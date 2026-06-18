@@ -37,7 +37,7 @@ class TextureADBranch:
         fmap = self.backbone.extract(image)
         feats, (h, w) = _to_patch_features(fmap)
         dist = self.bank.query(feats)                 # (h*w,)
-        amap = dist.reshape(h, w).numpy()
+        amap = dist.reshape(h, w).cpu().numpy()
         score = float(amap.max())
         lat = (time.perf_counter() - t0) * 1000.0
         return BranchResult(score=score, anomaly_map=amap,

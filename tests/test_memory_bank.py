@@ -15,3 +15,11 @@ def test_coreset_reduces_size():
     mb.coreset_subsample(0.25)
     assert mb.bank.shape[0] == 25
     assert mb.bank.shape[1] == 8
+
+def test_query_preserves_input_device():
+    # query/add 不再强制 CPU:CPU 输入下结果仍在 CPU(GPU 上则留在 GPU 加速 cdist)
+    mb = MemoryBank()
+    mb.add(torch.zeros(3, 2))
+    d = mb.query(torch.zeros(1, 2))
+    assert d.device.type == "cpu"
+    assert mb.bank.device.type == "cpu"

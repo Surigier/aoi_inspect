@@ -15,7 +15,9 @@ class DimensionADBranch:
     def _area(self, image: torch.Tensor) -> float:
         """image: (1,3,H,W) -> 前景像素数。"""
         gray = image[0].mean(dim=0)                       # H,W
-        bg = gray.median()
+        # 背景用边缘像素中位数估计:对大前景(>50%)鲁棒,避免全局中位数被前景翻转
+        border = torch.cat([gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]])
+        bg = border.median()
         return float((gray - bg).abs().gt(self.dev_thresh).sum().item())
 
     def fit(self, images: torch.Tensor) -> None:
@@ -29,6 +31,6 @@ class DimensionADBranch:
         t0 = time.perf_counter()
         area = self._area(image)
         std = self.std if self.std > 1e-9 else 1.0
-        score = abs(area - self.mean) / std
+        score = abs(area - self.mean) / std               # 仅幅度(偏大/偏小同等视为异常)
         lat = (time.perf_counter() - t0) * 1000.0
         return BranchResult(score=score, defect_type=self.defect_type, latency_ms=lat)

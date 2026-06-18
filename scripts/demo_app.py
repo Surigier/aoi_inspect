@@ -35,7 +35,8 @@ def feedback_fn(pil, actual):
 def main(root):
     global LOOP
     data = load_category(root)
-    bb = Backbone(pretrained=True, device="cuda")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    bb = Backbone(pretrained=True, device=device)
     adapter = MultiBranchAdapter([
         TextureADBranch(backbone=bb, coreset_ratio=0.25),
         StructuralADBranch(backbone=bb, grid_size=16),

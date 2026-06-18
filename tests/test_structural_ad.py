@@ -32,3 +32,13 @@ def test_infer_map_shape_and_batch_guard():
     assert r.defect_type == "structural"
     with pytest.raises(AssertionError):
         b.infer(torch.zeros(2, 3, 64, 64))
+
+def test_fit_is_idempotent():
+    # 重复 fit 同样数据不应让位置库累积(主动学习多轮反馈依赖此幂等性)
+    b = _branch()
+    imgs = torch.cat([_with_square() for _ in range(4)], dim=0)
+    b.fit(imgs)
+    n1 = b.bank.shape[1]
+    b.fit(imgs)
+    n2 = b.bank.shape[1]
+    assert n1 == n2

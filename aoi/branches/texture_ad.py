@@ -29,6 +29,9 @@ class TextureADBranch:
             self.bank.coreset_subsample(self.coreset_ratio)
 
     def infer(self, image: torch.Tensor) -> BranchResult:
+        assert image.shape[0] == 1, (
+            f"infer 期望单张图 (1,3,H,W),收到 batch={image.shape[0]};"
+            " 批量推理请逐张调用。")
         t0 = time.perf_counter()
         fmap = self.backbone.extract(image)
         feats, (h, w) = _to_patch_features(fmap)

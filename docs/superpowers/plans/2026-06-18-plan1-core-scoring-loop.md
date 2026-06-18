@@ -781,3 +781,19 @@ git add eval/mvtec.py scripts/run_mvtec_smoke.py tests/test_mvtec_loader.py && g
 **类型一致性:** `BranchResult` 字段(score/anomaly_map/boxes/defect_type/latency_ms)在 Task 1 定义,Task 4/5/7 一致使用;`Branch` 隐式接口 `fit(images)` + `infer(image)->BranchResult` + 类属性 `defect_type`,Task 4 实现、Task 5 `_FakeBranch` 与 `FewShotAdapter` 一致调用;`run_protocol` 签名在 Task 7 定义并被 Task 8 脚本一致调用。✅
 
 **范围:** 本 plan 聚焦"可运行评分闭环"单一子系统,独立可测、可交付。
+
+---
+
+## 代码审查后续项(最终审查记录)
+
+最终全量代码审查结论:**Approve,无 Critical**。已即时修复 2 项,其余按 YAGNI 登记到后续 Plan:
+
+**已修复(本分支内):**
+- `TextureADBranch.infer` 显式断言单图输入(B>1 原会报隐晦 reshape 错)+ 新增 `test_infer_rejects_batch`。
+- 冒烟脚本改为带种子洗牌再抽样(原 `random.seed(0)` 为死代码)。
+
+**登记延后:**
+- [ ] **Plan 5(部署)**:GPU 延时测量需加 `torch.cuda.synchronize()`;补 pixel-AUROC 指标(时间分 30% 与像素级评估的严肃测量归口部署/评测专项)。
+- [ ] **Plan 4(主动学习)**:`MemoryBank.coreset_subsample` 在 `fit` 内调用,重复 `fit` 会对已下采样的库再次下采样(增量入库需求要处理幂等性)。
+- [ ] **调优(准确率轴)**:`score=amap.max()` 可试 mean-of-top-k / PatchCore 重加权。
+- [ ] **泛化数据集**:`eval/mvtec.py` 仅 glob `*.png`;接入 VisA/MPDD 时需支持其它扩展名/布局。

@@ -1,3 +1,4 @@
+import pytest
 import torch
 from aoi.backbone import Backbone
 from aoi.branches.texture_ad import TextureADBranch
@@ -22,3 +23,9 @@ def test_anomaly_scores_higher_than_normal():
     s_normal = b.infer(torch.full((1, 3, 64, 64), 0.5)).score
     s_noise = b.infer(torch.rand(1, 3, 64, 64)).score
     assert s_noise > s_normal
+
+def test_infer_rejects_batch():
+    b = _branch()
+    b.fit(torch.full((2, 3, 64, 64), 0.5))
+    with pytest.raises(AssertionError):
+        b.infer(torch.full((2, 3, 64, 64), 0.5))

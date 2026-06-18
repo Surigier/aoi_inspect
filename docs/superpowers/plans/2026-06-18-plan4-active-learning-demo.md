@@ -286,3 +286,15 @@ git add requirements.txt scripts/demo_app.py && git commit -m "feat: Gradio 质�
 **范围(YAGNI):**
 - **纳入**:反馈闭环 + 热力图叠加 + Gradio Demo。
 - **延后**:复杂的增量式记忆库更新(当前用"重跑 fit_fewshot"全量重建,Demo 规模够用)→ 若需大规模在线可在 Plan 5 优化;视频流输入 → Plan 5;RL 式策略 → 明确不做(spec 已定主动学习)。
+
+---
+
+## 代码审查后续项(最终审查记录)
+
+最终审查发现 **1 个 Important(实为 Plan 1 审查预判、于 Plan 4 激活的幂等性 bug)**,已即时修复 + 加回归测试:
+
+**已修复:** `TextureADBranch.fit` / `StructuralADBranch.fit` 原为**累加**记忆库,多轮反馈重复 `fit_fewshot` 会累积重复样本 + coreset 随机采样导致阈值非确定漂移。改为**每次 fit 重建库**(幂等);补 `test_fit_is_idempotent`(两分支各一)。另:demo 增加 `cuda`→`cpu` 回退。真实端到端验证:漏检缺陷经反馈后被召回。
+
+**登记延后:**
+- [ ] **健壮性(M2)**:`ActiveLearningLoop.feedback` 未校验 image 形状((3,H,W));可加断言定位错误。
+- [ ] **demo(M4)**:`predict_fn` 在 anomaly_map 为 None 时回退返回原始尺寸图(当前多分支必有 map,实际为死分支)。

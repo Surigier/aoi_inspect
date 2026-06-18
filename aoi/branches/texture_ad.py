@@ -22,6 +22,7 @@ class TextureADBranch:
         self.coreset_ratio = coreset_ratio
 
     def fit(self, images: torch.Tensor) -> None:
+        self.bank = MemoryBank()        # 每次 fit 重建记忆库,保证幂等(多轮反馈重复 fit 不累积)
         fmap = self.backbone.extract(images)
         feats, _ = _to_patch_features(fmap)
         self.bank.add(feats)

@@ -24,8 +24,8 @@ class StructuralADBranch:
         return pooled.reshape(b, c, g * g).permute(2, 0, 1)      # (num_cells, B, C)
 
     def fit(self, images: torch.Tensor) -> None:
-        feats = self._cell_features(images)                      # (num_cells, B, C)
-        self.bank = feats if self.bank is None else torch.cat([self.bank, feats], dim=1)
+        # 每次 fit 重建库,保证幂等(多轮反馈重复 fit 不累积重复样本)
+        self.bank = self._cell_features(images)                  # (num_cells, B, C)
 
     def infer(self, image: torch.Tensor) -> BranchResult:
         assert image.shape[0] == 1, (

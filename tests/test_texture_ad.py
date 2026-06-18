@@ -29,3 +29,13 @@ def test_infer_rejects_batch():
     b.fit(torch.full((2, 3, 64, 64), 0.5))
     with pytest.raises(AssertionError):
         b.infer(torch.full((2, 3, 64, 64), 0.5))
+
+def test_fit_is_idempotent():
+    # 重复 fit 同样数据不应让记忆库累积(主动学习多轮反馈依赖此幂等性)
+    b = _branch()
+    imgs = torch.full((4, 3, 64, 64), 0.5)
+    b.fit(imgs)
+    n1 = b.bank.bank.shape[0]
+    b.fit(imgs)
+    n2 = b.bank.bank.shape[0]
+    assert n1 == n2

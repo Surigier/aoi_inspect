@@ -41,5 +41,6 @@ class MultiBranchAdapter:
     def predict(self, image):
         fused, res = self._fused(image)
         is_defect = bool(fused >= self.threshold)
+        res.score = fused            # 让 AUROC/阈值都基于融合分(保留最异常分支的 anomaly_map)
         res.defect_type = res.defect_type if is_defect else "normal"
         return res, is_defect

@@ -8,7 +8,7 @@ class MemoryBank:
         self.bank = None  # (N, C) tensor
 
     def add(self, features: torch.Tensor) -> None:
-        features = features.detach().float().cpu()
+        features = features.detach().float()            # 保留所在设备(GPU 上则留 GPU)
         self.bank = features if self.bank is None else torch.cat([self.bank, features], dim=0)
 
     def coreset_subsample(self, ratio: float) -> None:
@@ -19,6 +19,6 @@ class MemoryBank:
         self.bank = self.bank[idx]
 
     def query(self, features: torch.Tensor) -> torch.Tensor:
-        """返回每个 query 特征到 bank 的最小 L2 距离,形状 (M,)。"""
-        d = torch.cdist(features.detach().float().cpu(), self.bank)  # (M, N)
+        """返回每个 query 特征到 bank 的最小 L2 距离,形状 (M,)。在 bank 所在设备上计算。"""
+        d = torch.cdist(features.detach().float().to(self.bank.device), self.bank)
         return d.min(dim=1).values

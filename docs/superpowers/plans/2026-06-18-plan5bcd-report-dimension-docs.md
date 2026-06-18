@@ -225,3 +225,17 @@ git add aoi/branches/dimension_ad.py tests/test_dimension_ad.py && git commit -m
 **类型一致性:** `DimensionADBranch` 实现 fit/infer/defect_type 同 Branch 接口;`DefectReporter.report(result, is_defect)` 接受 BranchResult。✅
 
 **范围(YAGNI):** 报告默认模板(无强制 LLM 依赖,LLM 可注入);尺寸用简单前景面积(不引 opencv);真实 LLM API 接线为可选脚本,不入测试核心。OpenVINO CPU 导出仍延后(GPU 已达标 <200ms)。
+
+---
+
+## 代码审查后续项(最终审查记录)
+
+最终审查 **Approve,无 Critical**。已即时修复 1 个 Important:
+
+**已修复:** `DimensionADBranch._area` 原用全局中位数估背景,前景>50% 时中位数翻转 → 大缺陷反测出小面积被漏检。改为**边缘像素中位数估背景**(对大前景鲁棒);补 `test_large_foreground_not_inverted` 回归。另:`score` 加注释说明"仅幅度"。
+
+**登记延后:**
+- [ ] 尺寸分支可改为**有符号**偏差以区分偏大/偏小(当前仅幅度,赛题异常检测够用)。
+- [ ] `summarize_detection` 假设 anomaly_map 为 2D(当前所有分支均 2D),可加 ndim 防御。
+- [ ] `DimensionADBranch` std 下限在 fit/infer 两处处理,可统一到 fit。
+- [ ] `DefectReporter` LLM prompt 用 dict repr 拼接,可改 JSON/复用 format_report 作事实种子。

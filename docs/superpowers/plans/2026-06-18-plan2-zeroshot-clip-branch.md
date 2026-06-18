@@ -297,3 +297,17 @@ git add scripts/run_clip_smoke.py && git commit -m "feat: 零样本 CLIP MVTec �
 **类型一致性:** `ZeroShotCLIPBranch` 实现 `fit(images)->None` / `infer((1,3,H,W))->BranchResult` / 类属性 `defect_type`,与 Plan 1 的 Branch 接口及 `FewShotAdapter`/`run_protocol` 调用一致;encoder 接口(`encode_text`/`encode_image`)在 `FakeEncoder`(Task 2)与 `CLIPEncoder`(Task 3)间一致。✅
 
 **范围(YAGNI):** Plan 2 只做 image-level 零样本;**不做**像素级窗口聚合(WinCLIP 的 pixel-map)、不做 prompt 自动学习——留待后续增强。anomaly_map 暂为 None。
+
+---
+
+## 代码审查后续项(最终审查记录)
+
+最终审查结论:**Approve,无 Critical**。已即时修复 1 项,其余登记延后:
+
+**已修复:** 冒烟脚本默认类名从目录名推断(提示词更贴切)。
+
+**登记延后:**
+- [ ] **Plan 5(预处理)**:`CLIPEncoder.encode_image` 现对非方形图直接拉伸到 224;应改为 open_clip 标准的"短边缩放 + 中心裁剪"。当前管线 loader 已统一 resize 成方形,不触发;接入真实非方形 AOI 图前需修。
+- [ ] **增强(准确率)**:零样本 prompt 为朴素模板(当前 AUROC 0.62–0.87);换 AnomalyCLIP 式可学习提示 / 更大 prompt 集成可显著提升。
+- [ ] **校准**:temperature=0.01 使 score 趋近二值(对 AUROC 无碍,但与记忆库分支融合时需重新校准为可比概率)。
+- [ ] **测试健壮性**:`FakeEncoder` 按英文子串(defect/damaged/anomaly)判正常/异常轴,改 prompt 时易误判;可改为按索引/显式标记。

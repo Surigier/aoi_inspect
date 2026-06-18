@@ -1,5 +1,6 @@
 """零样本 CLIP 冒烟:python scripts/run_clip_smoke.py data/mvtec/bottle [class_name]
 用 CLIP 文本提示零样本检测,按官方协议输出 AUROC/准确率/延时。"""
+import os
 import sys
 from aoi.clip_encoder import CLIPEncoder
 from aoi.branches.zeroshot_clip import ZeroShotCLIPBranch
@@ -22,4 +23,7 @@ def main(root, class_name="object"):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "object")
+    root = sys.argv[1]
+    # 默认用目录名当类名(如 data/mvtec/metal_nut → "metal_nut"),提示词更贴切
+    class_name = sys.argv[2] if len(sys.argv) > 2 else os.path.basename(root.rstrip("/"))
+    main(root, class_name)

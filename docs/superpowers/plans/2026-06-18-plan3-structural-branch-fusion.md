@@ -384,3 +384,18 @@ git add scripts/run_loco_smoke.py && git commit -m "feat: MVTec LOCO 逻辑异�
 - **纳入**:结构分支 + 融合 + 多分支适配器 + LOCO 验证。
 - **延后**:**尺寸测量分支**(需相机标定/尺度,自成一体)→ 后续小 plan;**编排器的延时守卫/跳过慢分支** → Plan 5(部署/延时专项);视频时序 → Plan 5。
 - **已知**:`MultiBranchAdapter.fit_fewshot` 对正常样本做了两遍 infer(先统计后融合),100 张可接受,后续可缓存优化。
+
+---
+
+## 代码审查后续项(最终审查记录)
+
+最终审查发现 **1 个 Critical**,已即时修复并补回归测试 + 重跑验证:
+
+**已修复(C1,Critical):** `MultiBranchAdapter.predict` 原返回最异常分支的**原始分**,导致 `run_protocol` 的 AUROC 基于错误量纲(非融合分)。修复:`predict` 中 `res.score = fused`,使 AUROC/阈值同基于融合 z 分;保留最异常分支的 anomaly_map。补 `test_predict_returns_fused_score_not_raw` 回归测试。重跑 LOCO:fused 仍 0.837(结构分支 z 值主导,max 融合=结构排序;此为可信结果,融合增益需在外观+逻辑混合缺陷上体现)。
+
+**登记延后:**
+- [ ] **优化(I2)**:`fit_fewshot` 对正常样本两遍 infer;缓存首遍原始分即可去掉 2× GPU 开销。
+- [ ] **Plan 5/部署(I3)**:结构库内存 = `grid² × N × C`,grid 增大呈平方增长且无 coreset;RK3588 受限,需文档化内存公式 + 可选 per-cell 上限/coreset。
+- [ ] **健壮性(M2/M4)**:空分支列表无保护;`znorm` 的 std≈0 边界(1e-15)未测。
+- [ ] **可用性(M5)**:LOCO 冒烟脚本硬编码 `device="cuda"`,可加 CPU 回退。
+- [ ] **observation**:texture 配置因 coreset 随机下采样未固定种子,run-to-run AUROC 有小幅抖动;复现实验前可固定种子。

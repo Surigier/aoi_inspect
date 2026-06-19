@@ -4,3 +4,4 @@ Pillow>=10.0
 pytest>=8.0
 open_clip_torch>=2.20
 gradio>=4.0
+opencv-python-headless>=4.5

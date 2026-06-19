@@ -16,10 +16,11 @@ class TextureADBranch:
     """PatchCore 风格:正常 patch 特征入记忆库,推理时取最近邻距离作异常分。"""
     defect_type = "appearance"
 
-    def __init__(self, backbone: Backbone = None, coreset_ratio: float = 0.25):
+    def __init__(self, backbone: Backbone = None, coreset_ratio: float = 0.25, top_k: int = 10):
         self.backbone = backbone or Backbone()
         self.bank = MemoryBank()
         self.coreset_ratio = coreset_ratio
+        self.top_k = top_k              # 图像分=最大 patch 距离(=1)或 top-k 距离均值(>1,更抗噪)
 
     def fit(self, images: torch.Tensor) -> None:
         self.bank = MemoryBank()        # 每次 fit 重建记忆库,保证幂等(多轮反馈重复 fit 不累积)
@@ -38,7 +39,8 @@ class TextureADBranch:
         feats, (h, w) = _to_patch_features(fmap)
         dist = self.bank.query(feats)                 # (h*w,)
         amap = dist.reshape(h, w).cpu().numpy()
-        score = float(amap.max())
+        k = max(1, min(self.top_k, dist.numel()))
+        score = float(amap.max()) if k == 1 else float(dist.topk(k).values.mean().item())
         lat = (time.perf_counter() - t0) * 1000.0
         return BranchResult(score=score, anomaly_map=amap,
                             defect_type=self.defect_type, latency_ms=lat)

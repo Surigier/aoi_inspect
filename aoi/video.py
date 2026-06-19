@@ -5,6 +5,8 @@ import torch
 
 def moving_average(xs, window: int):
     """因果(trailing)滑动平均,window>=1。降低逐帧分数抖动。"""
+    if window < 1:
+        raise ValueError(f"window 必须 >= 1,收到 {window}")
     out = []
     for i in range(len(xs)):
         seg = xs[max(0, i - window + 1):i + 1]
@@ -56,7 +58,11 @@ class VideoDetector:
 def read_video_frames(path: str, size: int = 320, stride: int = 1):
     """读视频为 (3,H,W) [0,1] 张量列表(每 stride 帧取一帧)。需要 opencv-python(懒加载)。"""
     import cv2
+    if stride < 1:
+        raise ValueError(f"stride 必须 >= 1,收到 {stride}")
     cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"无法打开视频:{path}")
     frames, idx = [], 0
     while True:
         ok, bgr = cap.read()

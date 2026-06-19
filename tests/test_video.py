@@ -1,6 +1,12 @@
+import pytest
 import torch
 from aoi.video import moving_average, group_events, VideoDetector
 from aoi.types import BranchResult
+
+
+def test_moving_average_rejects_bad_window():
+    with pytest.raises(ValueError):
+        moving_average([1.0, 2.0], 0)
 
 
 def test_moving_average_trailing():
@@ -37,4 +43,11 @@ def test_detects_defect_event():
 def test_single_frame_spike_debounced():
     frames = [_frame(0.1)] * 3 + [_frame(0.9)] + [_frame(0.1)] * 3   # 单帧尖峰
     out = VideoDetector(_MeanAdapter(), smooth_window=1, min_event_len=2).process(frames)
+    assert out["events"] == []
+
+
+def test_smoothing_alone_suppresses_spike():
+    # 仅靠时序平滑(min_event_len=1)也能压住单帧尖峰
+    frames = [_frame(0.1)] * 3 + [_frame(0.9)] + [_frame(0.1)] * 3
+    out = VideoDetector(_MeanAdapter(), smooth_window=3, min_event_len=1).process(frames)
     assert out["events"] == []

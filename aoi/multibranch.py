@@ -4,7 +4,7 @@ from .fusion import znorm, auroc
 
 
 class MultiBranchAdapter:
-    """多分支:各分支 fit + 按正常分均值方差 z 归一化,融合(max)后标定单一阈值。
+    """多分支:留出法估各分支对未见正常图的可分性,硬选最可靠分支,再标定单一阈值。
     接口与 FewShotAdapter 一致,可直接喂给 run_protocol。"""
 
     def __init__(self, branches):

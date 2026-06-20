@@ -20,16 +20,19 @@ class FewShotAdapter:
 
     @staticmethod
     def _calibrate(normal_scores: List[float], defect_scores: List[float]) -> float:
-        """在候选分数上选准确率最高的阈值;并列时取更大值(更保守)。"""
+        """选**平衡准确率**(TPR+TNR)/2 最高的阈值。
+        正常多、缺陷少时,最大化原始准确率会偏向"不报警"→漏检;平衡准确率消除该偏向,
+        兼顾召回(AOI 早期拦截看重不漏)。并列时取更大阈值(更少误报)。"""
         candidates = sorted(set(normal_scores + defect_scores))
-        best_t, best_acc = candidates[0], -1.0
-        total = len(normal_scores) + len(defect_scores)
+        n_pos = len(defect_scores)
+        n_neg = len(normal_scores)
+        best_t, best_bal = candidates[0], -1.0
         for t in candidates:
-            tp = sum(s >= t for s in defect_scores)
-            tn = sum(s < t for s in normal_scores)
-            acc = (tp + tn) / total
-            if acc >= best_acc:
-                best_acc, best_t = acc, t
+            tpr = sum(s >= t for s in defect_scores) / n_pos
+            tnr = sum(s < t for s in normal_scores) / n_neg
+            bal = (tpr + tnr) / 2.0
+            if bal >= best_bal:
+                best_bal, best_t = bal, t
         return best_t
 
     def predict(self, image: torch.Tensor) -> Tuple[BranchResult, bool]:

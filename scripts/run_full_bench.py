@@ -8,9 +8,8 @@ from pathlib import Path
 import torch
 from aoi.backbone import Backbone
 from aoi.branches.texture_ad import TextureADBranch
-from aoi.branches.structural_ad import StructuralADBranch
 from aoi.fewshot import FewShotAdapter
-from aoi.multibranch import MultiBranchAdapter
+from aoi.ensemble import default_adapter
 from eval.protocol import run_protocol
 from eval.mvtec import load_category, _load_img
 
@@ -65,7 +64,7 @@ def main():
         tl = [0] * len(data["test_normal"]) + [1] * len(df[dfit:])
         try:
             tex = run_protocol(FewShotAdapter(TextureADBranch(backbone=bb)), fn, fd, ti, tl)["auroc"]
-            fus = run_protocol(MultiBranchAdapter([TextureADBranch(backbone=bb), StructuralADBranch(backbone=bb, grid_size=16)]), fn, fd, ti, tl)["auroc"]
+            fus = run_protocol(default_adapter(bb), fn, fd, ti, tl)["auroc"]   # 纹理+结构+判别头
         except Exception as e:
             print(f"{ds}/{c} err ({e})")
             continue

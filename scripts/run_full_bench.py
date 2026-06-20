@@ -1,6 +1,6 @@
-"""全量基准:python scripts/run_full_bench.py
-用最佳配置(默认 320 / coreset0.25 / top_k10)跑 MVTec(15)+MPDD(6)+LOCO(5)+DAGM(10)
-全部类别的 纹理 / 融合 image-AUROC,按数据集与总体出均值。种子固定可复现。"""
+"""全量基准(按竞赛规范):python scripts/run_full_bench.py
+5 大族 ~48 类(MVTec15+MPDD6+LOCO5+DAGM10+VisA12),官方协议 100 正常+30 缺陷现场迁移→测剩余,
+报融合的 AUROC / 准确率(平衡阈值)/ 单图延时,按数据族与总体汇总。种子固定可复现。"""
 import os
 import random
 from collections import defaultdict
@@ -26,6 +26,15 @@ def load_dagm(root):
     return {"train_normal": tn, "test_normal": te_n, "test_defect": te_d}
 
 
+def load_visa(root):
+    base = Path(root) / "Data" / "Images"
+    normal = [_load_img(p, SIZE) for p in sorted((base / "Normal").glob("*.JPG"))]
+    anomaly = [_load_img(p, SIZE) for p in sorted((base / "Anomaly").glob("*.JPG"))]
+    random.Random(0).shuffle(normal)
+    half = len(normal) // 2
+    return {"train_normal": normal[:half], "test_normal": normal[half:], "test_defect": anomaly}
+
+
 def collect():
     items = []
     for c in sorted(os.listdir("data/mvtec")):
@@ -38,13 +47,17 @@ def collect():
             items.append(("loco", c, f"{loco}/{c}", load_category))
     for c in sorted(os.listdir("data/dagm")):
         items.append(("dagm", c, f"data/dagm/{c}", load_dagm))
+    visa = "data/visa"
+    for c in sorted(os.listdir(visa)):
+        if (Path(visa) / c / "Data" / "Images" / "Normal").is_dir():
+            items.append(("visa", c, f"{visa}/{c}", load_visa))
     return items
 
 
 def main():
     torch.manual_seed(0)
     bb = Backbone(pretrained=True, device="cuda" if torch.cuda.is_available() else "cpu")
-    agg = defaultdict(lambda: [0.0, 0.0, 0])
+    agg = defaultdict(lambda: [0.0, 0.0, 0.0, 0.0, 0])   # tex_au, fus_au, fus_acc, fus_lat, n
     for ds, c, root, loader in collect():
         try:
             data = loader(root)
@@ -64,23 +77,20 @@ def main():
         tl = [0] * len(data["test_normal"]) + [1] * len(df[dfit:])
         try:
             tex = run_protocol(FewShotAdapter(TextureADBranch(backbone=bb)), fn, fd, ti, tl)["auroc"]
-            fus = run_protocol(default_adapter(bb), fn, fd, ti, tl)["auroc"]   # 纹理+结构+判别头
+            m = run_protocol(default_adapter(bb), fn, fd, ti, tl)
         except Exception as e:
             print(f"{ds}/{c} err ({e})")
             continue
         a = agg[ds]
-        a[0] += tex
-        a[1] += fus
-        a[2] += 1
-        print(f"{ds}/{c:18s} tex={tex:.3f} fused={fus:.3f}", flush=True)
-    print("--- per-dataset mean ---")
-    gt = gf = gn = 0
-    for ds, (st, sf, n) in agg.items():
-        print(f"{ds:8s} tex={st / n:.3f} fused={sf / n:.3f} (n={n})")
-        gt += st
-        gf += sf
-        gn += n
-    print(f"{'OVERALL':8s} tex={gt / gn:.3f} fused={gf / gn:.3f} (n={gn})")
+        a[0] += tex; a[1] += m["auroc"]; a[2] += m["accuracy"]; a[3] += m["latency_ms_mean"]; a[4] += 1
+        print(f"{ds}/{c:18s} texAU={tex:.3f} fusAU={m['auroc']:.3f} acc={m['accuracy']:.3f} lat={m['latency_ms_mean']:.0f}ms", flush=True)
+    print("--- 数据族均值(融合)---")
+    g = [0.0, 0.0, 0.0, 0.0, 0]
+    for ds, (ta, fa, ac, la, n) in agg.items():
+        print(f"{ds:8s} texAU={ta/n:.3f} fusAU={fa/n:.3f} acc={ac/n:.3f} lat={la/n:.0f}ms (n={n})")
+        for i in range(5):
+            g[i] += [ta, fa, ac, la, n][i]
+    print(f"{'OVERALL':8s} texAU={g[0]/g[4]:.3f} fusAU={g[1]/g[4]:.3f} acc={g[2]/g[4]:.3f} lat={g[3]/g[4]:.0f}ms (n={g[4]})")
 
 
 if __name__ == "__main__":

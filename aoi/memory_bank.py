@@ -12,10 +12,12 @@ class MemoryBank:
         self.bank = features if self.bank is None else torch.cat([self.bank, features], dim=0)
 
     def coreset_subsample(self, ratio: float) -> None:
-        """v1 用随机下采样近似 coreset(后续 Plan 可替换为 k-center-greedy)。"""
+        """随机下采样近似 coreset。用固定种子的生成器 → 确定可复现,且选支不随调用顺序漂移
+        (后续 Plan 可替换为 k-center-greedy)。"""
         n = self.bank.shape[0]
         k = max(1, int(n * ratio))
-        idx = torch.randperm(n)[:k]
+        g = torch.Generator().manual_seed(0)
+        idx = torch.randperm(n, generator=g)[:k]
         self.bank = self.bank[idx]
 
     def query(self, features: torch.Tensor) -> torch.Tensor:

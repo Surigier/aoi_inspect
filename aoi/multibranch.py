@@ -21,9 +21,8 @@ class MultiBranchAdapter:
         if len(build_normals) == 0:                      # 样本太少则退回全量
             build_normals, val_normals = normal_images, normal_images
         self.weights = []
-        build_stack = torch.stack(build_normals)
         for b in self.branches:
-            b.fit(build_stack)
+            self._fit_branch(b, build_normals, defect_images)
             vn = [b.infer(x.unsqueeze(0)).score for x in val_normals]
             ds = [b.infer(d.unsqueeze(0)).score for d in defect_images]
             sep = auroc(vn + ds, [0] * len(vn) + [1] * len(ds))
@@ -31,10 +30,9 @@ class MultiBranchAdapter:
         if sum(self.weights) <= 1e-9:
             self.weights = [1.0] * len(self.branches)
         # 2) 用全部正常图做最终拟合 + 统计正常分均值方差
-        stacked = torch.stack(normal_images)
         self.stats = []
         for b in self.branches:
-            b.fit(stacked)
+            self._fit_branch(b, normal_images, defect_images)
             ns = [b.infer(img.unsqueeze(0)).score for img in normal_images]
             m = sum(ns) / len(ns)
             var = sum((x - m) ** 2 for x in ns) / len(ns)
@@ -44,6 +42,14 @@ class MultiBranchAdapter:
         def_fused = [self._fused(img.unsqueeze(0))[0] for img in defect_images]
         self.threshold = FewShotAdapter._calibrate(norm_fused, def_fused)
         return self.threshold
+
+    @staticmethod
+    def _fit_branch(b, normals_list, defects_list):
+        """无监督分支用 fit(正常);监督分支(判别头)用 fit_supervised(正常, 缺陷)。"""
+        if hasattr(b, "fit_supervised"):
+            b.fit_supervised(normals_list, defects_list)
+        else:
+            b.fit(torch.stack(normals_list))
 
     def _fused(self, image):
         """按可分性硬选最可靠分支(各分支 z 幅度不可比,加权平均会被大幅度分支带偏;

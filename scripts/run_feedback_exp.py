@@ -19,6 +19,7 @@ def load_visa(cat, size=320):
 
 
 def main(cat="pcb3"):
+    torch.manual_seed(0)                      # 固定 coreset 随机,结果可复现
     normal, anom = load_visa(cat)
     rng = random.Random(0)
     rng.shuffle(normal)

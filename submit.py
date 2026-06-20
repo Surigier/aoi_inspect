@@ -8,9 +8,7 @@ import csv
 from pathlib import Path
 import torch
 from aoi.backbone import Backbone
-from aoi.branches.texture_ad import TextureADBranch
-from aoi.branches.structural_ad import StructuralADBranch
-from aoi.multibranch import MultiBranchAdapter
+from aoi.ensemble import default_adapter
 from aoi.video import VideoDetector, read_video_frames
 from eval.mvtec import _load_img
 
@@ -33,10 +31,7 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     bb = Backbone(pretrained=True, device=device)
-    adapter = MultiBranchAdapter([
-        TextureADBranch(backbone=bb),
-        StructuralADBranch(backbone=bb, grid_size=16),
-    ])
+    adapter = default_adapter(bb)
     normals = _load_images(args.normal, args.size)
     defects = _load_images(args.defect, args.size)
     if not normals or not defects:

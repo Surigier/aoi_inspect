@@ -13,6 +13,28 @@ class _FakeBranch:
         return BranchResult(score=float(self.score_fn(image)), defect_type=self.defect_type)
 
 
+class _FakeSupervisedBranch:
+    """有 fit_supervised(无 fit),验证 MultiBranchAdapter 的监督分支分发路径。"""
+    defect_type = "appearance"
+    def __init__(self):
+        self.saw_supervised = False
+    def fit_supervised(self, normals, defects):
+        self.saw_supervised = True
+    def infer(self, image):
+        return BranchResult(score=float(image.mean()), defect_type=self.defect_type)
+
+
+def test_supervised_branch_dispatch():
+    b = _FakeSupervisedBranch()
+    a = MultiBranchAdapter([b])
+    normals = [torch.zeros(3, 8, 8) for _ in range(10)]
+    defects = [torch.ones(3, 8, 8) for _ in range(10)]
+    a.fit_fewshot(normals, defects)
+    assert b.saw_supervised is True          # 走了 fit_supervised 而非 fit
+    _, is_def = a.predict(torch.ones(1, 3, 8, 8))
+    assert is_def is True
+
+
 def test_fit_predict_fuses_and_separates():
     # b1 按图像均值打分(正常0/缺陷1);b2 恒为0(静默分支)
     b1 = _FakeBranch("appearance", lambda im: im.mean())

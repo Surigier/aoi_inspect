@@ -13,6 +13,7 @@ class DiscriminativeHead:
 
     def fit(self, normal_feats: torch.Tensor, defect_feats: torch.Tensor):
         """normal_feats/defect_feats: (N, D) 图像级特征。每次调用重训(权重重置)。"""
+        assert len(defect_feats) >= 1 and len(normal_feats) >= 1, "判别头需正常与缺陷各至少一例"
         x = torch.cat([normal_feats, defect_feats]).float().to(self.device)
         y = torch.cat([torch.zeros(len(normal_feats)),
                        torch.ones(len(defect_feats))]).to(self.device)
@@ -30,4 +31,5 @@ class DiscriminativeHead:
     @torch.no_grad()
     def score(self, feat: torch.Tensor) -> torch.Tensor:
         """feat: (M, D) -> (M,) 缺陷概率 [0,1]。"""
+        assert self.lin is not None, "score 前须先 fit"
         return torch.sigmoid(self.lin(feat.float().to(self.device)).squeeze(-1))

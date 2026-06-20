@@ -20,11 +20,16 @@ class MultiBranchAdapter:
         val_normals, build_normals = normal_images[:k], normal_images[k:]
         if len(build_normals) == 0:                      # 样本太少则退回全量
             build_normals, val_normals = normal_images, normal_images
+        # 缺陷也拆 build/val:监督分支(判别头)须在**未见缺陷**上评可靠性,否则会靠背题作弊
+        kd = max(1, len(defect_images) // 5)
+        val_defects, build_defects = defect_images[:kd], defect_images[kd:]
+        if len(build_defects) == 0:
+            build_defects, val_defects = defect_images, defect_images
         self.weights = []
         for b in self.branches:
-            self._fit_branch(b, build_normals, defect_images)
+            self._fit_branch(b, build_normals, build_defects)
             vn = [b.infer(x.unsqueeze(0)).score for x in val_normals]
-            ds = [b.infer(d.unsqueeze(0)).score for d in defect_images]
+            ds = [b.infer(d.unsqueeze(0)).score for d in val_defects]
             sep = auroc(vn + ds, [0] * len(vn) + [1] * len(ds))
             self.weights.append(max(0.0, sep - 0.5))
         if sum(self.weights) <= 1e-9:

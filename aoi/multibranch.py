@@ -1,3 +1,4 @@
+import math
 import torch
 from .fewshot import FewShotAdapter
 from .fusion import znorm, auroc
@@ -60,12 +61,17 @@ class MultiBranchAdapter:
             b.fit(torch.stack(normals_list))
 
     def _fused(self, image):
-        """按可分性硬选最可靠分支(各分支 z 幅度不可比,加权平均会被大幅度分支带偏;
-        改为用现场 30 缺陷选出对该域最判别的分支)。返回 (该分支 z, 其 BranchResult)。"""
-        idx = max(range(len(self.weights)), key=lambda i: self.weights[i])
-        b, (m, s) = self.branches[idx], self.stats[idx]
-        r = b.infer(image)
-        return znorm(r.score, m, s), r
+        """可靠性加权的 sigmoid(z) 平均:各分支把 z 压到 [0,1](量纲可比),按可靠性加权平均。
+        各分支都贡献 → 单个分支的误选被稀释(比硬选支稳),返回 (融合分, 最可靠分支结果)。"""
+        total_w = sum(self.weights) or 1.0
+        num, best = 0.0, None
+        for b, (m, s), w in zip(self.branches, self.stats, self.weights):
+            r = b.infer(image)
+            p = 1.0 / (1.0 + math.exp(-znorm(r.score, m, s)))   # sigmoid(z) ∈ (0,1)
+            num += w * p
+            if best is None or w * p > best[0]:
+                best = (w * p, r)
+        return num / total_w, best[1]
 
     def predict(self, image):
         fused, res = self._fused(image)

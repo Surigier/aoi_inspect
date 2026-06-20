@@ -52,9 +52,9 @@ def test_fit_predict_fuses_and_separates():
 
 
 def test_predict_returns_fused_score_not_raw():
-    # 回归测试(C1):predict 返回的 score 必须是融合 z 分,而非分支原始分,
-    # 否则 run_protocol 的 AUROC 会基于错误的量纲。
-    # b1 正常分=10/缺陷分=20(原始量纲大);正常 mean=10,std=0→1.0,缺陷 z=(20-10)/1=10。
+    # 回归测试(C1):predict 返回的 score 必须是**融合分**(可靠性加权 sigmoid(z),∈(0,1)),
+    # 而非分支原始分(20),否则 run_protocol 的 AUROC 会基于错误的量纲。
+    # b1 正常分=10/缺陷分=20;正常 mean=10,std=0→1.0,缺陷 z=10 → sigmoid(10)≈1。
     b1 = _FakeBranch("appearance", lambda im: 10.0 + 10.0 * float(im.mean()))
     b2 = _FakeBranch("structural", lambda im: 0.0)
     a = MultiBranchAdapter([b1, b2])
@@ -62,4 +62,4 @@ def test_predict_returns_fused_score_not_raw():
     defects = [torch.ones(3, 8, 8) for _ in range(4)]
     a.fit_fewshot(normals, defects)
     r_d, _ = a.predict(torch.ones(1, 3, 8, 8))
-    assert r_d.score == 10.0          # 融合 z 分,不是原始分 20.0
+    assert 0.99 < r_d.score < 1.0     # 融合分(sigmoid 加权),绝非原始分 20.0

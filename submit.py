@@ -78,11 +78,11 @@ def _run_small(args, bb):
 
 
 def _run_large(args, device):
-    """大图(2500²)路径:EfficientAD 学生-教师(无记忆库→延时恒定 ~106ms@2060)。
-    训练用 256 细块保细节,推理整图全卷积(不分块不降采样);AD2 实测反超 PatchCore。"""
-    from aoi.tiled_efficientad import TiledEfficientAD
+    """大图(2500²)路径:EfficientAD 核心 + 色彩/尺寸/结构融合(5类全覆盖 + 类型输出)。
+    无记忆库→延时恒定 ~106ms@2060;输出缺陷类型(最强分支)。"""
+    from aoi.competition import CompetitionLargeDetector
     from aoi.video import moving_average, group_events
-    det = TiledEfficientAD(model_size="small", device=device)     # 默认 tile256/10k步/整图max1280
+    det = CompetitionLargeDetector(device=device)
     normals = [_load_img_native(p) for p in _img_files(args.normal)]
     defects = [_load_img_native(p) for p in _img_files(args.defect)]
     if not normals or not defects:
@@ -93,10 +93,10 @@ def _run_large(args, device):
         if p.suffix in IMG_EXT:
             o = det.predict(_load_img_native(p))
             rows.append([p.name, "image", int(o["is_defect"]), round(o["score"], 4),
-                         "defect" if o["is_defect"] else "normal"])
+                         o["defect_type"]])
         elif p.suffix in VID_EXT:
-            frames = read_video_frames(str(p), size=2048)        # 大图视频:逐帧整图卷积
-            scores = [det._image_score(f) for f in frames]
+            frames = read_video_frames(str(p), size=2048)
+            scores = [det._fuse([b.score(f) for b in det.branches]) for f in frames]
             sm = moving_average(scores, 3)
             events = group_events([s >= det.threshold for s in sm], 2)
             is_def = len(events) > 0

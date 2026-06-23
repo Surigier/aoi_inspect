@@ -22,21 +22,32 @@ def _load_images(d, size):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--normal", required=True, help="正常样本目录(现场迁移)")
-    ap.add_argument("--defect", required=True, help="缺陷样本目录(现场迁移)")
+    ap.add_argument("--normal", help="正常样本目录(现场迁移;zero-shot 模式可省)")
+    ap.add_argument("--defect", help="缺陷样本目录(现场迁移;zero-shot 模式可省)")
     ap.add_argument("--test", required=True, help="测试目录(图片/视频混合)")
     ap.add_argument("--out", default="result.csv")
     ap.add_argument("--size", type=int, default=320)
+    ap.add_argument("--zeroshot", action="store_true", help="无样本模式:无需 normal/defect,纯 CLIP 判异常")
+    ap.add_argument("--class-name", default="object", help="zero-shot 文本提示用的品类名")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    bb = Backbone(pretrained=True, device=device)
-    adapter = default_adapter(bb)
-    normals = _load_images(args.normal, args.size)
-    defects = _load_images(args.defect, args.size)
-    if not normals or not defects:
-        raise SystemExit("normal/ 与 defect/ 必须各含至少一张图片")
-    adapter.fit_fewshot(normals, defects)
+    if args.zeroshot:                                  # 无样本入口(赛题"少样本或无样本")
+        from aoi.clip_encoder import CLIPEncoder
+        from aoi.branches.zeroshot_clip import ZeroShotAdapter
+        adapter = ZeroShotAdapter(CLIPEncoder(device=device), class_name=args.class_name)
+        adapter.fit_fewshot()
+        print(f"模式:zero-shot 无样本(class={args.class_name})", flush=True)
+    else:
+        if not args.normal or not args.defect:
+            raise SystemExit("少样本模式需 --normal 与 --defect;或加 --zeroshot 走无样本")
+        bb = Backbone(pretrained=True, device=device)
+        adapter = default_adapter(bb)
+        normals = _load_images(args.normal, args.size)
+        defects = _load_images(args.defect, args.size)
+        if not normals or not defects:
+            raise SystemExit("normal/ 与 defect/ 必须各含至少一张图片")
+        adapter.fit_fewshot(normals, defects)
 
     rows = []
     for p in sorted(Path(args.test).iterdir()):

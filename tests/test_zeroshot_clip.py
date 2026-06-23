@@ -43,3 +43,13 @@ def test_infer_rejects_batch():
     b = ZeroShotCLIPBranch(FakeEncoder())
     with pytest.raises(AssertionError):
         b.infer(torch.zeros(2, 3, 8, 8))
+
+
+def test_zeroshot_adapter_no_fit_predict():
+    from aoi.branches.zeroshot_clip import ZeroShotAdapter
+    ad = ZeroShotAdapter(FakeEncoder(), class_name="bottle")
+    assert ad.fit_fewshot() == 0.5                      # 无样本,无需拟合
+    r, is_def = ad.predict(torch.ones(1, 3, 8, 8))      # 均值1→异常
+    assert is_def is True and r.defect_type != "normal"
+    r2, is_def2 = ad.predict(torch.zeros(1, 3, 8, 8))   # 均值0→正常
+    assert is_def2 is False and r2.defect_type == "normal"

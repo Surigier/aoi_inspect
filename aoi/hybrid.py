@@ -8,8 +8,10 @@ import torch
 import torch.nn.functional as F
 from .fusion import auroc, znorm
 from .fewshot import FewShotAdapter
-from .branches.texture_ad import TextureADBranch
+from .ensemble import default_adapter
 from .tiled import TiledFewShotDetector
+
+WEIGHT_FLOOR = 0.05         # 可靠性权重下限:防"好分支被噪声误判归零"(如 wallplugs)
 
 
 def _resize(img, size=512):
@@ -19,23 +21,27 @@ def _resize(img, size=512):
 
 
 class _GlobalBranch:
-    def __init__(self, backbone, size=512, coreset_ratio=0.05):
+    """整图 resize→320 的完整 ensemble(纹理+结构+判别头,现有proven配置),判别头吃30缺陷监督。
+    全局只管粗/全局上下文(纹理/色彩/尺寸/缺件),小缺陷交局部分块 → 320 足够且显存安全。"""
+    def __init__(self, backbone, size=320):
         self.size = size
-        self.branch = TextureADBranch(backbone=backbone, coreset_ratio=coreset_ratio)
+        self.adapter = default_adapter(backbone)
 
-    def fit(self, normals):
-        self.branch.fit(torch.stack([_resize(i, self.size) for i in normals]))
+    def fit(self, normals, defects):
+        self.adapter.fit_fewshot([_resize(i, self.size) for i in normals],
+                                 [_resize(d, self.size) for d in defects])
 
     def score(self, img):
-        return self.branch.infer(_resize(img, self.size).unsqueeze(0)).score
+        return self.adapter._fused(_resize(img, self.size).unsqueeze(0))[0]
 
 
 class _LocalBranch:
+    """原生分辨率分块(无监督,管局部小缺陷)。"""
     def __init__(self, backbone, **kw):
         self.det = TiledFewShotDetector(backbone, **kw)
 
-    def fit(self, normals):
-        self.det.fit_fewshot(normals, normals[:2])     # 仅建库;阈值此处不用
+    def fit(self, normals, defects):
+        self.det.fit_fewshot(normals, defects)         # 建库;阈值此处不用
 
     def score(self, img):
         return self.det._image_score(img)[0]
@@ -51,25 +57,23 @@ class HybridDetector:
         self.threshold = None
 
     def fit_fewshot(self, normals, defects):
-        # 1) 留出法估各分支可靠性(对未见正常的可分性)
+        # 1) 留出法估各分支可靠性(对未见正常的可分性),加 floor 防误判归零
         k = max(1, len(normals) // 5)
         val_n, build_n = normals[:k], normals[k:]
         if not build_n:
             build_n, val_n = normals, normals
         self.weights = []
         for b in self.branches:
-            b.fit(build_n)
+            b.fit(build_n, defects)
             vn = [b.score(x) for x in val_n]
             ds = [b.score(d) for d in defects]
             sep = auroc(vn + ds, [0] * len(vn) + [1] * len(ds))
-            self.weights.append(max(0.0, sep - 0.5))
-        if sum(self.weights) <= 1e-9:
-            self.weights = [1.0] * len(self.branches)
+            self.weights.append(max(WEIGHT_FLOOR, sep - 0.5))
         # 2) 全量重拟合 + 缓存分数估 μ/σ(每分支每图只算一次)
         self.stats = []
         norm_scores, def_scores = [], []
         for b in self.branches:
-            b.fit(normals)
+            b.fit(normals, defects)
             ns = [b.score(x) for x in normals]
             dsc = [b.score(d) for d in defects]
             m = sum(ns) / len(ns)

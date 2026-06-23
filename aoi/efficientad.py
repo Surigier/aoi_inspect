@@ -164,6 +164,22 @@ class EfficientADDetector:
         return float(combined.max()), None
 
     @torch.no_grad()
+    def score_large(self, img, max_size=1536):
+        """整图全卷积推理(ST 主分支,不分块不降采样)。PDN 全卷积→大图一次前向出全分辨率图。
+        只超 max_size 时才等比缩(控显存)。AE 分支固定256不参与大图。"""
+        if img.dim() == 3:
+            img = img.unsqueeze(0)
+        img = img.to(self.device)
+        if max(img.shape[-2:]) > max_size:
+            s = max_size / max(img.shape[-2:])
+            img = F.interpolate(img, scale_factor=s, mode="bilinear", align_corners=False)
+        x = (img - self._mean) / self._std
+        t = (self.teacher(x) - self.t_mean) / self.t_std
+        s = self.student(x)[:, :OUT]
+        map_st = ((t - s) ** 2).mean(1)
+        return float(map_st.max())
+
+    @torch.no_grad()
     def score_images(self, imgs, batch=16):
         """批量打分(供分块大图批处理):imgs 列表 → 每图异常分(map 最大值)。"""
         out = []

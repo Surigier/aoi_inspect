@@ -37,8 +37,9 @@ def run(cat, dev):
     test = [_load_img_native(p) for p in tp]
 
     t = time.time()
-    det = TiledEfficientAD(model_size="small", device=dev, train_steps=6000,
-                           tile=512, stride=512)
+    det = TiledEfficientAD(model_size="small", device=dev, train_steps=10000,
+                           tile=256, stride=256,         # 训练用256细块(保细节)
+                           whole_infer=True, max_size=2048)  # 推理整图全卷积(快+保细节)
     det.fit_fewshot(fn, fd)
     fit_s = time.time() - t
     scores = [det._image_score(im) for im in test]

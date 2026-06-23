@@ -9,13 +9,16 @@ from .fewshot import FewShotAdapter
 
 class TiledEfficientAD:
     def __init__(self, model_size="small", device="cuda", train_steps=8000,
-                 tile=512, stride=512, tile_top_k=3, batch=16):
+                 tile=512, stride=512, tile_top_k=3, batch=16,
+                 whole_infer=False, max_size=1536):
         self.det = EfficientADDetector(model_size=model_size, device=device,
                                        train_steps=train_steps)
         self.tile = tile
         self.stride = stride
         self.tile_top_k = tile_top_k
         self.batch = batch
+        self.whole_infer = whole_infer       # True:推理走整图全卷积(快,保细节);训练仍用块
+        self.max_size = max_size
         self.threshold = None
 
     def _tiles(self, img):
@@ -32,6 +35,8 @@ class TiledEfficientAD:
         return self.threshold
 
     def _image_score(self, img):
+        if self.whole_infer:
+            return self.det.score_large(img, max_size=self.max_size)
         scores = self.det.score_images(self._tiles(img), batch=self.batch)
         scores.sort(reverse=True)
         k = max(1, min(self.tile_top_k, len(scores)))

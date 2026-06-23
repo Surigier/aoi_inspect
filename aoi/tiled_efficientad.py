@@ -8,9 +8,9 @@ from .fewshot import FewShotAdapter
 
 
 class TiledEfficientAD:
-    def __init__(self, model_size="small", device="cuda", train_steps=8000,
-                 tile=512, stride=512, tile_top_k=3, batch=16,
-                 whole_infer=False, max_size=1536):
+    def __init__(self, model_size="small", device="cuda", train_steps=10000,
+                 tile=256, stride=256, tile_top_k=3, batch=16,
+                 whole_infer=True, max_size=1280):       # 默认=2060甜点(0.840/~106ms)
         self.det = EfficientADDetector(model_size=model_size, device=device,
                                        train_steps=train_steps)
         self.tile = tile

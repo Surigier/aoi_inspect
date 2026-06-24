@@ -32,18 +32,19 @@ def main():
     det.fit_fewshot(fn, fd)
     names = ["EAD核心", "色彩", "尺寸", "结构"]
     print(f"{cat} 训练完成 ({time.time()-t:.0f}s)", flush=True)
-    print("权重:", {n: round(w, 3) for n, w in zip(names, det.weights)}, flush=True)
-    # 各分支单独 AUROC
     for j, b in enumerate(det.branches):
         bs = [b.score(im) for im in test]
         print(f"  {names[j]:6s} 单独AUROC={auroc(bs, tl):.3f}", flush=True)
-    fused = [det._fuse([b.score(im) for b in det.branches]) for im in test]
+    det_scores = [det.branches[0].score(im) for im in test]    # 检测分=EAD核心
     det.predict(test[0])
     t0 = time.perf_counter()
     for i in range(4):
         det.predict(test[i])
     lat = (time.perf_counter() - t0) / 4 * 1000
-    print(f"融合AUROC={auroc(fused, tl):.3f} 延时={lat:.0f}ms (2060估~{lat*1.7:.0f}ms) | EAD单独基线0.840", flush=True)
+    # 缺陷图的类型输出分布(抽样)
+    types = [det.predict(test[i])["defect_type"] for i in range(len(test)) if tl[i] == 1][:10]
+    print(f"检测AUROC(EAD)={auroc(det_scores, tl):.3f} 延时={lat:.0f}ms (2060估~{lat*1.7:.0f}ms)", flush=True)
+    print(f"缺陷类型输出抽样: {types}", flush=True)
 
 
 if __name__ == "__main__":

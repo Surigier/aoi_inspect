@@ -2,18 +2,15 @@
 核心 = EfficientAD 整图卷积(强检测 + 低延时);辅以色彩/尺寸/结构分支补齐 5 类缺陷覆盖。
 可靠性加权 z-norm 软融合 → 二值判决 + 缺陷类型输出(最强分支=类型)。
 延时 ≈ EfficientAD(~106ms@2060)+ 几个轻分支(几 ms),仍 <200ms。"""
-import math
 import torch
 import torch.nn.functional as F
-from .fusion import auroc, znorm
+from .fusion import znorm
 from .fewshot import FewShotAdapter
 from .backbone import Backbone
 from .tiled_efficientad import TiledEfficientAD
 from .branches.color_ad import ColorADBranch
 from .branches.dimension_ad import DimensionADBranch
 from .branches.structural_ad import StructuralADBranch
-
-WEIGHT_FLOOR = 0.05
 
 
 def _down(img, size):
@@ -65,39 +62,29 @@ class CompetitionLargeDetector:
         self.threshold = None
 
     def fit_fewshot(self, normals, defects):
-        norm_scores, def_scores = [], []
-        self.stats, self.weights = [], []
+        """检测由 EAD 核心(branches[0])单独负责;辅助分支只为'类型归属'拟合并估 μ/σ。
+        实测从少样本估融合权重不可靠(弱分支overfit→拖垮强EAD),故不做检测层融合。"""
+        self.stats = []
         for b in self.branches:
-            b.fit(normals, defects)                       # 各分支单次拟合(EAD训练一次)
+            b.fit(normals, defects)
             ns = [b.score(x) for x in normals]
-            ds = [b.score(d) for d in defects]
             m = sum(ns) / len(ns)
             s = (sum((x - m) ** 2 for x in ns) / len(ns)) ** 0.5
             self.stats.append((m, s))
-            self.weights.append(max(WEIGHT_FLOOR,
-                                    auroc(ns + ds, [0] * len(ns) + [1] * len(ds)) - 0.5))
-            norm_scores.append(ns)
-            def_scores.append(ds)
-        nf = [self._fuse([norm_scores[j][i] for j in range(len(self.branches))])
-              for i in range(len(normals))]
-        df = [self._fuse([def_scores[j][i] for j in range(len(self.branches))])
-              for i in range(len(defects))]
-        self.threshold = FewShotAdapter._calibrate(nf, df)
+        ead = self.branches[0]
+        ns = [ead.score(x) for x in normals]
+        ds = [ead.score(d) for d in defects]
+        self.threshold = FewShotAdapter._calibrate(ns, ds)    # 阈值标在 EAD 分上
         return self.threshold
 
-    def _contribs(self, raws):
-        return [w * (1.0 / (1.0 + math.exp(-znorm(r, m, s))))
-                for r, (m, s), w in zip(raws, self.stats, self.weights)]
-
-    def _fuse(self, raws):
-        tot = sum(self.weights) or 1.0
-        return sum(self._contribs(raws)) / tot
+    def _ztype(self, raws):
+        """各分支 z 分,最高者定缺陷类型(z 归一后可比)。"""
+        zs = [znorm(r, m, s) for r, (m, s) in zip(raws, self.stats)]
+        return self.branches[max(range(len(zs)), key=lambda i: zs[i])].defect_type
 
     def predict(self, img):
         raws = [b.score(img) for b in self.branches]
-        fused = self._fuse(raws)
-        is_def = bool(self.threshold is not None and fused >= self.threshold)
-        contrib = self._contribs(raws)
-        top = max(range(len(contrib)), key=lambda i: contrib[i])
-        return {"score": fused, "is_defect": is_def,
-                "defect_type": self.branches[top].defect_type if is_def else "normal"}
+        score = raws[0]                                   # 检测分 = EAD 核心
+        is_def = bool(self.threshold is not None and score >= self.threshold)
+        return {"score": score, "is_defect": is_def,
+                "defect_type": self._ztype(raws) if is_def else "normal"}

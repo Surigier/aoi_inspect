@@ -96,7 +96,7 @@ def _run_large(args, device):
                          o["defect_type"]])
         elif p.suffix in VID_EXT:
             frames = read_video_frames(str(p), size=2048)
-            scores = [det._fuse([b.score(f) for b in det.branches]) for f in frames]
+            scores = [det.branches[0].score(f) for f in frames]   # 检测分=EAD核心
             sm = moving_average(scores, 3)
             events = group_events([s >= det.threshold for s in sm], 2)
             is_def = len(events) > 0

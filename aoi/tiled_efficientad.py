@@ -10,7 +10,10 @@ from .fewshot import FewShotAdapter
 class TiledEfficientAD:
     def __init__(self, model_size="small", device="cuda", train_steps=10000,
                  tile=256, stride=256, tile_top_k=3, batch=16,
-                 whole_infer=True, max_size=1280):       # 默认=2060甜点(0.840/~106ms)
+                 whole_infer=True, max_size=1152, max_pixels=1_400_000):
+        # max_size 卡长边(1152)为主;max_pixels 仅作超大图安全网(1152²≈1.33M)。
+        # FP16 整图卷积:1152²方图~110ms@4060→~187ms@2060,达标且留余量;
+        # 1152 vs 1280 仅0.9×线性,精度基本保住(对比650k降分辨率会塌成0.49)。
         self.det = EfficientADDetector(model_size=model_size, device=device,
                                        train_steps=train_steps)
         self.tile = tile
@@ -19,6 +22,7 @@ class TiledEfficientAD:
         self.batch = batch
         self.whole_infer = whole_infer       # True:推理走整图全卷积(快,保细节);训练仍用块
         self.max_size = max_size
+        self.max_pixels = max_pixels
         self.threshold = None
 
     def _tiles(self, img):
@@ -36,7 +40,7 @@ class TiledEfficientAD:
 
     def _image_score(self, img):
         if self.whole_infer:
-            return self.det.score_large(img, max_size=self.max_size)
+            return self.det.score_large(img, max_size=self.max_size, max_pixels=self.max_pixels)
         scores = self.det.score_images(self._tiles(img), batch=self.batch)
         scores.sort(reverse=True)
         k = max(1, min(self.tile_top_k, len(scores)))

@@ -164,19 +164,29 @@ class EfficientADDetector:
         return float(combined.max()), None
 
     @torch.no_grad()
-    def score_large(self, img, max_size=1536):
+    def score_large(self, img, max_size=1280, max_pixels=None, use_half=True):
         """整图全卷积推理(ST 主分支,不分块不降采样)。PDN 全卷积→大图一次前向出全分辨率图。
-        只超 max_size 时才等比缩(控显存)。AE 分支固定256不参与大图。"""
+        等比缩以同时满足:长边≤max_size、面积≤max_pixels(后者保证方图也达标延时,
+        因延时∝面积;只卡长边时方图面积可达扁图3倍→延时爆)。
+        use_half:FP16 autocast,卷积吞吐~翻倍→全分辨率(1280)也<200ms@2060,免降分辨率砸精度。
+        AE 分支固定256不参与大图。"""
         if img.dim() == 3:
             img = img.unsqueeze(0)
         img = img.to(self.device)
-        if max(img.shape[-2:]) > max_size:
-            s = max_size / max(img.shape[-2:])
+        h, w = img.shape[-2:]
+        s = 1.0
+        if max(h, w) > max_size:
+            s = min(s, max_size / max(h, w))
+        if max_pixels is not None and h * w * s * s > max_pixels:
+            s = min(s, (max_pixels / (h * w)) ** 0.5)
+        if s < 1.0:
             img = F.interpolate(img, scale_factor=s, mode="bilinear", align_corners=False)
         x = (img - self._mean) / self._std
-        t = (self.teacher(x) - self.t_mean) / self.t_std
-        s = self.student(x)[:, :OUT]
-        map_st = ((t - s) ** 2).mean(1)
+        half = use_half and self.device != "cpu"        # FP16 仅 GPU;CPU 走 FP32(OpenVINO另导)
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=half):
+            t = (self.teacher(x) - self.t_mean) / self.t_std
+            st = self.student(x)[:, :OUT]
+            map_st = ((t - st) ** 2).mean(1)
         return float(map_st.max())
 
     @torch.no_grad()

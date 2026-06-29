@@ -6,3 +6,4 @@ runs/
 *.pt
 *.pth
 *.onnx
+data/_dl/

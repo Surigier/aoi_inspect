@@ -216,6 +216,29 @@ class EfficientADDetector:
         return amap[0, 0].cpu().numpy()
 
     @torch.no_grad()
+    def residual_map_large(self, img, max_size=1152, max_pixels=1_400_000, use_half=True):
+        """整图 per-pixel 多通道残差 (C=OUT, h', w'):teacher-student 逐通道平方差(未mean)。
+        供监督分割头(用30张标注缺陷掩膜训1×1 conv)——比单通道异常图信息更丰富。
+        返回 (C,h',w') float tensor(device 上),及相对原图的缩放比 s。"""
+        if img.dim() == 3:
+            img = img.unsqueeze(0)
+        img = img.to(self.device)
+        h, w = img.shape[-2:]
+        s = 1.0
+        if max(h, w) > max_size:
+            s = min(s, max_size / max(h, w))
+        if max_pixels is not None and h * w * s * s > max_pixels:
+            s = min(s, (max_pixels / (h * w)) ** 0.5)
+        x_img = F.interpolate(img, scale_factor=s, mode="bilinear", align_corners=False) if s < 1.0 else img
+        x = (x_img - self._mean) / self._std
+        half = use_half and self.device != "cpu"
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=half):
+            t = (self.teacher(x) - self.t_mean) / self.t_std
+            st = self.student(x)[:, :OUT]
+            res = (t - st) ** 2
+        return res[0].float()                          # (OUT, h', w')
+
+    @torch.no_grad()
     def score_images(self, imgs, batch=16):
         """批量打分(供分块大图批处理):imgs 列表 → 每图异常分(map 最大值)。"""
         out = []

@@ -10,13 +10,22 @@ try:
     _HAS_CV2 = True
 except Exception:
     _HAS_CV2 = False
+try:
+    import pyspng
+    _HAS_SPNG = True
+except Exception:
+    _HAS_SPNG = False
 from PIL import Image
 
 
 def load_fast(path, max_size=1152):
     """读盘 → (3,H,W) float[0,1] tensor,长边≤~max_size。
-    JPEG 走 cv2 reduced 解码(按需 1/2、1/4)直接少解码;PNG 全解码后缩放。"""
+    PNG:pyspng(~2×PIL,73ms@2500²);JPEG:cv2 reduced 解码(1/2、1/4)少解码;均缩到max_size。"""
     path = str(path)
+    if _HAS_SPNG and path.lower().endswith(".png"):
+        im = _spng_load(path, max_size)
+        if im is not None:
+            return _to_tensor(im)
     if _HAS_CV2:
         im = _cv2_load(path, max_size)
         if im is not None:
@@ -31,6 +40,24 @@ def load_fast(path, max_size=1152):
         s = max_size / max(w, h)
         img = img.resize((max(1, int(w * s)), max(1, int(h * s))), Image.BILINEAR)
     return _to_tensor(np.asarray(img))
+
+
+def _spng_load(path, max_size):
+    """pyspng 快速 PNG 解码(无reduced,全解码后缩放)。"""
+    try:
+        with open(path, "rb") as f:
+            im = pyspng.load(f.read())
+    except Exception:
+        return None
+    if im.ndim == 2:
+        im = np.stack([im] * 3, -1)
+    elif im.shape[2] == 4:
+        im = im[:, :, :3]
+    H, W = im.shape[:2]
+    if max(H, W) > max_size and _HAS_CV2:
+        s = max_size / max(H, W)
+        im = cv2.resize(im, (max(1, int(W * s)), max(1, int(H * s))), interpolation=cv2.INTER_AREA)
+    return np.ascontiguousarray(im)
 
 
 def _cv2_load(path, max_size):

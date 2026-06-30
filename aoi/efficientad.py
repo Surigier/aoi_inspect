@@ -190,6 +190,32 @@ class EfficientADDetector:
         return float(map_st.max())
 
     @torch.no_grad()
+    def anomaly_map_large(self, img, max_size=1152, max_pixels=1_400_000,
+                          use_half=True, out_hw=None):
+        """整图全卷积像素级异常图(ST 主分支),上采样到 out_hw(默认原图 HxW)。
+        用于像素级分割/定位评分(赛题按定位评准确率)。返回 (H,W) numpy。"""
+        if img.dim() == 3:
+            img = img.unsqueeze(0)
+        img = img.to(self.device)
+        H, W = img.shape[-2:]
+        h, w = H, W
+        s = 1.0
+        if max(h, w) > max_size:
+            s = min(s, max_size / max(h, w))
+        if max_pixels is not None and h * w * s * s > max_pixels:
+            s = min(s, (max_pixels / (h * w)) ** 0.5)
+        x_img = F.interpolate(img, scale_factor=s, mode="bilinear", align_corners=False) if s < 1.0 else img
+        x = (x_img - self._mean) / self._std
+        half = use_half and self.device != "cpu"
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=half):
+            t = (self.teacher(x) - self.t_mean) / self.t_std
+            st = self.student(x)[:, :OUT]
+            map_st = ((t - st) ** 2).mean(1, keepdim=True)        # (1,1,h',w')
+        oh, ow = out_hw if out_hw is not None else (H, W)
+        amap = F.interpolate(map_st.float(), size=(oh, ow), mode="bilinear", align_corners=False)
+        return amap[0, 0].cpu().numpy()
+
+    @torch.no_grad()
     def score_images(self, imgs, batch=16):
         """批量打分(供分块大图批处理):imgs 列表 → 每图异常分(map 最大值)。"""
         out = []

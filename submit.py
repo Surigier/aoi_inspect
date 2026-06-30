@@ -77,23 +77,48 @@ def _run_small(args, bb):
     return rows, adapter.threshold
 
 
+def _load_mask_for(defect_path, mask_dir):
+    """按文件名(或词干)在 mask_dir 找对应缺陷掩膜 → (H,W){0,1} numpy;找不到返回 None。"""
+    import numpy as np
+    from PIL import Image
+    md = Path(mask_dir)
+    cands = [md / defect_path.name, md / (defect_path.stem + ".png"),
+             md / (defect_path.stem + "_mask.png")]
+    for c in cands:
+        if c.exists():
+            return (np.array(Image.open(c).convert("L")) > 0).astype("uint8")
+    return None
+
+
 def _run_large(args, device):
-    """大图(2500²)路径:EfficientAD 核心 + 色彩/尺寸/结构融合(5类全覆盖 + 类型输出)。
-    无记忆库→延时恒定 ~106ms@2060;输出缺陷类型(最强分支)。"""
+    """大图(2500²)路径:EfficientAD 整图卷积(无库→延时恒定)。
+    缺陷带标注掩膜(--defect-mask)→ 训监督分割头提定位精度(赛题按分割/检测定位评)。
+    输出图级判决 + 缺陷类型 + 检测框(连通域)。"""
     from aoi.competition import CompetitionLargeDetector
+    from aoi.imageio import load_fast
     from aoi.video import moving_average, group_events
     det = CompetitionLargeDetector(device=device)
-    normals = [_load_img_native(p) for p in _img_files(args.normal)]
-    defects = [_load_img_native(p) for p in _img_files(args.defect)]
+    dfiles = _img_files(args.defect)
+    normals = [load_fast(p) for p in _img_files(args.normal)]
+    defects = [load_fast(p) for p in dfiles]
     if not normals or not defects:
         raise SystemExit("normal/ 与 defect/ 必须各含至少一张图片")
-    det.fit_fewshot(normals, defects)
+    masks = None
+    if args.defect_mask:
+        masks = [_load_mask_for(p, args.defect_mask) for p in dfiles]
+        if all(m is None for m in masks):
+            masks = None
+        else:
+            masks = [m if m is not None else __import__("numpy").zeros((8, 8), "uint8") for m in masks]
+    det.fit_fewshot(normals, defects, defect_masks=masks)
+    print(f"  监督分割头: {'已训(用掩膜)' if det.seg_head.head is not None else '未训(无掩膜→无监督定位)'}", flush=True)
     rows = []
     for p in sorted(Path(args.test).iterdir()):
         if p.suffix in IMG_EXT:
-            o = det.predict(_load_img_native(p))
+            o = det.locate(load_fast(p))
+            boxes = ";".join(f"{b[0]},{b[1]},{b[2]},{b[3]}" for b in o["boxes"])
             rows.append([p.name, "image", int(o["is_defect"]), round(o["score"], 4),
-                         o["defect_type"]])
+                         o["defect_type"], boxes])
         elif p.suffix in VID_EXT:
             frames = read_video_frames(str(p), size=2048)
             scores = [det.branches[0].score(f) for f in frames]   # 检测分=EAD核心
@@ -101,7 +126,7 @@ def _run_large(args, device):
             events = group_events([s >= det.threshold for s in sm], 2)
             is_def = len(events) > 0
             rows.append([p.name, "video", int(is_def), round(max(sm) if sm else 0.0, 4),
-                         f"events={events}" if is_def else "normal"])
+                         f"events={events}" if is_def else "normal", ""])
     return rows, det.threshold
 
 
@@ -109,6 +134,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--normal", help="正常样本目录(现场迁移;zero-shot 模式可省)")
     ap.add_argument("--defect", help="缺陷样本目录(现场迁移;zero-shot 模式可省)")
+    ap.add_argument("--defect-mask", help="缺陷标注掩膜目录(大图路径用→训监督分割头提定位精度)")
     ap.add_argument("--test", required=True, help="测试目录(图片/视频混合)")
     ap.add_argument("--out", default="result.csv")
     ap.add_argument("--size", type=int, default=320)
@@ -135,8 +161,8 @@ def main():
 
     with open(args.out, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["file", "type", "is_defect", "score", "detail"])
-        w.writerows(rows)
+        w.writerow(["file", "type", "is_defect", "score", "detail", "boxes"])
+        w.writerows([r if len(r) == 6 else r + [""] for r in rows])
     n_def = sum(r[2] for r in rows)
     print(f"处理 {len(rows)} 个样本(缺陷 {n_def});阈值={thr:.4f} → {args.out}")
 

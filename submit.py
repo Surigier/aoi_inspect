@@ -97,7 +97,7 @@ def _run_large(args, device):
     from aoi.competition import CompetitionLargeDetector
     from aoi.imageio import load_fast
     from aoi.video import moving_average, group_events
-    det = CompetitionLargeDetector(device=device)
+    det = CompetitionLargeDetector(device=device, compile_infer=True)   # 竞赛入口开 torch.compile 加速
     dfiles = _img_files(args.defect)
     normals = [load_fast(p) for p in _img_files(args.normal)]
     defects = [load_fast(p) for p in dfiles]

@@ -49,11 +49,12 @@ class _AuxBranch:
 
 
 class CompetitionLargeDetector:
-    def __init__(self, device="cuda", aux_size=320, train_steps=10000, seg_eval_hw=(256, 256)):
+    def __init__(self, device="cuda", aux_size=320, train_steps=10000, seg_eval_hw=(256, 256),
+                 compile_infer=False):
         dev = device if torch.cuda.is_available() else "cpu"
         bb = Backbone(device=dev)
         self.branches = [
-            _EADBranch(device=dev, train_steps=train_steps),
+            _EADBranch(device=dev, train_steps=train_steps, compile_infer=compile_infer),
             _AuxBranch(ColorADBranch(grid_size=16), "色彩变化", aux_size),
             _AuxBranch(DimensionADBranch(), "尺寸偏差", aux_size),
             _AuxBranch(StructuralADBranch(backbone=bb, grid_size=16), "缺件/逻辑", aux_size),

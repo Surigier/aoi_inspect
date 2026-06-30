@@ -61,13 +61,15 @@ class EfficientADDetector:
     """接口与 FewShotAdapter 一致(fit_fewshot / predict)。无记忆库。"""
 
     def __init__(self, model_size="small", device="cuda", train_steps=4000,
-                 image_size=256, lr=1e-4, seed=42):
+                 image_size=256, lr=1e-4, seed=42, compile_infer=False):
         self.size = model_size
         self.device = device if torch.cuda.is_available() else "cpu"
         self.train_steps = train_steps
         self.image_size = image_size
         self.lr = lr
         self.seed = seed
+        self.compile_infer = compile_infer            # 推理期 torch.compile 加速(fit后启用)
+        self._compiled = False
         get_pdn = get_pdn_small if model_size == "small" else get_pdn_medium
         self.teacher = get_pdn(OUT).eval().to(self.device)
         sd = torch.load(_WEIGHTS / f"teacher_{model_size}.pth", map_location="cpu")
@@ -127,12 +129,27 @@ class EfficientADDetector:
             loss = loss_hard + ((t_ae - ae_out) ** 2).mean() + ((ae_out - s_ae) ** 2).mean()
             opt.zero_grad(); loss.backward(); opt.step(); sched.step()
         self.student.eval(); self.ae.eval()
+        self._maybe_compile(train_n[0] if train_n else None)
         self._map_norm(val_n if val_n else train_n)
         if defect_images:
             ns = [self._image_score(x)[0] for x in normal_images]
             ds = [self._image_score(x)[0] for x in defect_images]
             self.threshold = FewShotAdapter._calibrate(ns, ds)
         return self.threshold
+
+    def _maybe_compile(self, warm_img):
+        """fit 后用 torch.compile 加速推理(dynamic 应对变尺寸大图)。实测方形-24%、细长-56%。
+        warm_img 用于预热(编译在不计时的 fit 阶段完成);失败则静默回退 eager。"""
+        if not self.compile_infer or self._compiled or self.device == "cpu":
+            return
+        try:
+            self.teacher = torch.compile(self.teacher, dynamic=True)
+            self.student = torch.compile(self.student, dynamic=True)
+            self._compiled = True
+            if warm_img is not None:
+                self.score_large(warm_img)                # 触发编译(untimed)
+        except Exception:
+            self._compiled = False                        # 回退 eager,不影响正确性
 
     @torch.no_grad()
     def _maps(self, img):

@@ -55,9 +55,11 @@ def map_to_boxes(amap, thr, min_area_frac=0.0008, close=3, max_boxes=20):
 class SupervisedSegHead:
     """残差(C通道)→ 逐像素缺陷 logit。fit 用缺陷掩膜+正常负样本;apply 出像素图。"""
 
-    def __init__(self, device="cuda", steps=300, lr=0.01, neg_per_img=400, seed=0):
+    def __init__(self, device="cuda", steps=300, lr=0.01, neg_per_img=400, seed=0, n_synth=0):
         self.device = device if torch.cuda.is_available() else "cpu"
         self.steps, self.lr, self.neg_per_img, self.seed = steps, lr, neg_per_img, seed
+        # n_synth 默认0(关):实测合成在同域(赛题场景)可靠掉分-0.02~-0.07,跨域噪声不稳。保留代码opt-in。
+        self.n_synth = n_synth
         self.head = self.mu = self.sd = None
 
     @torch.no_grad()
@@ -68,16 +70,29 @@ class SupervisedSegHead:
 
     def fit(self, det, defect_imgs, defect_masks, normal_imgs):
         """defect_masks: 每张缺陷的 (H,W){0,1} numpy。normal_imgs:正常图(全负)。"""
+        import random as _random
+        from .synth import synth_defect
         rng = np.random.RandomState(self.seed)
+        srng = _random.Random(self.seed)
         Xs, ys = [], []
-        for img, mask in zip(defect_imgs, defect_masks):
+
+        def _add(img, mask_hw):
             feat, (h, w) = self._feats(det, img)
-            gt = _mask_to(mask, h, w).ravel()
+            gt = _mask_to(mask_hw, h, w).ravel()
             pos = np.where(gt == 1)[0]; neg = np.where(gt == 0)[0]
             if len(neg) > self.neg_per_img:
                 neg = rng.choice(neg, self.neg_per_img, replace=False)
             idx = np.concatenate([pos, neg])
             Xs.append(feat[idx].cpu().numpy()); ys.append(gt[idx])
+
+        for img, mask in zip(defect_imgs, defect_masks):
+            _add(img, mask)
+        # 反事实合成缺陷(正常→缺陷)扩张分布→泛化(赛题点名合成缺陷),fit时跑不计时
+        if self.n_synth and normal_imgs:
+            for _ in range(self.n_synth):
+                base = normal_imgs[srng.randrange(len(normal_imgs))]
+                d_img, d_mask = synth_defect(base, srng)
+                _add(d_img, d_mask)
         for img in normal_imgs:
             feat, (h, w) = self._feats(det, img)
             neg = rng.choice(h * w, min(self.neg_per_img, h * w), replace=False)

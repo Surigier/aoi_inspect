@@ -71,8 +71,13 @@ class CompetitionLargeDetector:
 
     @torch.no_grad()
     def _wrn_feats(self, img):
-        """img(3,H,W)[0,1] → WRN50 多层拼接特征 (C,h,w)。下采样到 aux_size 提特征(~8ms)。"""
-        return self._bb.extract(_down(img, self._seg_in))[0]
+        """img(3,H,W)[0,1] → WRN50 多层拼接特征 (C,h,w)。
+        先搬 GPU 再下采样(大图在 CPU 上 interpolate 要 ~50ms,GPU 上 ~1ms),再提特征(~8ms)。"""
+        if img.dim() == 3:
+            img = img.unsqueeze(0)
+        img = img.to(self._bb.device)
+        img = F.interpolate(img, size=(self._seg_in, self._seg_in), mode="bilinear", align_corners=False)
+        return self._bb.extract(img)[0]
 
     def fit_fewshot(self, normals, defects, defect_masks=None):
         """检测由 EAD 核心(branches[0])单独负责;辅助分支只为'类型归属'拟合并估 μ/σ。

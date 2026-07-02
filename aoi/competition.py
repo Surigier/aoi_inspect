@@ -50,7 +50,8 @@ class _AuxBranch:
 
 class CompetitionLargeDetector:
     def __init__(self, device="cuda", aux_size=320, train_steps=10000, seg_eval_hw=(256, 256),
-                 compile_infer=False, sam_refine=True, roi_zoom=True):
+                 compile_infer=False, sam_refine=True, roi_zoom=False):
+        # roi_zoom 默认关:AD2真大图实测负面(0.131→0.072,裁块尺度失配+阈值不匹配),留待修复
         dev = device if torch.cuda.is_available() else "cpu"
         bb = Backbone(device=dev)
         self.branches = [

@@ -50,7 +50,7 @@ class _AuxBranch:
 
 class CompetitionLargeDetector:
     def __init__(self, device="cuda", aux_size=320, train_steps=10000, seg_eval_hw=(256, 256),
-                 compile_infer=False, sam_refine=True):
+                 compile_infer=False, sam_refine=True, roi_zoom=True):
         dev = device if torch.cuda.is_available() else "cpu"
         bb = Backbone(device=dev)
         self.branches = [
@@ -72,6 +72,7 @@ class CompetitionLargeDetector:
         self.pix_thr = None                                # 像素图二值阈值(正常分位标定)
         from .sam_refine import SamRefiner
         self.sam = SamRefiner() if sam_refine else None    # SAM边界精化(仅判缺陷图触发)
+        self.roi_zoom = roi_zoom                           # 2500²大图:粗定位→原生裁块→局部重分割
 
     @torch.no_grad()
     def _wrn_feats(self, img):
@@ -99,9 +100,48 @@ class CompetitionLargeDetector:
         ds = [ead.score(d) for d in defects]
         self.threshold = FewShotAdapter._calibrate(ns, ds)    # 阈值标在 EAD 分上
         if defect_masks is not None:
-            self.seg_head.fit(self._eff(), defects, defect_masks, normals[:30])
+            d_imgs, d_masks = list(defects), list(defect_masks)
+            if self.roi_zoom:
+                ci, cm = self._native_crops(defects, defect_masks)   # 原生裁块样本(教头认放大视角)
+                d_imgs += ci; d_masks += cm
+            self.seg_head.fit(self._eff(), d_imgs, d_masks, normals[:30])
         self._calibrate_pixel(normals)
         return self.threshold
+
+    def _native_crops(self, imgs, masks, pad=1.0, min_c=256, max_c=1024):
+        """对每张缺陷图:按掩膜连通域在原生分辨率裁块(带上下文),供分割头训练。
+        小图(长边<700)原生≈全局视角,跳过。返回 (crop_imgs, crop_masks)。"""
+        import numpy as np
+        try:
+            import cv2
+        except Exception:
+            return [], []
+        ci, cm = [], []
+        for img, mk in zip(imgs, masks):
+            H, W = img.shape[-2:]
+            if max(H, W) < 700:
+                continue
+            mh, mw = mk.shape
+            n, _, stats, _ = cv2.connectedComponentsWithStats(mk.astype(np.uint8), connectivity=8)
+            for i in range(1, min(n, 4)):
+                x, y, w, h, a = stats[i]
+                if a < 2:
+                    continue
+                # 掩膜坐标 → 原图坐标
+                cx, cy = (x + w / 2) * W / mw, (y + h / 2) * H / mh
+                side = int(min(max(max(w * W / mw, h * H / mh) * (1 + 2 * pad), min_c), max_c))
+                x0 = int(np.clip(cx - side / 2, 0, max(0, W - side)))
+                y0 = int(np.clip(cy - side / 2, 0, max(0, H - side)))
+                x1, y1 = min(W, x0 + side), min(H, y0 + side)
+                crop = img[:, y0:y1, x0:x1]
+                # 掩膜对应子区域(掩膜空间)
+                mx0, my0 = int(x0 * mw / W), int(y0 * mh / H)
+                mx1, my1 = max(mx0 + 1, int(x1 * mw / W)), max(my0 + 1, int(y1 * mh / H))
+                sub = mk[my0:my1, mx0:mx1]
+                if sub.sum() == 0:
+                    continue
+                ci.append(crop); cm.append(sub.astype(np.uint8))
+        return ci, cm
 
     def _eff(self):
         """底层 EfficientADDetector(residual_map_large/anomaly_map_large 在它上面)。"""
@@ -134,6 +174,8 @@ class CompetitionLargeDetector:
         res["anomaly_map"] = amap
         if res["is_defect"]:
             mask = (amap >= thr).astype(np.uint8)
+            if self.roi_zoom:
+                mask = self._zoom_refine(img if img.dim() == 3 else img[0], mask, thr)  # 原生裁块重分割
             if self.sam is not None:
                 mask = self.sam.refine(img if img.dim() == 3 else img[0], mask)  # SAM粗到细,IoU均值+23%
             res["mask"] = mask
@@ -143,6 +185,40 @@ class CompetitionLargeDetector:
             res["mask"] = None
             res["boxes"] = []
         return res
+
+    def _zoom_refine(self, img, mask, thr, pad=1.0, min_c=256, max_c=1024, max_regions=6):
+        """2500²大图定位精化:粗掩膜连通域→原生分辨率裁块→分割头重打分→贴回。
+        消除'全图下采样512把微小缺陷抹掉'的结构损失;小图(长边<700)直接返回。"""
+        import numpy as np
+        try:
+            import cv2
+        except Exception:
+            return mask
+        H, W = img.shape[-2:]
+        if max(H, W) < 700 or self.seg_head.head is None:
+            return mask
+        mh, mw = mask.shape
+        n, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if n <= 1:
+            return mask
+        out = mask.copy()
+        for i in range(1, min(n, max_regions + 1)):
+            x, y, w, h, a = stats[i]
+            if a < 2:
+                continue
+            cx, cy = (x + w / 2) * W / mw, (y + h / 2) * H / mh
+            side = int(min(max(max(w * W / mw, h * H / mh) * (1 + 2 * pad), min_c), max_c))
+            x0 = int(np.clip(cx - side / 2, 0, max(0, W - side)))
+            y0 = int(np.clip(cy - side / 2, 0, max(0, H - side)))
+            x1, y1 = min(W, x0 + side), min(H, y0 + side)
+            sub_amap = self.seg_head.map(self._eff(), img[:, y0:y1, x0:x1], (128, 128))
+            sub_mask = (sub_amap >= thr).astype(np.uint8)
+            # 贴回掩膜空间对应区域
+            mx0, my0 = int(x0 * mw / W), int(y0 * mh / H)
+            mx1, my1 = max(mx0 + 1, int(x1 * mw / W)), max(my0 + 1, int(y1 * mh / H))
+            sub_rs = cv2.resize(sub_mask, (mx1 - mx0, my1 - my0), interpolation=cv2.INTER_NEAREST)
+            out[my0:my1, mx0:mx1] = sub_rs
+        return out
 
     def _ztype(self, raws):
         """各分支 z 分,最高者定缺陷类型(z 归一后可比)。"""

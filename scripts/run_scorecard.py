@@ -99,27 +99,27 @@ def evaluate(name, normals, fit_i, fit_m, test_defs, test_goods):
 
 def prep_mvtec(cat, folders):
     root = Path(f"data/mvtec/{cat}")
-    normals = [_load_img(p, 320) for p in sorted(glob.glob(str(root / "train/good/*.png")))[:100]]
-    goods = [(_load_img(p, 320), None) for p in sorted(glob.glob(str(root / "test/good/*.png")))[:40]]
+    normals = [_load_img(p, 640) for p in sorted(glob.glob(str(root / "train/good/*.png")))[:100]]
+    goods = [(_load_img(p, 640), None) for p in sorted(glob.glob(str(root / "test/good/*.png")))[:40]]
     df = []
     for fo in folders:
         df += [(p, fo) for p in sorted(glob.glob(str(root / "test" / fo / "*.png")))]
     random.Random(0).shuffle(df); k = max(5, len(df) // 3)
-    fit_i = [_load_img(p, 320) for p, _ in df[:k]]
+    fit_i = [_load_img(p, 640) for p, _ in df[:k]]
     fit_m = [_read(GT / cat / "ground_truth" / fo / (Path(p).stem + "_mask.png"), HW) for p, fo in df[:k]]
-    test_defs = [(_load_img(p, 320), _read(GT / cat / "ground_truth" / fo / (Path(p).stem + "_mask.png"), HW)) for p, fo in df[k:]]
+    test_defs = [(_load_img(p, 640), _read(GT / cat / "ground_truth" / fo / (Path(p).stem + "_mask.png"), HW)) for p, fo in df[k:]]
     return normals, fit_i, fit_m, test_defs, goods
 
 
 def prep_realiad(cat):
     d = json.load(open(RJ / f"{cat}.json")); R = RI / cat
     tok = [x for x in d["train"] if x["anomaly_class"] == "OK"]; random.Random(0).shuffle(tok)
-    normals = [_load_img(R / x["image_path"], 320) for x in tok[:100]]
+    normals = [_load_img(R / x["image_path"], 640) for x in tok[:100]]
     ng = [x for x in d["test"] if x["anomaly_class"] != "OK"]; random.Random(0).shuffle(ng)
-    fit_i = [_load_img(R / x["image_path"], 320) for x in ng[:30]]
+    fit_i = [_load_img(R / x["image_path"], 640) for x in ng[:30]]
     fit_m = [_read(R / x["mask_path"], HW) for x in ng[:30]]
-    test_defs = [(_load_img(R / x["image_path"], 320), _read(R / x["mask_path"], HW)) for x in ng[30:70]]
-    goods = [(_load_img(R / x["image_path"], 320), None) for x in d["test"] if x["anomaly_class"] == "OK"][:40]
+    test_defs = [(_load_img(R / x["image_path"], 640), _read(R / x["mask_path"], HW)) for x in ng[30:70]]
+    goods = [(_load_img(R / x["image_path"], 640), None) for x in d["test"] if x["anomaly_class"] == "OK"][:40]
     return normals, fit_i, fit_m, test_defs, goods
 
 

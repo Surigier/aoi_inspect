@@ -53,21 +53,25 @@ def map_to_boxes(amap, thr, min_area_frac=0.0008, close=3, max_boxes=20):
 
 
 class SupervisedSegHead:
-    """残差(C通道)→ 逐像素缺陷 logit。fit 用缺陷掩膜+正常负样本;apply 出像素图。"""
+    """逐像素特征(C通道)→ 缺陷 logit。fit 用缺陷掩膜+正常负样本;apply 出像素图。
+    特征源可插拔(extractor):默认 EAD 残差;生产定位用 WRN50 特征
+    (实测 best-IoU 0.263→0.432 +64%,电子件上尤胜 DINOv2)。"""
 
-    def __init__(self, device="cuda", steps=300, lr=0.01, neg_per_img=400, seed=0, n_synth=0):
+    def __init__(self, device="cuda", steps=300, lr=0.01, neg_per_img=400, seed=0, n_synth=0,
+                 extractor=None):
         self.device = device if torch.cuda.is_available() else "cpu"
         self.steps, self.lr, self.neg_per_img, self.seed = steps, lr, neg_per_img, seed
         # n_synth 默认0(关):实测合成在同域(赛题场景)可靠掉分-0.02~-0.07,跨域噪声不稳。保留代码opt-in。
         self.n_synth = n_synth
+        self.extractor = extractor                         # img(3,H,W)→(C,h,w);None=EAD残差
         self.head = self.mu = self.sd = None
         self.thr = None                                    # fit缺陷掩膜标定的F1最优像素阈值
 
     @torch.no_grad()
     def _feats(self, det, img):
-        res = det.residual_map_large(img)                  # (C,h,w)
-        C, h, w = res.shape
-        return res.reshape(C, -1).t(), (h, w)              # (h*w, C)
+        f = self.extractor(img) if self.extractor is not None else det.residual_map_large(img)
+        C, h, w = f.shape
+        return f.reshape(C, -1).t(), (h, w)                # (h*w, C)
 
     def fit(self, det, defect_imgs, defect_masks, normal_imgs):
         """defect_masks: 每张缺陷的 (H,W){0,1} numpy。normal_imgs:正常图(全负)。"""

@@ -62,9 +62,17 @@ class CompetitionLargeDetector:
         self.stats = []
         self.weights = []
         self.threshold = None
-        self.seg_head = SupervisedSegHead(device=dev)
+        self._bb = bb
+        self._seg_in = aux_size                            # 定位特征的下采样输入(与辅助分支同)
+        # 定位头用 WRN50 特征(实测 best-IoU 0.263→0.432 +64%,电子件优于 DINOv2/EAD残差)
+        self.seg_head = SupervisedSegHead(device=dev, extractor=self._wrn_feats)
         self.seg_eval_hw = seg_eval_hw
         self.pix_thr = None                                # 像素图二值阈值(正常分位标定)
+
+    @torch.no_grad()
+    def _wrn_feats(self, img):
+        """img(3,H,W)[0,1] → WRN50 多层拼接特征 (C,h,w)。下采样到 aux_size 提特征(~8ms)。"""
+        return self._bb.extract(_down(img, self._seg_in))[0]
 
     def fit_fewshot(self, normals, defects, defect_masks=None):
         """检测由 EAD 核心(branches[0])单独负责;辅助分支只为'类型归属'拟合并估 μ/σ。

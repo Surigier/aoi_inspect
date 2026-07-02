@@ -50,7 +50,7 @@ class _AuxBranch:
 
 class CompetitionLargeDetector:
     def __init__(self, device="cuda", aux_size=320, train_steps=10000, seg_eval_hw=(256, 256),
-                 compile_infer=False):
+                 compile_infer=False, sam_refine=True):
         dev = device if torch.cuda.is_available() else "cpu"
         bb = Backbone(device=dev)
         self.branches = [
@@ -68,6 +68,8 @@ class CompetitionLargeDetector:
         self.seg_head = SupervisedSegHead(device=dev, extractor=self._wrn_feats)
         self.seg_eval_hw = seg_eval_hw
         self.pix_thr = None                                # 像素图二值阈值(正常分位标定)
+        from .sam_refine import SamRefiner
+        self.sam = SamRefiner() if sam_refine else None    # SAM边界精化(仅判缺陷图触发)
 
     @torch.no_grad()
     def _wrn_feats(self, img):
@@ -123,11 +125,21 @@ class CompetitionLargeDetector:
 
     def locate(self, img):
         """完整定位输出:图级分(EAD)+ 判决 + 类型 + 像素图 + 检测框。"""
+        import numpy as np
         res = self.predict(img)
         amap = self.segment(img)
         thr = self.pix_thr if self.pix_thr is not None else float(amap.mean() + 3 * amap.std())
         res["anomaly_map"] = amap
-        res["boxes"] = map_to_boxes(amap, thr) if res["is_defect"] else []
+        if res["is_defect"]:
+            mask = (amap >= thr).astype(np.uint8)
+            if self.sam is not None:
+                mask = self.sam.refine(img if img.dim() == 3 else img[0], mask)  # SAM粗到细,IoU均值+23%
+            res["mask"] = mask
+            # 掩膜已阈值化+SAM精化,面积门槛放宽到~13px(默认52px会滤掉pcb类5×5微小缺陷)
+            res["boxes"] = map_to_boxes(mask.astype(np.float32), 0.5, min_area_frac=0.0002, close=0)
+        else:
+            res["mask"] = None
+            res["boxes"] = []
         return res
 
     def _ztype(self, raws):

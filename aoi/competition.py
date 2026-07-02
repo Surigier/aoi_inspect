@@ -62,9 +62,11 @@ class CompetitionLargeDetector:
         self.stats = []
         self.weights = []
         self.threshold = None
-        self._bb = bb
-        self._seg_in = aux_size                            # 定位特征的下采样输入(与辅助分支同)
-        # 定位头用 WRN50 特征(实测 best-IoU 0.263→0.432 +64%,电子件优于 DINOv2/EAD残差)
+        # 定位专用浅层骨干:WRN50 layers(1,2) @512 → 128²特征格(现状40²比微小缺陷粗)。
+        # 扫描实测(run_feat_res.py):IoU均值0.305→0.449(+47%),pcb+53%/battery+74%/pill+72%,
+        # 且浅层更快(8ms vs 36ms)。640过犹不及。结构分支仍用默认bb(layers 2,3)不受影响。
+        self._bb_loc = Backbone(layers=(1, 2), device=dev)
+        self._seg_in = 512
         self.seg_head = SupervisedSegHead(device=dev, extractor=self._wrn_feats)
         self.seg_eval_hw = seg_eval_hw
         self.pix_thr = None                                # 像素图二值阈值(正常分位标定)
@@ -73,13 +75,13 @@ class CompetitionLargeDetector:
 
     @torch.no_grad()
     def _wrn_feats(self, img):
-        """img(3,H,W)[0,1] → WRN50 多层拼接特征 (C,h,w)。
-        先搬 GPU 再下采样(大图在 CPU 上 interpolate 要 ~50ms,GPU 上 ~1ms),再提特征(~8ms)。"""
+        """img(3,H,W)[0,1] → WRN50 浅层(1,2)特征 (C,128,128)。
+        先搬 GPU 再下采样(大图 CPU interpolate 慢),再提特征(~8ms)。"""
         if img.dim() == 3:
             img = img.unsqueeze(0)
-        img = img.to(self._bb.device)
+        img = img.to(self._bb_loc.device)
         img = F.interpolate(img, size=(self._seg_in, self._seg_in), mode="bilinear", align_corners=False)
-        return self._bb.extract(img)[0]
+        return self._bb_loc.extract(img)[0]
 
     def fit_fewshot(self, normals, defects, defect_masks=None):
         """检测由 EAD 核心(branches[0])单独负责;辅助分支只为'类型归属'拟合并估 μ/σ。

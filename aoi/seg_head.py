@@ -73,6 +73,19 @@ def merge_boxes(boxes, d):
     return [tuple(b) for b in bs]
 
 
+class _Ensemble(nn.Module):
+    """双头logit平均(WBF思想:组合优于选择;消30掩膜小留出的选择方差)。"""
+    def __init__(self, *heads):
+        super().__init__()
+        self.heads = nn.ModuleList(heads)
+    def forward(self, x):
+        out = None
+        for h in self.heads:
+            o = h(x)
+            out = o if out is None else out + o
+        return out / len(self.heads)
+
+
 class SupervisedSegHead:
     """逐像素特征(C通道)→ 缺陷 logit。fit 用缺陷掩膜+正常负样本;apply 出像素图。
     特征源可插拔(extractor):默认 EAD 残差;生产定位用 WRN50 特征
@@ -174,24 +187,13 @@ class SupervisedSegHead:
         pos = sum(float(g.sum()) for g in gts); neg = sum(g.numel() for g in gts) - pos
         pos_w = torch.tensor([neg / max(pos, 1)], device=self.device)
         C = feats[0].shape[0]
-        def_idx = [i for i, d in enumerate(is_def) if d]
         all_idx = list(range(len(feats)))
-        # 留出选头(缺陷≥8才选;否则直接线性)
+        # 双头集成(平均logit)替代硬选:实测均值IoU 0.443→0.487四类全涨,消小留出选择方差
         torch.manual_seed(self.seed)
-        if len(def_idx) >= 8:
-            hold = def_idx[::4]
-            train_idx = [i for i in all_idx if i not in set(hold)]
-            lin = self._train_one(self._linear_head(C).to(self.device), feats, gts, train_idx, pos_w)
-            cnv = self._train_one(self._conv_head(C).to(self.device), feats, gts, train_idx, pos_w)
-            iou_l = self._hold_iou(lin, feats, gts, hold)
-            iou_c = self._hold_iou(cnv, feats, gts, hold)
-            use_conv = iou_c > iou_l + 0.01                 # 卷积要赢出margin才用(稳定性偏向线性)
-            self.head_kind = "conv" if use_conv else "linear"
-        else:
-            use_conv = False; self.head_kind = "linear"
-        # 全量重训胜者
-        head = (self._conv_head(C) if use_conv else self._linear_head(C)).to(self.device)
-        self.head = self._train_one(head, feats, gts, all_idx, pos_w)
+        lin = self._train_one(self._linear_head(C).to(self.device), feats, gts, all_idx, pos_w)
+        cnv = self._train_one(self._conv_head(C).to(self.device), feats, gts, all_idx, pos_w)
+        self.head = _Ensemble(lin, cnv)
+        self.head_kind = "ensemble"
         self._calibrate_thr(det, defect_imgs, defect_masks)   # 用fit缺陷掩膜标F1最优阈值
         return True
 

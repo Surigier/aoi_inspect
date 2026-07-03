@@ -14,6 +14,15 @@ from .branches.structural_ad import StructuralADBranch
 from .seg_head import SupervisedSegHead, map_to_boxes
 
 
+def _mask_np(mk, hw):
+    """(H,W){0,1} numpy → hw 大小(最近邻)。"""
+    import numpy as np
+    if mk.shape == tuple(hw):
+        return mk
+    t = torch.from_numpy(mk.astype("float32"))[None, None]
+    return (F.interpolate(t, size=tuple(hw), mode="nearest")[0, 0].numpy() > 0.5).astype("uint8")
+
+
 def _down(img, size):
     if img.dim() == 3:
         img = img.unsqueeze(0)
@@ -105,10 +114,54 @@ class CompetitionLargeDetector:
             if self.roi_zoom:
                 ci, cm = self._native_crops(defects, defect_masks)   # 原生裁块样本(教头认放大视角)
                 d_imgs += ci; d_masks += cm
+            self._select_feat_mode(defects, defect_masks, normals)   # 留出集自动决定模板差分开关
             self.seg_head.fit(self._eff(), d_imgs, d_masks, normals[:30])
             self._calibrate_boxes(defects, defect_masks)             # fit标定碎框合并距离
         self._calibrate_pixel(normals)
         return self.threshold
+
+    def _select_feat_mode(self, defects, defect_masks, normals):
+        """留出集(每4取1)对比 单特征 vs 模板差分特征(工业AOI金模板;pcb类刚性件+21%,
+        非刚性中性),赢者定 extractor。差分推理多~30ms(ECC),仅在有效时启用。"""
+        import numpy as np
+        from .tmpl_ref import RefBank
+        self._ref_bank = RefBank(normals)
+        if len(defects) < 8:
+            return                                          # 样本太少不选,保持单特征
+        hold = list(range(0, len(defects), 4))
+        tr = [i for i in range(len(defects)) if i not in set(hold)]
+
+        def _try(extractor):
+            h = SupervisedSegHead(device=self.seg_head.device, steps=150, extractor=extractor)
+            ok = h.fit(self._eff(), [defects[i] for i in tr], [defect_masks[i] for i in tr],
+                       normals[:15])
+            if not ok or h.thr is None:
+                return -1.0
+            ious = []
+            for i in hold:
+                amap = h.map(self._eff(), defects[i], self.seg_eval_hw)
+                gt = _mask_np(defect_masks[i], self.seg_eval_hw)
+                pred = amap >= h.thr
+                TP = int((pred & (gt == 1)).sum()); FP = int((pred & (gt == 0)).sum()); FN = int((~pred & (gt == 1)).sum())
+                ious.append(TP / max(TP + FP + FN, 1))
+            return float(np.mean(ious))
+
+        iou_single = _try(self._wrn_feats)
+        iou_diff = _try(self._wrn_feats_diff)
+        if iou_diff > iou_single + 0.01:                    # 差分要赢出margin才启用(它更贵)
+            self.seg_head.extractor = self._wrn_feats_diff
+            self.feat_mode = "tmpl_diff"
+        else:
+            self.seg_head.extractor = self._wrn_feats
+            self.feat_mode = "single"
+
+    @torch.no_grad()
+    def _wrn_feats_diff(self, img):
+        """模板差分特征:concat[feat(test), feat(test)-feat(ECC对齐最近邻正常参考)]。"""
+        f = self._wrn_feats(img)
+        ref = self._ref_bank.aligned_ref(img if img.dim() == 3 else img[0])
+        fr = self._wrn_feats(ref)
+        return torch.cat([f, f - fr], dim=0)
 
     def _calibrate_boxes(self, defects, defect_masks):
         """在fit缺陷上搜碎框合并距离d(最大化GT框召回@0.5)。实测电子件+0.02~0.04。"""

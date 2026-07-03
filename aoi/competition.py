@@ -106,8 +106,50 @@ class CompetitionLargeDetector:
                 ci, cm = self._native_crops(defects, defect_masks)   # 原生裁块样本(教头认放大视角)
                 d_imgs += ci; d_masks += cm
             self.seg_head.fit(self._eff(), d_imgs, d_masks, normals[:30])
+            self._calibrate_boxes(defects, defect_masks)             # fit标定碎框合并距离
         self._calibrate_pixel(normals)
         return self.threshold
+
+    def _calibrate_boxes(self, defects, defect_masks):
+        """在fit缺陷上搜碎框合并距离d(最大化GT框召回@0.5)。实测电子件+0.02~0.04。"""
+        import numpy as np
+        from .seg_head import merge_boxes
+        try:
+            import cv2
+        except Exception:
+            self.box_merge_d = 0; return
+        if self.seg_head.thr is None:
+            self.box_merge_d = 0; return
+
+        def gtb(mk):
+            m = cv2.resize(mk.astype(np.uint8), self.seg_eval_hw[::-1], interpolation=cv2.INTER_NEAREST)
+            n, _, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+            return [(x, y, x + w, y + h) for x, y, w, h, a in (st[i] for i in range(1, n)) if a >= 4]
+
+        def biou(a, b):
+            x1, y1 = max(a[0], b[0]), max(a[1], b[1]); x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+            inter = max(0, x2 - x1) * max(0, y2 - y1)
+            return inter / max((a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter, 1)
+
+        preds, gts = [], []
+        for img, mk in zip(defects, defect_masks):
+            amap = self.segment(img)
+            preds.append(map_to_boxes((amap >= self.seg_head.thr).astype(np.float32), 0.5,
+                                      min_area_frac=0.0002, close=0))
+            gts.append(gtb(mk))
+        best_d, best_h = 0, -1
+        for d in [0, 4, 8, 16]:
+            tot = hit = 0
+            for pb, gb in zip(preds, gts):
+                mb = merge_boxes(pb, d)
+                for g in gb:
+                    tot += 1
+                    if any(biou(p[:4], g) >= 0.5 for p in mb):
+                        hit += 1
+            h = hit / max(tot, 1)
+            if h > best_h:
+                best_h, best_d = h, d
+        self.box_merge_d = best_d
 
     def _native_crops(self, imgs, masks, pad=1.0, min_c=256, max_c=1024):
         """对每张缺陷图:按掩膜连通域在原生分辨率裁块(带上下文),供分割头训练。
@@ -181,7 +223,9 @@ class CompetitionLargeDetector:
                 mask = self.sam.refine(img if img.dim() == 3 else img[0], mask)  # SAM粗到细,IoU均值+23%
             res["mask"] = mask
             # 掩膜已阈值化+SAM精化,面积门槛放宽到~13px(默认52px会滤掉pcb类5×5微小缺陷)
-            res["boxes"] = map_to_boxes(mask.astype(np.float32), 0.5, min_area_frac=0.0002, close=0)
+            from .seg_head import merge_boxes
+            boxes = map_to_boxes(mask.astype(np.float32), 0.5, min_area_frac=0.0002, close=0)
+            res["boxes"] = merge_boxes(boxes, getattr(self, "box_merge_d", 0))
         else:
             res["mask"] = None
             res["boxes"] = []

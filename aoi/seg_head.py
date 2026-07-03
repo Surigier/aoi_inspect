@@ -52,6 +52,27 @@ def map_to_boxes(amap, thr, min_area_frac=0.0008, close=3, max_boxes=20):
     return boxes[:max_boxes]
 
 
+def merge_boxes(boxes, d):
+    """近邻(间距<d)框合并为union(碎框合并,fit标定d;实测电子件框命中+0.02~0.04)。"""
+    if d <= 0 or len(boxes) <= 1:
+        return boxes
+    bs = [list(b) for b in boxes]
+    changed = True
+    while changed and len(bs) > 1:
+        changed = False
+        for i in range(len(bs)):
+            for j in range(i + 1, len(bs)):
+                a, b = bs[i], bs[j]
+                if a[0] - d < b[2] and b[0] - d < a[2] and a[1] - d < b[3] and b[1] - d < a[3]:
+                    bs[i] = [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]),
+                             max(a[4], b[4])]
+                    bs.pop(j); changed = True
+                    break
+            if changed:
+                break
+    return [tuple(b) for b in bs]
+
+
 class SupervisedSegHead:
     """逐像素特征(C通道)→ 缺陷 logit。fit 用缺陷掩膜+正常负样本;apply 出像素图。
     特征源可插拔(extractor):默认 EAD 残差;生产定位用 WRN50 特征
@@ -68,53 +89,109 @@ class SupervisedSegHead:
         self.thr = None                                    # fit缺陷掩膜标定的F1最优像素阈值
 
     @torch.no_grad()
-    def _feats(self, det, img):
-        f = self.extractor(img) if self.extractor is not None else det.residual_map_large(img)
-        C, h, w = f.shape
-        return f.reshape(C, -1).t(), (h, w)                # (h*w, C)
+    def _fmap(self, det, img):
+        """img → (C,h,w) 特征图。"""
+        return self.extractor(img) if self.extractor is not None else det.residual_map_large(img)
 
-    def fit(self, det, defect_imgs, defect_masks, normal_imgs):
-        """defect_masks: 每张缺陷的 (H,W){0,1} numpy。normal_imgs:正常图(全负)。"""
-        import random as _random
-        from .synth import synth_defect
-        rng = np.random.RandomState(self.seed)
-        srng = _random.Random(self.seed)
-        Xs, ys = [], []
+    @staticmethod
+    def _linear_head(C):
+        return nn.Conv2d(C, 1, 1)
 
-        def _add(img, mask_hw):
-            feat, (h, w) = self._feats(det, img)
-            gt = _mask_to(mask_hw, h, w).ravel()
-            pos = np.where(gt == 1)[0]; neg = np.where(gt == 0)[0]
-            if len(neg) > self.neg_per_img:
-                neg = rng.choice(neg, self.neg_per_img, replace=False)
-            idx = np.concatenate([pos, neg])
-            Xs.append(feat[idx].cpu().numpy()); ys.append(gt[idx])
+    @staticmethod
+    def _conv_head(C, mid=64):
+        """1×1降维+3×3上下文+1×1输出(~10万参)。AD2大图实测+0.119,小图略输线性→fit留出自动选。"""
+        return nn.Sequential(nn.Conv2d(C, mid, 1), nn.ReLU(True),
+                             nn.Conv2d(mid, mid, 3, padding=1), nn.ReLU(True),
+                             nn.Conv2d(mid, 1, 1))
 
-        for img, mask in zip(defect_imgs, defect_masks):
-            _add(img, mask)
-        # 反事实合成缺陷(正常→缺陷)扩张分布→泛化(赛题点名合成缺陷),fit时跑不计时
-        if self.n_synth and normal_imgs:
-            for _ in range(self.n_synth):
-                base = normal_imgs[srng.randrange(len(normal_imgs))]
-                d_img, d_mask = synth_defect(base, srng)
-                _add(d_img, d_mask)
-        for img in normal_imgs:
-            feat, (h, w) = self._feats(det, img)
-            neg = rng.choice(h * w, min(self.neg_per_img, h * w), replace=False)
-            Xs.append(feat[neg].cpu().numpy()); ys.append(np.zeros(len(neg), np.uint8))
-        X = torch.tensor(np.concatenate(Xs), dtype=torch.float32, device=self.device)
-        y = torch.tensor(np.concatenate(ys), dtype=torch.float32, device=self.device)
-        if (y == 1).sum() == 0:                            # 无正样本(掩膜空)→ 不训
-            return False
-        self.mu, self.sd = X.mean(0), X.std(0) + 1e-6
-        Xn = (X - self.mu) / self.sd
-        self.head = nn.Linear(X.shape[1], 1).to(self.device)
-        pos_w = torch.tensor([(y == 0).sum() / max(1, (y == 1).sum())], device=self.device)
-        opt = torch.optim.Adam(self.head.parameters(), lr=self.lr, weight_decay=1e-4)
+    def _train_one(self, head, feats, gts, idxs, pos_w, batch=8):
+        opt = torch.optim.Adam(head.parameters(), lr=5e-3, weight_decay=1e-4)
         lossf = nn.BCEWithLogitsLoss(pos_weight=pos_w)
         torch.manual_seed(self.seed)
+        g = torch.Generator().manual_seed(self.seed)
         for _ in range(self.steps):
-            opt.zero_grad(); lossf(self.head(Xn).squeeze(1), y).backward(); opt.step()
+            sel = [idxs[i] for i in torch.randperm(len(idxs), generator=g)[:batch]]
+            X = torch.stack([feats[i] for i in sel]).to(self.device).float()
+            X = (X - self.mu) / self.sd
+            Y = torch.stack([gts[i] for i in sel]).to(self.device)
+            opt.zero_grad(); lossf(head(X).squeeze(1), Y).backward(); opt.step()
+        head.eval()
+        return head
+
+    @torch.no_grad()
+    def _hold_iou(self, head, feats, gts, idxs):
+        """留出集上:F1最优阈值下逐图IoU均值(选头用)。"""
+        logits, labels = [], []
+        for i in idxs:
+            X = feats[i][None].to(self.device).float()
+            logits.append(head((X - self.mu) / self.sd)[0, 0].cpu().numpy())
+            labels.append(gts[i].numpy())
+        s = np.concatenate([x.ravel() for x in logits]); l = np.concatenate([x.ravel() for x in labels])
+        order = np.argsort(-s); ls = l[order]; ss = s[order]
+        tp = np.cumsum(ls); fp = np.cumsum(1 - ls); P = max(int(ls.sum()), 1)
+        f1 = 2*(tp/np.maximum(tp+fp,1))*(tp/P)/np.maximum(tp/np.maximum(tp+fp,1)+tp/P, 1e-9)
+        thr = float(ss[int(np.argmax(f1))])
+        ious = []
+        for lo, la in zip(logits, labels):
+            pred = lo >= thr
+            TP = int((pred & (la == 1)).sum()); FP = int((pred & (la == 0)).sum()); FN = int((~pred & (la == 1)).sum())
+            ious.append(TP / max(TP + FP + FN, 1))
+        return float(np.mean(ious))
+
+    def fit(self, det, defect_imgs, defect_masks, normal_imgs):
+        """全图训练(实测优于像素采样:pill+0.10/pcb+0.04)+ 双头留出自动选(线性vs卷积)。
+        defect_masks: 每张缺陷 (H,W){0,1} numpy。normal_imgs:正常图(全负)。"""
+        import random as _random
+        from .synth import synth_defect
+        srng = _random.Random(self.seed)
+        items = list(zip(defect_imgs, defect_masks))
+        if self.n_synth and normal_imgs:
+            for _ in range(self.n_synth):
+                items.append(synth_defect(normal_imgs[srng.randrange(len(normal_imgs))], srng))
+        feats, gts, is_def = [], [], []
+        grid = None
+        with torch.no_grad():
+            for img, mk in items:
+                f = self._fmap(det, img)
+                if grid is None:
+                    grid = f.shape[-2:]
+                if f.shape[-2:] != grid:
+                    continue                                # 变尺寸特征图跳过(生产extractor为定尺寸)
+                feats.append(f.half().cpu())
+                gts.append(torch.from_numpy(_mask_to(mk, grid[0], grid[1]).astype(np.float32)))
+                is_def.append(True)
+            for img in normal_imgs[:20]:
+                f = self._fmap(det, img)
+                if f.shape[-2:] != grid:
+                    continue
+                feats.append(f.half().cpu()); gts.append(torch.zeros(grid)); is_def.append(False)
+        if not feats or not any(g.sum() > 0 for g in gts):
+            return False
+        stack_mean = torch.stack([f.float().mean(dim=(1, 2)) for f in feats]).mean(0)
+        stack_sd = torch.stack([f.float().std(dim=(1, 2)) for f in feats]).mean(0) + 1e-6
+        self.mu = stack_mean.view(1, -1, 1, 1).to(self.device)
+        self.sd = stack_sd.view(1, -1, 1, 1).to(self.device)
+        pos = sum(float(g.sum()) for g in gts); neg = sum(g.numel() for g in gts) - pos
+        pos_w = torch.tensor([neg / max(pos, 1)], device=self.device)
+        C = feats[0].shape[0]
+        def_idx = [i for i, d in enumerate(is_def) if d]
+        all_idx = list(range(len(feats)))
+        # 留出选头(缺陷≥8才选;否则直接线性)
+        torch.manual_seed(self.seed)
+        if len(def_idx) >= 8:
+            hold = def_idx[::4]
+            train_idx = [i for i in all_idx if i not in set(hold)]
+            lin = self._train_one(self._linear_head(C).to(self.device), feats, gts, train_idx, pos_w)
+            cnv = self._train_one(self._conv_head(C).to(self.device), feats, gts, train_idx, pos_w)
+            iou_l = self._hold_iou(lin, feats, gts, hold)
+            iou_c = self._hold_iou(cnv, feats, gts, hold)
+            use_conv = iou_c > iou_l + 0.01                 # 卷积要赢出margin才用(稳定性偏向线性)
+            self.head_kind = "conv" if use_conv else "linear"
+        else:
+            use_conv = False; self.head_kind = "linear"
+        # 全量重训胜者
+        head = (self._conv_head(C) if use_conv else self._linear_head(C)).to(self.device)
+        self.head = self._train_one(head, feats, gts, all_idx, pos_w)
         self._calibrate_thr(det, defect_imgs, defect_masks)   # 用fit缺陷掩膜标F1最优阈值
         return True
 
@@ -140,7 +217,7 @@ class SupervisedSegHead:
         """(out_h,out_w) numpy logit 像素图。未训则返回 None。"""
         if self.head is None:
             return None
-        feat, (h, w) = self._feats(det, img)
-        logit = self.head((feat - self.mu) / self.sd).squeeze(1).reshape(1, 1, h, w)
+        f = self._fmap(det, img)[None].to(self.device).float()   # (1,C,h,w)
+        logit = self.head((f - self.mu) / self.sd)
         amap = F.interpolate(logit, size=out_hw, mode="bilinear", align_corners=False)
         return amap[0, 0].cpu().numpy()

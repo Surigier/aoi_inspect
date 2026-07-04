@@ -118,7 +118,29 @@ class CompetitionLargeDetector:
             self.seg_head.fit(self._eff(), d_imgs, d_masks, normals[:30])
             self._calibrate_boxes(defects, defect_masks)             # fit标定碎框合并距离
         self._calibrate_pixel(normals)
+        self._calibrate_rescue(normals, defects)                     # 受控补检:零误翻救援线
         return self.threshold
+
+    def _calibrate_rescue(self, normals, defects):
+        """受控补检标定(榨干30张图级标签):EAD判正常时,监督信号超'fit零误翻线'才翻正。
+        非对称救援≠对称融合(后者曾拖垮EAD已弃):只救漏检、fit正常集上保证零误翻。
+        信号①seg头图max(30掩膜监督,最强);②辅助分支z分(色彩/尺寸/结构,显式缺陷型)。"""
+        import numpy as np
+        self.rescue_seg_thr = None
+        self.rescue_aux_thr = None
+        if self.seg_head.head is not None:
+            n_max = [float(self.segment(n).max()) for n in normals]
+            d_max = [float(self.segment(d).max()) for d in defects]
+            bar = max(n_max) + 1e-6                          # fit正常最大值=零误翻线
+            if sum(x > bar for x in d_max) > 0:              # 真能救到缺陷才启用
+                self.rescue_seg_thr = bar
+        # 辅助分支z线(逐分支fit正常z最大值)
+        bars = []
+        for bi in range(1, len(self.branches)):
+            m, s = self.stats[bi]
+            nz = [znorm(self.branches[bi].score(n), m, s) for n in normals[:40]]
+            bars.append(max(nz) + 1e-6)
+        self.rescue_aux_thr = bars
 
     def _select_feat_mode(self, defects, defect_masks, normals):
         """留出集(每4取1)对比 单特征 vs 模板差分特征(工业AOI金模板;pcb类刚性件+21%,
@@ -268,6 +290,21 @@ class CompetitionLargeDetector:
         amap = self.segment(img)
         thr = self.pix_thr if self.pix_thr is not None else float(amap.mean() + 3 * amap.std())
         res["anomaly_map"] = amap
+        # 受控补检:EAD判正常但监督信号超fit零误翻线→救援翻正(只救漏,不动EAD强项)
+        if not res["is_defect"]:
+            seg_hit = (getattr(self, "rescue_seg_thr", None) is not None
+                       and float(amap.max()) >= self.rescue_seg_thr)
+            aux_hit = False
+            if getattr(self, "rescue_aux_thr", None):
+                raws = res.get("_raws")
+                for bi in range(1, len(self.branches)):
+                    m, s = self.stats[bi]
+                    if znorm(raws[bi], m, s) >= self.rescue_aux_thr[bi - 1]:
+                        aux_hit = True; break
+            if seg_hit or aux_hit:
+                res["is_defect"] = True
+                res["rescued"] = "seg" if seg_hit else "aux"
+                res["defect_type"] = self._ztype(res["_raws"])
         if res["is_defect"]:
             mask = (amap >= thr).astype(np.uint8)
             if self.roi_zoom:
@@ -328,4 +365,5 @@ class CompetitionLargeDetector:
         score = raws[0]                                   # 检测分 = EAD 核心
         is_def = bool(self.threshold is not None and score >= self.threshold)
         return {"score": score, "is_defect": is_def,
-                "defect_type": self._ztype(raws) if is_def else "normal"}
+                "defect_type": self._ztype(raws) if is_def else "normal",
+                "_raws": raws}

@@ -139,7 +139,9 @@ class CompetitionLargeDetector:
             bar = float(a.max() + (a.max() - np.percentile(a, 90)) + 1e-6)
             if (b > bar).any():                              # B半验出误翻→抬线
                 bar = float(b.max() + (b.max() - np.percentile(b, 90)) + 1e-6)
-            if sum(x > bar for x in d_max) > 0:              # 真能救到缺陷才启用
+            # 证据量门槛:至少3张fit缺陷越线才启用——只救到1-2张说明线在噪声尾部,
+            # test正常必踩(v3实测pcb/battery薄救援仍翻车)
+            if sum(x > bar for x in d_max) >= 3:
                 self.rescue_seg_thr = bar
         bars = []
         for bi in range(1, len(self.branches)):
@@ -149,6 +151,9 @@ class CompetitionLargeDetector:
             bar = float(az.max() + (az.max() - np.percentile(az, 90)) + 1e-6)
             if (bz > bar).any():
                 bar = float(bz.max() + (bz.max() - np.percentile(bz, 90)) + 1e-6)
+            dz = [znorm(self.branches[bi].score(d), m, s) for d in defects]
+            if sum(z > bar for z in dz) < 3:                 # 证据量门槛(同seg)
+                bar = float("inf")
             bars.append(bar)
         self.rescue_aux_thr = bars
 

@@ -128,19 +128,28 @@ class CompetitionLargeDetector:
         import numpy as np
         self.rescue_seg_thr = None
         self.rescue_aux_thr = None
-        if self.seg_head.head is not None:
-            n_max = np.array([float(self.segment(n).max()) for n in normals])
+        # v3自验证:正常图劈两半——A半建线(max+尾宽),B半验线;B上有误翻→抬线到B.max+余量;
+        # 抬完仍救不到任何fit缺陷→该信号自动禁用。逐类自守("受控"闭环)。
+        half = len(normals) // 2
+        A, B = normals[:half], normals[half:]
+        if self.seg_head.head is not None and A and B:
+            a = np.array([float(self.segment(n).max()) for n in A])
+            b = np.array([float(self.segment(n).max()) for n in B])
             d_max = [float(self.segment(d).max()) for d in defects]
-            # 鲁棒线:fit最大值再加一个尾宽(max-p90)余量——纯max是脆弱统计量,
-            # 首版实测测试正常图大量越线(pill acc 1.0→0.40),故加EVT式余量
-            bar = float(n_max.max() + (n_max.max() - np.percentile(n_max, 90)) + 1e-6)
+            bar = float(a.max() + (a.max() - np.percentile(a, 90)) + 1e-6)
+            if (b > bar).any():                              # B半验出误翻→抬线
+                bar = float(b.max() + (b.max() - np.percentile(b, 90)) + 1e-6)
             if sum(x > bar for x in d_max) > 0:              # 真能救到缺陷才启用
                 self.rescue_seg_thr = bar
         bars = []
         for bi in range(1, len(self.branches)):
             m, s = self.stats[bi]
-            nz = np.array([znorm(self.branches[bi].score(n), m, s) for n in normals[:40]])
-            bars.append(float(nz.max() + (nz.max() - np.percentile(nz, 90)) + 1e-6))
+            az = np.array([znorm(self.branches[bi].score(n), m, s) for n in A[:40]]) if A else np.array([0.0])
+            bz = np.array([znorm(self.branches[bi].score(n), m, s) for n in B[:40]]) if B else np.array([0.0])
+            bar = float(az.max() + (az.max() - np.percentile(az, 90)) + 1e-6)
+            if (bz > bar).any():
+                bar = float(bz.max() + (bz.max() - np.percentile(bz, 90)) + 1e-6)
+            bars.append(bar)
         self.rescue_aux_thr = bars
 
     def _select_feat_mode(self, defects, defect_masks, normals):

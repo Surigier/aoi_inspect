@@ -128,31 +128,30 @@ class CompetitionLargeDetector:
         import numpy as np
         self.rescue_seg_thr = None
         self.rescue_aux_thr = None
-        # v3自验证:正常图劈两半——A半建线(max+尾宽),B半验线;B上有误翻→抬线到B.max+余量;
-        # 抬完仍救不到任何fit缺陷→该信号自动禁用。逐类自守("受控"闭环)。
+        self.rescue_gray = None
+        # v6(完全体):在B半上验证"联合翻正条件"(EAD灰区 ∧ 信号超线),而非只验线——
+        # 实际翻正是联合事件,单验线既过严(hazelnut被误禁)又不够(pcb灰区内穿线没查)。
+        # 灰区下界g自适应:取B半零误翻的最松g∈{0.95,0.9,0.85,0.8};0.95都守不住→禁用。
         half = len(normals) // 2
         A, B = normals[:half], normals[half:]
-        if self.seg_head.head is not None and A and B:
-            a = np.array([float(self.segment(n).max()) for n in A])
-            b = np.array([float(self.segment(n).max()) for n in B])
-            d_max = [float(self.segment(d).max()) for d in defects]
-            bar = float(a.max() + (a.max() - np.percentile(a, 90)) + 1e-6)
-            # v5:B半穿线=该类正常分布不稳(v4实测抬线硬撑test仍必穿)→直接禁用;
-            # 加证据量门槛(≥3张fit缺陷越线)。稳定类(hazelnut)白赚,不稳类零损失。
-            if not (b > bar).any() and sum(x > bar for x in d_max) >= 3:
-                self.rescue_seg_thr = bar
-        bars = []
-        for bi in range(1, len(self.branches)):
-            m, s = self.stats[bi]
-            az = np.array([znorm(self.branches[bi].score(n), m, s) for n in A[:40]]) if A else np.array([0.0])
-            bz = np.array([znorm(self.branches[bi].score(n), m, s) for n in B[:40]]) if B else np.array([0.0])
-            bar = float(az.max() + (az.max() - np.percentile(az, 90)) + 1e-6)
-            dz = [znorm(self.branches[bi].score(d), m, s) for d in defects]
-            # v5:B半穿线→禁用;证据量门槛≥3(同seg)
-            if (bz > bar).any() or sum(z > bar for z in dz) < 3:
-                bar = float("inf")
-            bars.append(bar)
-        self.rescue_aux_thr = bars
+        if self.seg_head.head is None or not A or not B or self.threshold is None:
+            return
+        ead = self.branches[0]
+        a_sig = np.array([float(self.segment(n).max()) for n in A])
+        b_sig = np.array([float(self.segment(n).max()) for n in B])
+        b_ead = np.array([ead.score(n) for n in B])
+        d_sig = np.array([float(self.segment(d).max()) for d in defects])
+        d_ead = np.array([ead.score(d) for d in defects])
+        bar = float(a_sig.max() + (a_sig.max() - np.percentile(a_sig, 90)) + 1e-6)
+        for g in [0.8, 0.85, 0.9, 0.95]:                     # 从松到紧,取第一个B半零误翻的
+            b_flip = ((b_ead >= g * self.threshold) & (b_ead < self.threshold) & (b_sig >= bar)).sum()
+            if b_flip == 0:
+                # 证据量:该(g,bar)下能救到的fit缺陷数(漏检段:EAD分<阈值)
+                d_flip = ((d_ead >= g * self.threshold) & (d_ead < self.threshold) & (d_sig >= bar)).sum()
+                if d_flip >= 3:
+                    self.rescue_seg_thr = bar
+                    self.rescue_gray = g
+                break                                        # g再收紧只会更少救,B已零误翻即停
 
     def _select_feat_mode(self, defects, defect_masks, normals):
         """留出集(每4取1)对比 单特征 vs 模板差分特征(工业AOI金模板;pcb类刚性件+21%,
@@ -302,23 +301,17 @@ class CompetitionLargeDetector:
         amap = self.segment(img)
         thr = self.pix_thr if self.pix_thr is not None else float(amap.mean() + 3 * amap.std())
         res["anomaly_map"] = amap
-        # 受控补检:EAD判正常但处于灰区(score≥0.8×阈值,即"险漏")且监督信号超鲁棒线
-        # →救援翻正。灰区约束防深度正常被滥翻(首版无灰区时pill acc 1.0→0.40)。
-        in_gray = (self.threshold is not None and res["score"] >= 0.8 * self.threshold)
-        if not res["is_defect"] and in_gray:
-            seg_hit = (getattr(self, "rescue_seg_thr", None) is not None
-                       and float(amap.max()) >= self.rescue_seg_thr)
-            aux_hit = False
-            if getattr(self, "rescue_aux_thr", None):
-                raws = res.get("_raws")
-                for bi in range(1, len(self.branches)):
-                    m, s = self.stats[bi]
-                    if znorm(raws[bi], m, s) >= self.rescue_aux_thr[bi - 1]:
-                        aux_hit = True; break
-            if seg_hit or aux_hit:
-                res["is_defect"] = True
-                res["rescued"] = "seg" if seg_hit else "aux"
-                res["defect_type"] = self._ztype(res["_raws"])
+        # 受控补检v6:EAD判正常但处于自适应灰区(score≥g×阈值,g由fit B半联合验证选定)
+        # 且seg信号超线→翻正。g与线在fit上按"联合翻正条件零误翻"标定,守不住则整体禁用。
+        g = getattr(self, "rescue_gray", None)
+        if (not res["is_defect"] and g is not None
+                and getattr(self, "rescue_seg_thr", None) is not None
+                and self.threshold is not None
+                and res["score"] >= g * self.threshold
+                and float(amap.max()) >= self.rescue_seg_thr):
+            res["is_defect"] = True
+            res["rescued"] = "seg"
+            res["defect_type"] = self._ztype(res["_raws"])
         if res["is_defect"]:
             mask = (amap >= thr).astype(np.uint8)
             if self.roi_zoom:

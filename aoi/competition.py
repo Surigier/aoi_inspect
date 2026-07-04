@@ -129,17 +129,18 @@ class CompetitionLargeDetector:
         self.rescue_seg_thr = None
         self.rescue_aux_thr = None
         if self.seg_head.head is not None:
-            n_max = [float(self.segment(n).max()) for n in normals]
+            n_max = np.array([float(self.segment(n).max()) for n in normals])
             d_max = [float(self.segment(d).max()) for d in defects]
-            bar = max(n_max) + 1e-6                          # fit正常最大值=零误翻线
+            # 鲁棒线:fit最大值再加一个尾宽(max-p90)余量——纯max是脆弱统计量,
+            # 首版实测测试正常图大量越线(pill acc 1.0→0.40),故加EVT式余量
+            bar = float(n_max.max() + (n_max.max() - np.percentile(n_max, 90)) + 1e-6)
             if sum(x > bar for x in d_max) > 0:              # 真能救到缺陷才启用
                 self.rescue_seg_thr = bar
-        # 辅助分支z线(逐分支fit正常z最大值)
         bars = []
         for bi in range(1, len(self.branches)):
             m, s = self.stats[bi]
-            nz = [znorm(self.branches[bi].score(n), m, s) for n in normals[:40]]
-            bars.append(max(nz) + 1e-6)
+            nz = np.array([znorm(self.branches[bi].score(n), m, s) for n in normals[:40]])
+            bars.append(float(nz.max() + (nz.max() - np.percentile(nz, 90)) + 1e-6))
         self.rescue_aux_thr = bars
 
     def _select_feat_mode(self, defects, defect_masks, normals):
@@ -290,8 +291,10 @@ class CompetitionLargeDetector:
         amap = self.segment(img)
         thr = self.pix_thr if self.pix_thr is not None else float(amap.mean() + 3 * amap.std())
         res["anomaly_map"] = amap
-        # 受控补检:EAD判正常但监督信号超fit零误翻线→救援翻正(只救漏,不动EAD强项)
-        if not res["is_defect"]:
+        # 受控补检:EAD判正常但处于灰区(score≥0.8×阈值,即"险漏")且监督信号超鲁棒线
+        # →救援翻正。灰区约束防深度正常被滥翻(首版无灰区时pill acc 1.0→0.40)。
+        in_gray = (self.threshold is not None and res["score"] >= 0.8 * self.threshold)
+        if not res["is_defect"] and in_gray:
             seg_hit = (getattr(self, "rescue_seg_thr", None) is not None
                        and float(amap.max()) >= self.rescue_seg_thr)
             aux_hit = False

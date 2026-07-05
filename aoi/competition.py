@@ -118,7 +118,9 @@ class CompetitionLargeDetector:
             self.seg_head.fit(self._eff(), d_imgs, d_masks, normals[:30])
             self._calibrate_boxes(defects, defect_masks)             # fit标定碎框合并距离
         self._calibrate_pixel(normals)
-        self._calibrate_rescue(normals, defects)                     # 受控补检:零误翻救援线
+        self.rescue_gray = None; self.rescue_seg_thr = None          # 救援默认关(v1-v6净收益≈0已放弃)
+        if getattr(self, "use_rescue", False):
+            self._calibrate_rescue(normals, defects)
         return self.threshold
 
     def _calibrate_rescue(self, normals, defects):

@@ -121,6 +121,9 @@ class CompetitionLargeDetector:
         self.rescue_gray = None; self.rescue_seg_thr = None          # 救援默认关(v1-v6净收益≈0已放弃)
         if getattr(self, "use_rescue", False):
             self._calibrate_rescue(normals, defects)
+        self._dino = None                                            # DINOv2 图级co-detector(受控)
+        if getattr(self, "use_dino_gate", True) and defects:
+            self._calibrate_dino_gate(normals, defects)
         return self.threshold
 
     def _calibrate_rescue(self, normals, defects):
@@ -155,6 +158,53 @@ class CompetitionLargeDetector:
                     self.rescue_gray = g
                 break                                        # g再收紧只会更少救,B已零误翻即停
 
+    def _calibrate_dino_gate(self, normals, defects):
+        """DINOv2 图级 co-detector 标定(受控平等融合,治EAD漏检→提含漏检IoU)。
+        max(z_EAD, z_DINO) 联合门,3折CV验证:每折在训练部分标两门、验证部分比平衡acc,
+        仅当融合门CV均值不劣于EAD-only才逐类启用(否则回退纯EAD)。启用后用全fit重标联合阈值。
+        CV(替代单次A/B半):降15+15小split噪声,治pcb类fit看着行/test更难的失配欠触发。"""
+        import numpy as np
+        from .dino_gate import DinoGate, _bal_acc
+        self._dino = None
+        if self.threshold is None or len(normals) < 9 or len(defects) < 6:
+            return
+        ead = self.branches[0]
+        gate = DinoGate(device=self._bb_loc.device)
+        gate.build(normals[:40])
+        en = np.array([ead.score(n) for n in normals]); dn = np.array([gate.score(n) for n in normals])
+        ed = np.array([ead.score(d) for d in defects]); dd = np.array([gate.score(d) for d in defects])
+        # 3折CV:训练折标定两门标准化+阈值,验证折比平衡acc(两门同折同标定→公平)
+        K = 3
+        def _folds(n):
+            idx = np.arange(n); np.random.RandomState(0).shuffle(idx)
+            return [idx[i::K] for i in range(K)]
+        nf, df = _folds(len(normals)), _folds(len(defects))
+        bfs, bes = [], []
+        for k in range(K):
+            vn, vd = nf[k], df[k]
+            tn = np.concatenate([nf[j] for j in range(K) if j != k])
+            td = np.concatenate([df[j] for j in range(K) if j != k])
+            emu, esd = en[tn].mean(), en[tn].std() + 1e-9
+            dmu, dsd = dn[tn].mean(), dn[tn].std() + 1e-9
+            fz = lambda e, d: np.maximum((e - emu) / esd, (d - dmu) / dsd)
+            thr_e = FewShotAdapter._calibrate(list(en[tn]), list(ed[td]))
+            thr_f = FewShotAdapter._calibrate(list(fz(en[tn], dn[tn])), list(fz(ed[td], dd[td])))
+            bes.append(_bal_acc(list(ed[vd]), list(en[vn]), thr_e))
+            bfs.append(_bal_acc(list(fz(ed[vd], dd[vd])), list(fz(en[vn], dn[vn])), thr_f))
+        bf, be = np.nanmean(bfs), np.nanmean(bes)
+        if not (np.isfinite(bf) and np.isfinite(be) and bf >= be):
+            return                                            # CV均值无增益→不启用,守住纯EAD
+        # 启用:全fit重标准化+联合阈值
+        emu, esd = en.mean(), en.std() + 1e-9
+        dmu, dsd = dn.mean(), dn.std() + 1e-9
+        fz2 = lambda e, d: max((e - emu) / esd, (d - dmu) / dsd)
+        self._dino = gate
+        self._dino_stats = (emu, esd, dmu, dsd)
+        self._dino_fuse = fz2
+        self._dino_thr = FewShotAdapter._calibrate(
+            [float(max((e - emu) / esd, (d - dmu) / dsd)) for e, d in zip(en, dn)],
+            [float(max((e - emu) / esd, (d - dmu) / dsd)) for e, d in zip(ed, dd)])
+
     def _select_feat_mode(self, defects, defect_masks, normals):
         """留出集(每4取1)对比 单特征 vs 模板差分特征(工业AOI金模板;pcb类刚性件+21%,
         非刚性中性),赢者定 extractor。差分推理多~30ms(ECC),仅在有效时启用。"""
@@ -181,6 +231,8 @@ class CompetitionLargeDetector:
                 ious.append(TP / max(TP + FP + FN, 1))
             return float(np.mean(ious))
 
+        # 候选:WRN单特征(基线,最快)vs 模板差分(工业金模板,pcb类+21%)。
+        # DINO组件语义特征曾试(逻辑定位):64²探针假象,原生口径WRN分辨率优势胜出,已撤(见run_logic_native.py)。
         iou_single = _try(self._wrn_feats)
         iou_diff = _try(self._wrn_feats_diff)
         if iou_diff > iou_single + 0.01:                    # 差分要赢出margin才启用(它更贵)
@@ -373,6 +425,9 @@ class CompetitionLargeDetector:
         raws = [b.score(img) for b in self.branches]
         score = raws[0]                                   # 检测分 = EAD 核心
         is_def = bool(self.threshold is not None and score >= self.threshold)
+        if getattr(self, "_dino", None) is not None:      # DINOv2 图级co-detector:平等融合门
+            fused = self._dino_fuse(score, self._dino.score(img))
+            is_def = bool(fused >= self._dino_thr)
         return {"score": score, "is_defect": is_def,
                 "defect_type": self._ztype(raws) if is_def else "normal",
                 "_raws": raws}

@@ -59,10 +59,14 @@ class SamRefiner:
         if r.masks is None:
             return raw_mask
         out = np.zeros((H, W), np.uint8)
+        n_masks = r.masks.data.shape[0]                       # SAM 可能返回少于提示框数
         for k, b in enumerate(boxes):
+            bx = [int(b[0] / sx), int(b[1] / sy), int(b[2] / sx), int(b[3] / sy)]
+            if k >= n_masks:                                  # 该框无对应掩膜 → 回退原区域
+                out[bx[1]:bx[3], bx[0]:bx[2]] |= raw_mask[bx[1]:bx[3], bx[0]:bx[2]]
+                continue
             mk = r.masks.data[k].cpu().numpy().astype(np.uint8)
             mk = cv2.resize(mk, (W, H), interpolation=cv2.INTER_NEAREST)
-            bx = [int(b[0] / sx), int(b[1] / sy), int(b[2] / sx), int(b[3] / sy)]
             box_area = max(1, (bx[2] - bx[0]) * (bx[3] - bx[1]))
             if mk.sum() > 4 * box_area or mk.sum() == 0:
                 out[bx[1]:bx[3], bx[0]:bx[2]] |= raw_mask[bx[1]:bx[3], bx[0]:bx[2]]

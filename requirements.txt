@@ -1,7 +1,16 @@
-timm>=1.0
+# ── 核心运行时(检测 + 定位主链,缺一不可)──
+torch>=2.1              # 基础张量/GPU;GPU版需按CUDA装: pip install torch --index-url https://download.pytorch.org/whl/cu121
+timm>=1.0               # WideResNet50_2 定位骨干 + DINOv2 图级co-detector(features_only/vit_small_patch14_dinov2)
 numpy>=1.24
 Pillow>=10.0
-pytest>=8.0
-open_clip_torch>=2.20
-gradio>=4.0
-opencv-python-headless>=4.5
+opencv-python-headless>=4.5   # 图像IO/连通域框/ECC模板配准
+ultralytics>=8.3        # MobileSAM 边界精化(models/mobile_sam.pt);缺→静默回退粗掩膜,定位IoU掉~0.05
+pyspng>=1.1             # 2500² PNG 快速解码(~2×PIL);缺→回退慢解码,PNG测试图延时可能超200ms
+
+# ── 无样本 / 演示 / 测试 ──
+open_clip_torch>=2.20   # zero-shot CLIP 分支(无样本冷启动)
+gradio>=4.0             # Web Demo(scripts/demo_app.py:一键反馈在线学习)
+pytest>=8.0             # 测试复现(tests/)
+
+# ── 可选(CPU<2s 挑战目标;不装则走 PyTorch CPU,慢但可跑)──
+openvino>=2024.0        # EAD/骨干 CPU 导出加速(aoi/ov_backbone.py)

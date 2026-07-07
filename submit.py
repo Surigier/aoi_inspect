@@ -121,9 +121,10 @@ def _run_large(args, device):
                          o["defect_type"], boxes])
         elif p.suffix in VID_EXT:
             frames = read_video_frames(str(p), size=2048)
-            scores = [det.branches[0].score(f) for f in frames]   # 检测分=EAD核心
+            scores = [det.frame_score(f) for f in frames]         # 图级门同口径(含受控DINO co-detector)
+            thr = det.decision_threshold()
             sm = moving_average(scores, 3)
-            events = group_events([s >= det.threshold for s in sm], 2)
+            events = group_events([thr is not None and s >= thr for s in sm], 2)
             is_def = len(events) > 0
             rows.append([p.name, "video", int(is_def), round(max(sm) if sm else 0.0, 4),
                          f"events={events}" if is_def else "normal", ""])

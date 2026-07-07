@@ -1,7 +1,12 @@
 """赛场大图统一检测器(CompetitionLargeDetector):2500² 输入的生产路径。
-核心 = EfficientAD 整图卷积(强检测 + 低延时);辅以色彩/尺寸/结构分支补齐 5 类缺陷覆盖。
-可靠性加权 z-norm 软融合 → 二值判决 + 缺陷类型输出(最强分支=类型)。
-延时 ≈ EfficientAD(~106ms@2060)+ 几个轻分支(几 ms),仍 <200ms。"""
+架构(2026-07 现状):
+- 检测主干 = EfficientAD 整图卷积(学生-教师,无记忆库→延时恒定;阈值标在 EAD 分上)。
+- 图级门 = DINOv2 受控 co-detector(3折CV验证,仅当融合门不劣于EAD-only才逐类启用;
+  max(z_EAD,z_DINO) 治EAD漏检→提含漏检IoU;此前补检门/定位融合双死,平等融合是活路)。
+- 定位 = WRN50 浅层(1,2)@512 监督分割头(30掩膜训练,双头logit集成 + SAM边界精化)。
+- 辅助色彩/尺寸/结构分支只做缺陷【类型归属】(最强z分支=类型),不参与检测融合
+  (少样本估融合权重不可靠,会拖垮强EAD;实测软融合在对抗数据反低于EAD单独,故弃)。
+延时 ≈ EfficientAD(~140-170ms@2060)+ DINO门前向(~25ms)+ 轻分支(几ms),仍 <200ms。"""
 import torch
 import torch.nn.functional as F
 from .fusion import znorm
@@ -431,3 +436,18 @@ class CompetitionLargeDetector:
         return {"score": score, "is_defect": is_def,
                 "defect_type": self._ztype(raws) if is_def else "normal",
                 "_raws": raws}
+
+    def frame_score(self, img):
+        """逐帧检测分(视频路径用,与 predict() 图级门同口径):EAD核心分,DINO门启用时
+        返回 max(z_EAD,z_DINO) 融合分。配 decision_threshold() 时序平滑判决,让视频也吃到
+        受控DINO co-detector(此前视频直接用EAD分绕过了门)。"""
+        ead = self.branches[0].score(img)
+        if getattr(self, "_dino", None) is not None:
+            return self._dino_fuse(ead, self._dino.score(img))
+        return ead
+
+    def decision_threshold(self):
+        """当前图级判决阈值:DINO门启用→融合阈值,否则EAD阈值。与 frame_score() 配对。"""
+        if getattr(self, "_dino", None) is not None:
+            return self._dino_thr
+        return self.threshold

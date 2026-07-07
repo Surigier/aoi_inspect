@@ -84,8 +84,10 @@ def train(bb, cls, fit, normals, steps=300):
     opt = torch.optim.Adam(head.parameters(), lr=5e-3, weight_decay=1e-4)
     lossf = nn.BCEWithLogitsLoss(pos_weight=pw)
     torch.manual_seed(0)
+    N = Fa.shape[0]; gg = torch.Generator().manual_seed(0)
     for _ in range(steps):
-        opt.zero_grad(); lossf(head((Fa - mu) / sd).squeeze(1), Ga).backward(); opt.step()
+        sel = torch.randperm(N, generator=gg)[:8]              # minibatch=8(避免大特征图全批训练卡死)
+        opt.zero_grad(); lossf(head(((Fa[sel]-mu)/sd)).squeeze(1), Ga[sel]).backward(); opt.step()
     head.eval()
     return head, mu, sd
 

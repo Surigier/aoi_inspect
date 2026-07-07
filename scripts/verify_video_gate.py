@@ -15,7 +15,7 @@ DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
 def main():
     torch.manual_seed(0)
-    cat, folder = "hazelnut", "crack"
+    cat, folder = "cable", "missing_cable"
     root = Path(f"data/mvtec/{cat}")
     normals = [_load_img(p, 640) for p in sorted(glob.glob(str(root / "train/good/*.png")))[:100]]
     dfiles = sorted(glob.glob(str(root / "test" / folder / "*.png")))

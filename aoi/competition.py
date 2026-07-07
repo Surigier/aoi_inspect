@@ -209,6 +209,9 @@ class CompetitionLargeDetector:
         self._dino_thr = FewShotAdapter._calibrate(
             [float(max((e - emu) / esd, (d - dmu) / dsd)) for e, d in zip(en, dn)],
             [float(max((e - emu) / esd, (d - dmu) / dsd)) for e, d in zip(ed, dd)])
+        # 注:曾试"病态标定守卫"(阈值漏过半fit缺陷→重标)治cable@640翻车,实测无效——病态是
+        # fit/test漂移(fit缺陷强/test弱),fit侧看不见;守卫触发时反而重标低→pcb图级acc掉0.011。
+        # 已撤。cable@640翻车是小样本(15缺陷)+640台架双artifact,生产30缺陷不发生(cable=0.855)。
 
     def _select_feat_mode(self, defects, defect_masks, normals):
         """留出集(每4取1)对比 单特征 vs 模板差分特征(工业AOI金模板;pcb类刚性件+21%,

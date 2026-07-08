@@ -64,7 +64,7 @@ class _AuxBranch:
 
 class CompetitionLargeDetector:
     def __init__(self, device="cuda", aux_size=320, train_steps=10000, seg_eval_hw=(256, 256),
-                 compile_infer=False, sam_refine=True, roi_zoom=False):
+                 compile_infer=False, sam_refine=True, roi_zoom=False, seg_in=512):
         # roi_zoom 默认关:AD2真大图实测负面(0.131→0.072,裁块尺度失配+阈值不匹配),留待修复
         dev = device if torch.cuda.is_available() else "cpu"
         bb = Backbone(device=dev)
@@ -81,7 +81,7 @@ class CompetitionLargeDetector:
         # 扫描实测(run_feat_res.py):IoU均值0.305→0.449(+47%),pcb+53%/battery+74%/pill+72%,
         # 且浅层更快(8ms vs 36ms)。640过犹不及。结构分支仍用默认bb(layers 2,3)不受影响。
         self._bb_loc = Backbone(layers=(1, 2), device=dev)
-        self._seg_in = 512
+        self._seg_in = seg_in                              # 定位特征输入分辨率(大图可调高保小缺陷)
         self.seg_head = SupervisedSegHead(device=dev, extractor=self._wrn_feats)
         self.seg_eval_hw = seg_eval_hw
         self.pix_thr = None                                # 像素图二值阈值(正常分位标定)

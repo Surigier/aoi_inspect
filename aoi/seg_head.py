@@ -86,20 +86,44 @@ class _Ensemble(nn.Module):
         return out / len(self.heads)
 
 
+class _RamsCorr(nn.Module):
+    """RAMS-R 残差注意力多尺度修正支(锚定已训双头基线):逐尺度1×1降维 → 逐像素逐尺度
+    softmax注意力加权融合 → zero-conv头(末层零初始化→出发点≡基线,只学修正)。
+    诊断实测(run_rams_diag.py,3种子):从零训RAMS优化不稳定判负,锚定版AD2 3/4类
+    +0.013~+0.033(std≤0.022)、最差-0.009噪声内 → fit留出门控逐类启用,零回退。"""
+
+    def __init__(self, chans, d=48):
+        super().__init__()
+        self.red = nn.ModuleList([nn.Conv2d(c, d, 1) for c in chans])
+        self.att = nn.Conv2d(d * len(chans), len(chans), 1)
+        self.head = nn.Sequential(nn.Conv2d(d, 64, 1), nn.ReLU(True),
+                                  nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(True), nn.Conv2d(64, 1, 1))
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
+
+    def forward(self, scales):
+        r = [red(s) for red, s in zip(self.red, scales)]
+        w = torch.softmax(self.att(torch.cat(r, 1)), dim=1)
+        return self.head(sum(w[:, i:i + 1] * r[i] for i in range(len(r))))
+
+
 class SupervisedSegHead:
     """逐像素特征(C通道)→ 缺陷 logit。fit 用缺陷掩膜+正常负样本;apply 出像素图。
     特征源可插拔(extractor):默认 EAD 残差;生产定位用 WRN50 特征
     (实测 best-IoU 0.263→0.432 +64%,电子件上尤胜 DINOv2)。"""
 
     def __init__(self, device="cuda", steps=300, lr=0.01, neg_per_img=400, seed=0, n_synth=0,
-                 extractor=None):
+                 extractor=None, rams_extractor=None):
         self.device = device if torch.cuda.is_available() else "cpu"
         self.steps, self.lr, self.neg_per_img, self.seed = steps, lr, neg_per_img, seed
         # n_synth 默认0(关):实测合成在同域(赛题场景)可靠掉分-0.02~-0.07,跨域噪声不稳。保留代码opt-in。
         self.n_synth = n_synth
         self.extractor = extractor                         # img(3,H,W)→(C,h,w);None=EAD残差
+        self.rams_extractor = rams_extractor               # img→[多尺度(C_i,h,w)];RAMS-R修正支用
         self.head = self.mu = self.sd = None
         self.thr = None                                    # fit缺陷掩膜标定的F1最优像素阈值
+        self.rams = None                                   # RAMS-R修正支(fit留出门控启用)
+        self._rams_stats = None
 
     @torch.no_grad()
     def _fmap(self, det, img):
@@ -194,8 +218,87 @@ class SupervisedSegHead:
         cnv = self._train_one(self._conv_head(C).to(self.device), feats, gts, all_idx, pos_w)
         self.head = _Ensemble(lin, cnv)
         self.head_kind = "ensemble"
-        self._calibrate_thr(det, defect_imgs, defect_masks)   # 用fit缺陷掩膜标F1最优阈值
+        self._fit_rams(det, defect_imgs, defect_masks, normal_imgs)  # RAMS-R修正支(留出门控)
+        self._calibrate_thr(det, defect_imgs, defect_masks)   # 用fit缺陷掩膜标F1最优阈值(含已启用修正)
         return True
+
+    def _fit_rams(self, det, defect_imgs, defect_masks, normal_imgs, steps=400, margin=0.005):
+        """RAMS-R 残差修正支训练+留出门控:锚定已训双头(零初始化→出发点≡基线),只学修正;
+        留出集(每4取1)IoU 无增益(≤margin)→ 不启用,零回退。见 _RamsCorr 注释与 run_rams_diag。"""
+        self.rams = None
+        if self.rams_extractor is None or len(defect_imgs) < 8:
+            return
+        hold = list(range(0, len(defect_imgs), 4))
+        tr = [i for i in range(len(defect_imgs)) if i not in set(hold)]
+        # 缓存训练集:base logit(特征格,双头冻结)+ 多尺度特征 + gt
+        tr_imgs = [defect_imgs[i] for i in tr] + list(normal_imgs[:15])
+        tr_mks = [defect_masks[i] for i in tr] + [None] * min(15, len(normal_imgs))
+        B, S, G = [], [], []
+        with torch.no_grad():
+            for img, mk in zip(tr_imgs, tr_mks):
+                f = self._fmap(det, img)[None].to(self.device).float()
+                B.append(self.head((f - self.mu) / self.sd).cpu())
+                sc = self.rams_extractor(img)
+                S.append([s.half().cpu() for s in sc])
+                g = sc[0].shape[-2:]
+                G.append(torch.from_numpy(_mask_to(mk, g[0], g[1]).astype(np.float32))
+                         if mk is not None else torch.zeros(g))
+        if B[0].shape[-2:] != S[0][0].shape[-2:]:
+            return                                            # base与修正支网格不一致(如变尺寸)→跳过
+        nsc = len(S[0])
+        mus, sds = [], []
+        for i in range(nsc):
+            A = torch.stack([s[i].float() for s in S])
+            mus.append(A.mean(dim=(0, 2, 3), keepdim=True).to(self.device))
+            sds.append((A.std(dim=(0, 2, 3), keepdim=True) + 1e-6).to(self.device))
+        self._rams_stats = (mus, sds)
+        torch.manual_seed(self.seed)
+        corr = _RamsCorr([s.shape[0] for s in S[0]]).to(self.device)
+        pos = sum(float(g.sum()) for g in G); neg = sum(g.numel() for g in G) - pos
+        pw = torch.tensor([neg / max(pos, 1)], device=self.device)
+        opt = torch.optim.Adam(corr.parameters(), lr=3e-3, weight_decay=1e-4)
+        lossf = nn.BCEWithLogitsLoss(pos_weight=pw)
+        gg = torch.Generator().manual_seed(self.seed)
+        N = len(S)
+        for _ in range(steps):
+            sel = torch.randperm(N, generator=gg)[:8].tolist()
+            scales = [torch.stack([S[j][i].float() for j in sel]).to(self.device) for i in range(nsc)]
+            scales = [(scales[i] - mus[i]) / sds[i] for i in range(nsc)]
+            base = torch.cat([B[j] for j in sel]).to(self.device)
+            gt = torch.stack([G[j] for j in sel]).to(self.device)
+            opt.zero_grad()
+            lossf((base + corr(scales)).squeeze(1), gt).backward()
+            opt.step()
+        corr.eval()
+        # 留出门控:base vs base+corr 各自F1阈值下的逐图IoU
+        h_imgs = [defect_imgs[i] for i in hold]; h_mks = [defect_masks[i] for i in hold]
+
+        def hold_iou(use_corr):
+            self.rams = corr if use_corr else None
+            out_hw = (256, 256)
+            Sm = [self.map(det, im, out_hw) for im in h_imgs]
+            Lm = [_mask_to(mk, out_hw[0], out_hw[1]) for mk in h_mks]
+            s = np.concatenate([x.ravel() for x in Sm]); l = np.concatenate([x.ravel() for x in Lm])
+            order = np.argsort(-s); ls = l[order]; ss = s[order]
+            tp = np.cumsum(ls); fp = np.cumsum(1 - ls); P = max(int(ls.sum()), 1)
+            f1 = 2 * (tp / np.maximum(tp + fp, 1)) * (tp / P) / np.maximum(
+                (tp / np.maximum(tp + fp, 1)) + (tp / P), 1e-9)
+            thr = float(ss[int(np.argmax(f1))])
+            ious = []
+            for smap, lm in zip(Sm, Lm):
+                pred = smap >= thr
+                TP = int((pred & (lm == 1)).sum()); FP = int((pred & (lm == 0)).sum())
+                FN = int((~pred & (lm == 1)).sum())
+                ious.append(TP / max(TP + FP + FN, 1))
+            return float(np.mean(ious))
+
+        base_iou = hold_iou(False)
+        corr_iou = hold_iou(True)
+        if corr_iou > base_iou + margin:
+            self.rams = corr
+            self.rams_gain = corr_iou - base_iou              # 留出增益(诊断/日志用)
+        else:
+            self.rams = None
 
     def _calibrate_thr(self, det, defect_imgs, defect_masks):
         """在fit缺陷上找最大化F1的阈值(实测校准IoU 0.170→0.269 +58%,弱电子件涨最多)。
@@ -221,5 +324,11 @@ class SupervisedSegHead:
             return None
         f = self._fmap(det, img)[None].to(self.device).float()   # (1,C,h,w)
         logit = self.head((f - self.mu) / self.sd)
+        if self.rams is not None:                                # RAMS-R残差修正(留出门控启用时)
+            mus, sds = self._rams_stats
+            sc = self.rams_extractor(img)
+            sc = [((sc[i][None].to(self.device).float() - mus[i]) / sds[i]) for i in range(len(sc))]
+            if sc[0].shape[-2:] == logit.shape[-2:]:
+                logit = logit + self.rams(sc)
         amap = F.interpolate(logit, size=out_hw, mode="bilinear", align_corners=False)
         return amap[0, 0].cpu().numpy()

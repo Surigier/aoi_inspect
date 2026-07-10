@@ -64,7 +64,10 @@ class _AuxBranch:
 
 class CompetitionLargeDetector:
     def __init__(self, device="cuda", aux_size=320, train_steps=10000, seg_eval_hw=(256, 256),
-                 compile_infer=False, sam_refine=True, roi_zoom=False, seg_in=512):
+                 compile_infer=False, sam_refine=True, roi_zoom=False, seg_in=512, rams=False):
+        # rams 默认关:RAMS-R残差注意力修正支隔离探针+0.013~0.033(3/4类),但生产全管线实测净平
+        # (SAM下游重塑边界冲掉raw增益+8张留出门控噪声漏判强类+框对掩膜形变敏感),且开门类延时
+        # 超线(295/330ms,修正支重复提特征)。留opt-in备查,见 run_rams_diag.py / seg_head._RamsCorr。
         # roi_zoom 默认关:AD2真大图实测负面(0.131→0.072,裁块尺度失配+阈值不匹配),留待修复
         dev = device if torch.cuda.is_available() else "cpu"
         bb = Backbone(device=dev)
@@ -82,7 +85,9 @@ class CompetitionLargeDetector:
         # 且浅层更快(8ms vs 36ms)。640过犹不及。结构分支仍用默认bb(layers 2,3)不受影响。
         self._bb_loc = Backbone(layers=(1, 2), device=dev)
         self._seg_in = seg_in                              # 定位特征输入分辨率(大图可调高保小缺陷)
-        self.seg_head = SupervisedSegHead(device=dev, extractor=self._wrn_feats)
+        self._bb_l3 = None                                 # layer3 惰性建(RAMS-R修正支多尺度用)
+        self.seg_head = SupervisedSegHead(device=dev, extractor=self._wrn_feats,
+                                          rams_extractor=self._rams_scales if rams else None)
         self.seg_eval_hw = seg_eval_hw
         self.pix_thr = None                                # 像素图二值阈值(正常分位标定)
         from .sam_refine import SamRefiner
@@ -98,6 +103,20 @@ class CompetitionLargeDetector:
         img = img.to(self._bb_loc.device)
         img = F.interpolate(img, size=(self._seg_in, self._seg_in), mode="bilinear", align_corners=False)
         return self._bb_loc.extract(img)[0]
+
+    @torch.no_grad()
+    def _rams_scales(self, img):
+        """RAMS-R 修正支多尺度特征:WRN layers(1,2)按通道拆两尺度 + 惰性layer3,统一128²格。
+        与基线extractor解耦(tmpl_diff模式下修正支仍用本尺度组,additive不冲突)。"""
+        f12 = self._wrn_feats(img)                            # (768,128,128)
+        if self._bb_l3 is None:
+            self._bb_l3 = Backbone(layers=(3,), device=self._bb_loc.device)
+        x = (img.unsqueeze(0) if img.dim() == 3 else img).to(self._bb_loc.device)
+        x = F.interpolate(x, size=(self._seg_in, self._seg_in), mode="bilinear", align_corners=False)
+        f3 = self._bb_l3.extract(x)                           # (1,1024,g3,g3)
+        f3 = F.interpolate(f3, size=f12.shape[-2:], mode="bilinear", align_corners=False)[0]
+        s1, s2 = torch.split(f12, (256, 512), dim=0)
+        return [s1, s2, f3]
 
     def fit_fewshot(self, normals, defects, defect_masks=None):
         """检测由 EAD 核心(branches[0])单独负责;辅助分支只为'类型归属'拟合并估 μ/σ。

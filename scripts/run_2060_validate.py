@@ -103,6 +103,23 @@ def main():
             print(f"{tag} [{fmt.upper()}] 端到端: 均值={lats.mean():.0f}ms 中位={np.median(lats):.0f} "
                   f"p90={np.percentile(lats,90):.0f} min={lats.min():.0f}  → {'✅<200ms' if ok else '❌超线'}", flush=True)
 
+    # ── SAM 定标:固定4连通域标准掩膜直接计时(SAM耗时∝区域数,与图内容相关,须标准化)──
+    if det.sam is not None:
+        std_mask = np.zeros((256, 256), np.uint8)
+        for (y, x) in [(40, 40), (40, 170), (170, 40), (170, 170)]:
+            std_mask[y:y + 30, x:x + 30] = 1
+        big = t3(synth_img(1586, 3034, 9))
+        for _ in range(3):
+            det.sam.refine(big, std_mask)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            det.sam.refine(big, std_mask)
+        torch.cuda.synchronize()
+        sam_ms = (time.perf_counter() - t0) / 10 * 1000
+        print(f"\nSAM定标(固定4区域,细长大图): {sam_ms:.0f}ms/图 "
+              f"(真实缺陷通常1-5区域;上面端到端里SAM区域数随机,以此校准)", flush=True)
+
     peak = torch.cuda.max_memory_allocated() / 1e9
     vram_ok = peak < 5.5
     print(f"\n推理显存峰值: {peak:.2f}GB / {total_gb:.1f}GB  → {'✅' if vram_ok else '❌超6GB预算'}", flush=True)

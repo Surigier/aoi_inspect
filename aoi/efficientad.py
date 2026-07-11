@@ -61,7 +61,7 @@ class EfficientADDetector:
     """接口与 FewShotAdapter 一致(fit_fewshot / predict)。无记忆库。"""
 
     def __init__(self, model_size="small", device="cuda", train_steps=4000,
-                 image_size=256, lr=1e-4, seed=42, compile_infer=False):
+                 image_size=256, lr=1e-4, seed=42, compile_infer=False, n_students=1):
         self.size = model_size
         self.device = device if torch.cuda.is_available() else "cpu"
         self.train_steps = train_steps
@@ -70,16 +70,21 @@ class EfficientADDetector:
         self.seed = seed
         self.compile_infer = compile_infer            # 推理期 torch.compile 加速(fit后启用)
         self._compiled = False
-        get_pdn = get_pdn_small if model_size == "small" else get_pdn_medium
-        self.teacher = get_pdn(OUT).eval().to(self.device)
+        # n_students>1:多种子学生集成(仅检测分路径,教师共享;定位/残差路径仍用主学生)。
+        # 实测(run_ead_ensemble.py):工作类方差收窄~2×、现场一次fit下限+0.012、均值零代价;
+        # fit不计时→训练免费,推理多一次学生前向。
+        self.n_students = max(1, int(n_students))
+        self._get_pdn = get_pdn_small if model_size == "small" else get_pdn_medium
+        self.teacher = self._get_pdn(OUT).eval().to(self.device)
         sd = torch.load(_WEIGHTS / f"teacher_{model_size}.pth", map_location="cpu")
         self.teacher.load_state_dict(sd)
         for p in self.teacher.parameters():
             p.requires_grad_(False)
-        self.student = get_pdn(2 * OUT).to(self.device)
+        self.student = self._get_pdn(2 * OUT).to(self.device)
         self.ae = get_autoencoder(OUT).to(self.device)
         self.t_mean = self.t_std = None
         self.q = None                                  # (q_st_a, q_st_b, q_ae_a, q_ae_b)
+        self.pairs = None                              # [(student, ae, q)](n_students>1时)
         self.threshold = None
         self._mean = _MEAN.to(self.device)
         self._std = _STD.to(self.device)
@@ -100,15 +105,13 @@ class EfficientADDetector:
                  for x in normals]
         self.t_std = torch.stack(dists).mean(0)[None, :, None, None].sqrt()
 
-    def fit_fewshot(self, normal_images, defect_images=None):
-        torch.manual_seed(self.seed)
-        k = max(1, len(normal_images) // 10)
-        val_n, train_n = normal_images[:k], normal_images[k:]
-        if not train_n:
-            train_n = normal_images
-        self._teacher_norm(train_n)
-        self.student.train(); self.ae.train()
-        opt = torch.optim.Adam(itertools.chain(self.student.parameters(), self.ae.parameters()),
+    def _train_pair(self, train_n, seed):
+        """训一个(student, ae)对(教师冻结共享)。返回训好的 eval 态模型对。"""
+        torch.manual_seed(seed)
+        student = self._get_pdn(2 * OUT).to(self.device)
+        ae = get_autoencoder(OUT).to(self.device)
+        student.train(); ae.train()
+        opt = torch.optim.Adam(itertools.chain(student.parameters(), ae.parameters()),
                                lr=self.lr, weight_decay=1e-5)
         sched = torch.optim.lr_scheduler.StepLR(opt, int(0.95 * self.train_steps), 0.1)
         loader = itertools.cycle(train_n)
@@ -118,19 +121,33 @@ class EfficientADDetector:
             x_ae = self._prep(_color_jitter(img))
             with torch.no_grad():
                 t_st = (self.teacher(x) - self.t_mean) / self.t_std
-            s_st = self.student(x)[:, :OUT]
+            s_st = student(x)[:, :OUT]
             d = (t_st - s_st) ** 2
             d_hard = torch.quantile(d, 0.999)
             loss_hard = d[d >= d_hard].mean()
-            ae_out = self.ae(x_ae)
+            ae_out = ae(x_ae)
             with torch.no_grad():
                 t_ae = (self.teacher(x_ae) - self.t_mean) / self.t_std
-            s_ae = self.student(x_ae)[:, OUT:]
+            s_ae = student(x_ae)[:, OUT:]
             loss = loss_hard + ((t_ae - ae_out) ** 2).mean() + ((ae_out - s_ae) ** 2).mean()
             opt.zero_grad(); loss.backward(); opt.step(); sched.step()
-        self.student.eval(); self.ae.eval()
+        student.eval(); ae.eval()
+        return student, ae
+
+    def fit_fewshot(self, normal_images, defect_images=None):
+        torch.manual_seed(self.seed)
+        k = max(1, len(normal_images) // 10)
+        val_n, train_n = normal_images[:k], normal_images[k:]
+        if not train_n:
+            train_n = normal_images
+        self._teacher_norm(train_n)
+        self.pairs = []
+        for i in range(self.n_students):
+            student, ae = self._train_pair(train_n, self.seed + i)
+            q = self._map_norm(val_n if val_n else train_n, student, ae)
+            self.pairs.append((student, ae, q))
+        self.student, self.ae, self.q = self.pairs[0]         # 主学生(定位/残差路径用)
         self._maybe_compile(train_n[0] if train_n else None)
-        self._map_norm(val_n if val_n else train_n)
         if defect_images:
             ns = [self._image_score(x)[0] for x in normal_images]
             ds = [self._image_score(x)[0] for x in defect_images]
@@ -144,7 +161,11 @@ class EfficientADDetector:
             return
         try:
             self.teacher = torch.compile(self.teacher, dynamic=True)
-            self.student = torch.compile(self.student, dynamic=True)
+            if self.pairs:
+                self.pairs = [(torch.compile(s, dynamic=True), a, q) for s, a, q in self.pairs]
+                self.student = self.pairs[0][0]
+            else:
+                self.student = torch.compile(self.student, dynamic=True)
             self._compiled = True
             if warm_img is not None:
                 self.score_large(warm_img)                # 触发编译(untimed)
@@ -152,33 +173,42 @@ class EfficientADDetector:
             self._compiled = False                        # 回退 eager,不影响正确性
 
     @torch.no_grad()
-    def _maps(self, img):
+    def _maps(self, img, student=None, ae_model=None):
+        student = student if student is not None else self.student
+        ae_model = ae_model if ae_model is not None else self.ae
         x = self._prep(img)
         t = (self.teacher(x) - self.t_mean) / self.t_std
-        s = self.student(x)
-        a = self.ae(x)
+        s = student(x)
+        a = ae_model(x)
         map_st = ((t - s[:, :OUT]) ** 2).mean(1, keepdim=True)
         map_ae = ((a - s[:, OUT:]) ** 2).mean(1, keepdim=True)
         return map_st, map_ae
 
     @torch.no_grad()
-    def _map_norm(self, val_normals):
+    def _map_norm(self, val_normals, student=None, ae_model=None):
         sts, aes = [], []
         for x in val_normals:
-            st, ae = self._maps(x)
+            st, ae = self._maps(x, student, ae_model)
             sts.append(st); aes.append(ae)
         sts, aes = torch.cat(sts), torch.cat(aes)
-        self.q = (torch.quantile(sts, 0.9), torch.quantile(sts, 0.995),
-                  torch.quantile(aes, 0.9), torch.quantile(aes, 0.995))
+        q = (torch.quantile(sts, 0.9), torch.quantile(sts, 0.995),
+             torch.quantile(aes, 0.9), torch.quantile(aes, 0.995))
+        if student is None:
+            self.q = q
+        return q
 
     @torch.no_grad()
     def _image_score(self, img):
-        st, ae = self._maps(img)
-        if self.q is not None:
-            st = 0.1 * (st - self.q[0]) / (self.q[1] - self.q[0])
-            ae = 0.1 * (ae - self.q[2]) / (self.q[3] - self.q[2])
-        combined = 0.5 * st + 0.5 * ae
-        return float(combined.max()), None
+        """检测分。n_students>1:逐学生打分取平均(与run_ead_ensemble探针口径一致)。"""
+        pairs = self.pairs if self.pairs else [(self.student, self.ae, self.q)]
+        scores = []
+        for student, ae_model, q in pairs:
+            st, ae = self._maps(img, student, ae_model)
+            if q is not None:
+                st = 0.1 * (st - q[0]) / (q[1] - q[0])
+                ae = 0.1 * (ae - q[2]) / (q[3] - q[2])
+            scores.append(float((0.5 * st + 0.5 * ae).max()))
+        return sum(scores) / len(scores), None
 
     @torch.no_grad()
     def score_large(self, img, max_size=1280, max_pixels=None, use_half=True):
@@ -201,10 +231,13 @@ class EfficientADDetector:
         x = (img - self._mean) / self._std
         half = use_half and self.device != "cpu"        # FP16 仅 GPU;CPU 走 FP32(OpenVINO另导)
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=half):
-            t = (self.teacher(x) - self.t_mean) / self.t_std
-            st = self.student(x)[:, :OUT]
-            map_st = ((t - st) ** 2).mean(1)
-        return float(map_st.max())
+            t = (self.teacher(x) - self.t_mean) / self.t_std   # 教师前向一次,学生集成共享
+            students = [p[0] for p in self.pairs] if self.pairs else [self.student]
+            scores = []
+            for student in students:
+                st = student(x)[:, :OUT]
+                scores.append(float(((t - st) ** 2).mean(1).max()))
+        return sum(scores) / len(scores)
 
     @torch.no_grad()
     def anomaly_map_large(self, img, max_size=1152, max_pixels=1_400_000,

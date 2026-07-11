@@ -11,13 +11,15 @@ class TiledEfficientAD:
     def __init__(self, model_size="small", device="cuda", train_steps=10000,
                  tile=256, stride=256, tile_top_k=3, batch=16,
                  whole_infer=True, max_size=1152, max_pixels=1_400_000,
-                 compile_infer=False):
+                 compile_infer=False, n_students=1):
         # max_size 卡长边(1152)为主;max_pixels 仅作超大图安全网(1152²≈1.33M)。
         # FP16 整图卷积:1152²方图~110ms@4060→~187ms@2060,达标且留余量;
         # 1152 vs 1280 仅0.9×线性,精度基本保住(对比650k降分辨率会塌成0.49)。
         # compile_infer:fit 后 torch.compile 加速推理(方形-24%、细长-56%)。
+        # n_students:多种子学生集成(检测分),教师共享;fit不计时→训练免费。
         self.det = EfficientADDetector(model_size=model_size, device=device,
-                                       train_steps=train_steps, compile_infer=compile_infer)
+                                       train_steps=train_steps, compile_infer=compile_infer,
+                                       n_students=n_students)
         self.tile = tile
         self.stride = stride
         self.tile_top_k = tile_top_k

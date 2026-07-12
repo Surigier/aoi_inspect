@@ -152,7 +152,55 @@ class CompetitionLargeDetector:
         self._dino = None                                            # DINOv2 图级co-detector(受控)
         if getattr(self, "use_dino_gate", True) and defects:
             self._calibrate_dino_gate(normals, defects)
+        self._calibrate_latency(normals)                             # 延时预算自适应(评委真机自测自裁)
         return self.threshold
+
+    def _calibrate_latency(self, normals):
+        """延时预算自适应:fit发生在评委真机上且不计时→免费自测。用fit里最大图作探针,
+        强制走最坏链(全判缺陷→SAM/框必走)实测locate;超预算按'每ms换的分'逆序裁:
+        ①第二EAD学生(下限+0.012,最廉价)②DINO门(含漏检+0.023);③SAM(定位IoU+23%,
+        价值最高)仅在仍超200ms硬线时才弃。快卡全保留,慢卡构造性达标——不赌评委硬件。"""
+        import time
+        budget = getattr(self, "latency_budget_ms", 170)
+        if not budget or not normals:
+            return
+        probe = max(normals, key=lambda im: int(im.shape[-1]) * int(im.shape[-2]))
+        ead = self.branches[0].det.det                      # TiledEfficientAD→内层EfficientADDetector
+
+        def timed():
+            thr, dthr = self.threshold, getattr(self, "_dino_thr", None)
+            self.threshold = -1e9                                    # 强制最坏链
+            if getattr(self, "_dino", None) is not None:
+                self._dino_thr = -1e9
+            for _ in range(2):
+                self.locate(probe)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(5):
+                self.locate(probe)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            ms = (time.perf_counter() - t0) / 5 * 1000
+            self.threshold = thr
+            if dthr is not None:
+                self._dino_thr = dthr
+            return ms
+
+        self.lat_trimmed = []
+        self.lat_probe_ms = timed()
+        if self.lat_probe_ms > budget and getattr(ead, "pairs", None) and len(ead.pairs) > 1:
+            ead.pairs = ead.pairs[:1]                                # ①弃第二学生
+            self.lat_trimmed.append("student2")
+            self.lat_probe_ms = timed()
+        if self.lat_probe_ms > budget and getattr(self, "_dino", None) is not None:
+            self._dino = None                                        # ②弃DINO门(回退EAD阈值)
+            self.lat_trimmed.append("dino_gate")
+            self.lat_probe_ms = timed()
+        if self.lat_probe_ms > 200 and self.sam is not None:
+            self.sam = None                                          # ③硬超200才弃SAM
+            self.lat_trimmed.append("sam")
+            self.lat_probe_ms = timed()
 
     def _calibrate_rescue(self, normals, defects):
         """受控补检标定(榨干30张图级标签):EAD判正常时,监督信号超'fit零误翻线'才翻正。

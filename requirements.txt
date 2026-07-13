@@ -5,7 +5,7 @@ numpy>=1.24
 Pillow>=10.0
 opencv-python-headless>=4.5   # 图像IO/连通域框/ECC模板配准
 ultralytics>=8.3        # MobileSAM 边界精化(models/mobile_sam.pt);缺→静默回退粗掩膜,定位IoU掉~0.05
-pyspng>=1.1             # 2500² PNG 快速解码(~2×PIL);缺→回退慢解码,PNG测试图延时可能超200ms
+pyspng>=0.1             # 2500² PNG 快速解码(~2×PIL);缺→回退慢解码,PNG测试图延时可能超200ms
 
 # ── 无样本 / 演示 / 测试 ──
 open_clip_torch>=2.20   # zero-shot CLIP 分支(无样本冷启动)

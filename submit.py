@@ -98,6 +98,11 @@ def _run_large(args, device):
     from aoi.imageio import load_fast
     from aoi.video import moving_average, group_events
     det = CompetitionLargeDetector(device=device, compile_infer=True)   # 竞赛入口开 torch.compile 加速
+    # 延时自适应探针按真实测试文件格式计时(PNG解码~50-80ms vs JPG~30ms,影响自裁深度)
+    test_files = [p for p in sorted(Path(args.test).iterdir()) if p.suffix in IMG_EXT]
+    if test_files:
+        det.probe_format = test_files[0].suffix.lstrip(".")
+        print(f"  延时探针格式: {det.probe_format}(取自真实测试文件)", flush=True)
     dfiles = _img_files(args.defect)
     normals = [load_fast(p) for p in _img_files(args.normal)]
     defects = [load_fast(p) for p in dfiles]

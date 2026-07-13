@@ -58,10 +58,8 @@ def main():
     def t3(a):
         return torch.from_numpy(a.transpose(2, 0, 1).astype(np.float32) / 255.0)
     normals = [t3(synth_img(640, 640, i)) for i in range(99)]
-    # 混入细长大图正常样本:延时预算自适应的探针取fit最大图,须反映真实测试形态。
-    # 赛题隐藏测试=手机件(屏/电池/中框,细长)→探针用细长;方形只作测试场景(信息性,非手机形态,
-    # 若fit全是方图探针自会取方并裁到达标)。
-    normals += [t3(synth_img(1586, 3034, 901))]
+    # 混入方形2500²正常样本:赛题原文=2500×2500输入,探针必须按方形最坏情况自裁。
+    normals += [t3(synth_img(2500, 2500, 900))]
     defects = [t3(synth_img(640, 640, 1000 + i)) for i in range(30)]
     masks = []
     for i in range(30):                                       # 随机块状掩膜(训分割头用)
@@ -73,6 +71,7 @@ def main():
     t0 = time.perf_counter()
     det = CompetitionLargeDetector(train_steps=args.steps, compile_infer=True,
                                    ead_students=args.students)
+    det.probe_format = "png"                                # 探针按最坏格式(方形2500² PNG)端到端计时
     det.fit_fewshot(normals, defects, defect_masks=masks)
     print(f"fit 完成,耗时 {time.perf_counter()-t0:.0f}s(赛题不计时)", flush=True)
     print(f"延时自适应: 探针={getattr(det,'lat_probe_ms',None) and f'{det.lat_probe_ms:.0f}ms'} "

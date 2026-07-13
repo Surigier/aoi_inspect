@@ -156,15 +156,31 @@ class CompetitionLargeDetector:
         return self.threshold
 
     def _calibrate_latency(self, normals):
-        """延时预算自适应:fit发生在评委真机上且不计时→免费自测。用fit里最大图作探针,
-        强制走最坏链(全判缺陷→SAM/框必走)实测locate;超预算按'每ms换的分'逆序裁:
-        ①第二EAD学生(下限+0.012,最廉价)②DINO门(含漏检+0.023);③SAM(定位IoU+23%,
-        价值最高)仅在仍超200ms硬线时才弃。快卡全保留,慢卡构造性达标——不赌评委硬件。"""
+        """延时预算自适应:fit发生在评委真机上且不计时→免费自测。探针=真评分口径——把fit里
+        最大图写成真实文件(格式取 probe_format,submit按真实测试文件后缀设置,默认png最坏),
+        端到端计时 load_fast解码 + locate最坏链(强制全判缺陷→SAM/框必走)。分解式预算(GPU链
+        +解码相加)实测系统性低估30-40ms(张量上传/预处理隐性成本),故必须量真口径。
+        超预算(170)按'每ms换的分'逆序裁:①第二EAD学生②DINO门③EAD面积降档;
+        SAM(定位IoU+23%最值钱)与最深档只在超硬线(190=200留10余量)时动。"""
         import time
+        import tempfile
+        from pathlib import Path as _P
+        import numpy as np
+        from PIL import Image as _Im
+        from .imageio import load_fast
         budget = getattr(self, "latency_budget_ms", 170)
         if not budget or not normals:
             return
+        hard = 190.0                                        # 端到端硬线(200留10ms余量)
+        budget = min(budget, hard)
         probe = max(normals, key=lambda im: int(im.shape[-1]) * int(im.shape[-2]))
+        fmt = str(getattr(self, "probe_format", "png")).lower().lstrip(".")
+        arr = (probe.clamp(0, 1).cpu().numpy().transpose(1, 2, 0) * 255).astype("uint8")
+        pf = _P(tempfile.mkdtemp(prefix="latprobe_")) / f"probe.{fmt}"
+        if fmt in ("jpg", "jpeg"):
+            _Im.fromarray(arr).save(str(pf), quality=92)
+        else:
+            _Im.fromarray(arr).save(str(pf))
         ead = self.branches[0].det.det                      # TiledEfficientAD→内层EfficientADDetector
 
         def timed():
@@ -173,15 +189,15 @@ class CompetitionLargeDetector:
             if getattr(self, "_dino", None) is not None:
                 self._dino_thr = -1e9
             for _ in range(2):
-                self.locate(probe)
+                self.locate(load_fast(str(pf)))
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
-            for _ in range(5):
-                self.locate(probe)
+            for _ in range(4):
+                self.locate(load_fast(str(pf)))              # 端到端=解码+预处理+locate(评分口径)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-            ms = (time.perf_counter() - t0) / 5 * 1000
+            ms = (time.perf_counter() - t0) / 4 * 1000
             self.threshold = thr
             if dthr is not None:
                 self._dino_thr = dthr
@@ -197,9 +213,23 @@ class CompetitionLargeDetector:
             self._dino = None                                        # ②弃DINO门(回退EAD阈值)
             self.lat_trimmed.append("dino_gate")
             self.lat_probe_ms = timed()
-        if self.lat_probe_ms > 200 and self.sam is not None:
-            self.sam = None                                          # ③硬超200才弃SAM
+        # ③EAD面积预算降档(方形2500²的主开销;image-area是EAD唯一随图涨的GPU成本,
+        #   WRN/SAM/DINO均定尺寸)。1.4M→1.1M→0.9M,每档~-20%EAD耗时;精度代价温和于砍SAM。
+        tiled = self.branches[0].det
+        for mp in (1_100_000, 900_000):
+            if self.lat_probe_ms <= budget:
+                break
+            if getattr(tiled, "max_pixels", 0) > mp:
+                tiled.max_pixels = mp
+                self.lat_trimmed.append(f"max_pixels={mp//1000}k")
+                self.lat_probe_ms = timed()
+        if self.lat_probe_ms > hard and self.sam is not None:
+            self.sam = None                                          # ④超真硬线(200-解码)才弃SAM
             self.lat_trimmed.append("sam")
+            self.lat_probe_ms = timed()
+        if self.lat_probe_ms > hard and getattr(tiled, "max_pixels", 0) > 700_000:
+            tiled.max_pixels = 700_000                               # ⑤最深档(仍超真硬线时)
+            self.lat_trimmed.append("max_pixels=700k")
             self.lat_probe_ms = timed()
 
     def _calibrate_rescue(self, normals, defects):

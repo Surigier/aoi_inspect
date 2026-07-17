@@ -160,7 +160,13 @@ def prep_probe_files(tmpdir):
 
 def main():
     torch.manual_seed(0)
-    import tempfile
+    import tempfile, subprocess
+    try:
+        t = subprocess.run(["nvidia-smi", "--query-gpu=temperature.gpu,clocks.current.sm,clocks.max.sm",
+                             "--format=csv,noheader"], capture_output=True, text=True).stdout.strip()
+        print(f"GPU状态(延时数据仅在此干净时可信,脏卡/连轴跑后SM clock掉档会系统性高估延时): {t}", flush=True)
+    except Exception:
+        pass
     probe_files = prep_probe_files(tempfile.mkdtemp(prefix="pareto_probe_"))
 
     print("\n=== 精度轴:AD2真实掩膜数据(fit一次,post-hoc切换SAM×max_pixels测纯定位)===", flush=True)
@@ -169,7 +175,7 @@ def main():
     det_cache = {}     # cat -> (det, test_defs, test_goods)
     for cat in acc_cats:
         normals, fit_i, fit_m, test_defs, test_goods = prep_ad2(cat)
-        det = CompetitionLargeDetector(ead_students=2)   # 全功能fit一次
+        det = CompetitionLargeDetector(ead_students=2, compile_infer=True)   # 全功能fit一次(compile_infer对齐submit.py生产配置)
         det.fit_fewshot(normals, fit_i, defect_masks=fit_m)
         det_cache[cat] = (det, test_defs, test_goods)
         for sam_on in SAM_OPTS:

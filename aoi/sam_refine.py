@@ -62,6 +62,8 @@ class SamRefiner:
     def refine(self, img_chw, raw_mask, amap=None):
         """img(3,H,W)[0,1] tensor(CPU) + 二值掩膜(h,w) [+ 原始异常图amap,可选,供峰值特征用]
         → 精化掩膜(h,w)。失败/无模型回退原掩膜。逐连通域独立判断是否接受SAM结果。"""
+        if self.gate == "reject_all":
+            return raw_mask                                # OOF判SAM无净值:短路,连SAM推理都不跑(缺陷图省~40-60ms)
         m = self._model()
         if m is None or not _HAS_CV2:
             return raw_mask

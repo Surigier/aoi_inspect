@@ -50,7 +50,7 @@ def eval_pure_iou(det, test_defs, sam_mode):
     ious = []
     for img, gt in test_defs:
         o = det.locate(img)
-        pix = (o["mask"].astype(bool) if o.get("mask") is not None else (o["anomaly_map"] >= det.pix_thr))
+        pix = (o["mask"].astype(bool) if o.get("mask") is not None else (det.segment(img) >= det.pix_thr))
         ious.append(iou(pix, gt))
     det.sam = orig_sam
     if det.sam is not None:

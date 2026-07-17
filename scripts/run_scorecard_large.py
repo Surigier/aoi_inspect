@@ -46,7 +46,7 @@ def evaluate(name, normals, fit_i, fit_m, test_defs, test_goods):
         t0 = time.perf_counter(); o = det.locate(img)
         torch.cuda.synchronize() if torch.cuda.is_available() else None
         lats.append((time.perf_counter() - t0) * 1000); total += 1
-        pix = (o["mask"].astype(bool) if o.get("mask") is not None else (o["anomaly_map"] >= det.pix_thr))
+        pix = (o["mask"].astype(bool) if o.get("mask") is not None else (det.segment(img) >= det.pix_thr))
         TP = int((pix & (gt == 1)).sum()); FP = int((pix & (gt == 0)).sum()); FN = int((~pix & (gt == 1)).sum())
         iou = TP / max(TP + FP + FN, 1); ious_p.append(iou)
         if o["is_defect"]:

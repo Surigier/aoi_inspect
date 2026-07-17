@@ -75,7 +75,7 @@ def evaluate(name, normals, fit_i, fit_m, test_defs, test_goods):
             TP = int((pred & (gt == 1)).sum()); FP = int((pred & (gt == 0)).sum()); FN = int((~pred & (gt == 1)).sum())
             iou = TP / max(TP + FP + FN, 1)
         else:
-            iou = img_iou(o["anomaly_map"], gt, det.pix_thr)
+            iou = img_iou(det.segment(img), gt, det.pix_thr)
         ious_pure.append(iou)
         if o["is_defect"]:
             n_img_ok += 1

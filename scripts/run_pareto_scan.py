@@ -89,7 +89,7 @@ def eval_accuracy(det, test_defs, test_goods):
     for img, gt in test_defs:
         o = det.locate(img)
         total += 1
-        pix = (o["mask"].astype(bool) if o.get("mask") is not None else (o["anomaly_map"] >= det.pix_thr))
+        pix = (o["mask"].astype(bool) if o.get("mask") is not None else (det.segment(img) >= det.pix_thr))
         TP = int((pix & (gt == 1)).sum()); FP = int((pix & (gt == 0)).sum()); FN = int((~pix & (gt == 1)).sum())
         v = TP / max(TP + FP + FN, 1)
         ious_pure.append(v)

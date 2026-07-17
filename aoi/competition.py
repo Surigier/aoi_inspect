@@ -58,14 +58,15 @@ class _AuxBranch:
     def fit(self, normals, defects):
         self.branch.fit(torch.cat([_down(n, self.size) for n in normals], 0))
 
-    def score(self, img):
-        return self.branch.infer(_down(img, self.size)).score
+    def score(self, img, pre=None):
+        """pre:预先算好的_down(img,size)张量(3路辅助分支size相同,判缺陷时共享一次下采样)。"""
+        return self.branch.infer(pre if pre is not None else _down(img, self.size)).score
 
 
 class CompetitionLargeDetector:
     def __init__(self, device="cuda", aux_size=320, train_steps=10000, seg_eval_hw=(256, 256),
                  compile_infer=False, sam_refine=True, roi_zoom=False, seg_in=512, rams=False,
-                 ead_students=2):
+                 ead_students=2, crop_cascade=False):
         # ead_students=2:多种子EAD学生集成(检测分,教师共享)。实测工作类方差收窄~2×、
         # 现场一次fit下限+0.012、均值零代价;fit不计时训练免费,推理+一次学生前向(延时待验)。
         # rams 默认关:RAMS-R残差注意力修正支隔离探针+0.013~0.033(3/4类),但生产全管线实测净平
@@ -81,6 +82,7 @@ class CompetitionLargeDetector:
             _AuxBranch(DimensionADBranch(), "尺寸偏差", aux_size),
             _AuxBranch(StructuralADBranch(backbone=bb, grid_size=16), "缺件/逻辑", aux_size),
         ]
+        self.aux_size = aux_size
         self.stats = []
         self.weights = []
         self.threshold = None
@@ -97,6 +99,10 @@ class CompetitionLargeDetector:
         from .sam_refine import SamRefiner
         self.sam = SamRefiner() if sam_refine else None    # SAM边界精化(仅判缺陷图触发)
         self.roi_zoom = roi_zoom                           # 2500²大图:粗定位→原生裁块→局部重分割
+        # crop_cascade默认关:独立crop-head级联(重做roi_zoom,候选来自ECC模板残差非粗分割头,
+        # 独立mu/sd/阈值),fit时OOF留出验证净正才启用,opt-in等待真实数据确认前不默认开。
+        self.use_crop_cascade = crop_cascade
+        self.crop_cascade = None
 
     @torch.no_grad()
     def _wrn_feats(self, img):
@@ -148,6 +154,13 @@ class CompetitionLargeDetector:
         self._calibrate_pixel(normals)
         if defect_masks is not None and self.sam is not None:
             self.sam.calibrate(self, defects, defect_masks, seg_map_fn=self.segment)  # SAM受控精化OOF标定
+        self.crop_cascade = None
+        if defect_masks is not None and self.use_crop_cascade:
+            from .crop_cascade import CropHeadCascade
+            cc = CropHeadCascade(device=self._bb_loc.device)
+            cc.fit(self, self._ref_bank, defects, defect_masks, normals)   # OOF留出验证净正才启用
+            if cc.enabled:
+                self.crop_cascade = cc
         self.rescue_gray = None; self.rescue_seg_thr = None          # 救援默认关(v1-v6净收益≈0已放弃)
         if getattr(self, "use_rescue", False):
             self._calibrate_rescue(normals, defects)
@@ -480,29 +493,37 @@ class CompetitionLargeDetector:
         return sup if sup is not None else eff.anomaly_map_large(img, out_hw=self.seg_eval_hw)
 
     def locate(self, img):
-        """完整定位输出:图级分(EAD)+ 判决 + 类型 + 像素图 + 检测框。"""
+        """完整定位输出:图级分(EAD)+ 判决 + 类型 + 像素图 + 检测框。
+        延时热路径:EAD/DINO判正常且不处于救援灰区→立即返回,不算WRN分割/SAM/crop级联
+        (它们只有判缺陷才有意义,正常图是生产大多数,省的是主要延时)。"""
         import numpy as np
         res = self.predict(img)
-        amap = self.segment(img)
-        thr = self.pix_thr if self.pix_thr is not None else float(amap.mean() + 3 * amap.std())
-        res["anomaly_map"] = amap
         # 受控补检v6:EAD判正常但处于自适应灰区(score≥g×阈值,g由fit B半联合验证选定)
         # 且seg信号超线→翻正。g与线在fit上按"联合翻正条件零误翻"标定,守不住则整体禁用。
         g = getattr(self, "rescue_gray", None)
-        if (not res["is_defect"] and g is not None
-                and getattr(self, "rescue_seg_thr", None) is not None
-                and self.threshold is not None
-                and res["score"] >= g * self.threshold
-                and float(amap.max()) >= self.rescue_seg_thr):
+        rescue_zone = (not res["is_defect"] and g is not None
+                       and getattr(self, "rescue_seg_thr", None) is not None
+                       and self.threshold is not None
+                       and res["score"] >= g * self.threshold)
+        if not res["is_defect"] and not rescue_zone:
+            res["anomaly_map"] = None; res["mask"] = None; res["boxes"] = []
+            return res
+        amap = self.segment(img)
+        thr = self.pix_thr if self.pix_thr is not None else float(amap.mean() + 3 * amap.std())
+        res["anomaly_map"] = amap
+        if rescue_zone and float(amap.max()) >= self.rescue_seg_thr:
             res["is_defect"] = True
             res["rescued"] = "seg"
-            res["defect_type"] = self._ztype(res["_raws"])
+            raws = res["_raws"] if res["_raws"] is not None else ([res["score"]] + self._aux_raws(img))
+            res["defect_type"] = self._ztype(raws)
         if res["is_defect"]:
             mask = (amap >= thr).astype(np.uint8)
             if self.roi_zoom:
                 mask = self._zoom_refine(img if img.dim() == 3 else img[0], mask, thr)  # 原生裁块重分割
             if self.sam is not None:
                 mask = self.sam.refine(img if img.dim() == 3 else img[0], mask, amap=amap)  # SAM受控精化(逐区域OOF)
+            if self.crop_cascade is not None:
+                mask = self.crop_cascade.refine(self, img if img.dim() == 3 else img[0], mask, mask.shape)  # 独立crop-head补微小缺陷
             res["mask"] = mask
             # 掩膜已阈值化+SAM精化,面积门槛放宽到~13px(默认52px会滤掉pcb类5×5微小缺陷)
             from .seg_head import merge_boxes
@@ -552,16 +573,21 @@ class CompetitionLargeDetector:
         zs = [znorm(r, m, s) for r, (m, s) in zip(raws, self.stats)]
         return self.branches[max(range(len(zs)), key=lambda i: zs[i])].defect_type
 
+    def _aux_raws(self, img):
+        """3路轻辅助分支(色彩/尺寸/结构)分,仅判缺陷才需要(定类型)——共享一次下采样。"""
+        aux_x = _down(img, self.aux_size)
+        return [b.score(img, pre=aux_x) for b in self.branches[1:]]
+
     def predict(self, img):
-        raws = [b.score(img) for b in self.branches]
-        score = raws[0]                                   # 检测分 = EAD 核心
+        score = self.branches[0].score(img)               # 检测分 = EAD 核心(唯一检测层,无条件算)
         is_def = bool(self.threshold is not None and score >= self.threshold)
         if getattr(self, "_dino", None) is not None:      # DINOv2 图级co-detector:平等融合门
             fused = self._dino_fuse(score, self._dino.score(img))
             is_def = bool(fused >= self._dino_thr)
-        return {"score": score, "is_defect": is_def,
-                "defect_type": self._ztype(raws) if is_def else "normal",
-                "_raws": raws}
+        if is_def:
+            raws = [score] + self._aux_raws(img)          # 类型归属(3路辅助分支)只在判缺陷时算,省正常图开销
+            return {"score": score, "is_defect": True, "defect_type": self._ztype(raws), "_raws": raws}
+        return {"score": score, "is_defect": False, "defect_type": "normal", "_raws": None}
 
     def frame_score(self, img):
         """逐帧检测分(视频路径用,与 predict() 图级门同口径):EAD核心分,DINO门启用时

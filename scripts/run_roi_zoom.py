@@ -47,7 +47,7 @@ def run(cat, zoom):
         t0 = time.perf_counter()
         o = det.locate(img)
         lats.append((time.perf_counter() - t0) * 1000)
-        pred = o["mask"].astype(bool) if o.get("mask") is not None else (o["anomaly_map"] >= det.pix_thr)
+        pred = o["mask"].astype(bool) if o.get("mask") is not None else (det.segment(img) >= det.pix_thr)
         ious.append(iou(pred, _read(mpath(p), HW)))
     return np.mean(ious), np.mean(lats), len(ious)
 

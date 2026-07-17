@@ -19,7 +19,7 @@ def evaluate_ab(name, normals, fit_i, fit_m, test_defs, test_goods):
         t0 = time.perf_counter()
         o = det.locate(img)                                 # 走融合门(生产)
         lats.append((time.perf_counter() - t0) * 1000)
-        pix = (o["mask"].astype(bool) if o.get("mask") is not None else (o["anomaly_map"] >= det.pix_thr))
+        pix = (o["mask"].astype(bool) if o.get("mask") is not None else (det.segment(img) >= det.pix_thr))
         TP = int((pix & (gt == 1)).sum()); FP = int((pix & (gt == 0)).sum()); FN = int((~pix & (gt == 1)).sum())
         iou = TP / max(TP + FP + FN, 1)
         ead_def = det.threshold is not None and o["score"] >= det.threshold   # EAD-only 反事实

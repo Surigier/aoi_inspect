@@ -161,6 +161,25 @@ class SamRefiner:
         # 先算全raw基线(padding无关,用当前raw_mask做参照)
         thr = getattr(det.seg_head, "thr", None) if hasattr(det, "seg_head") else None
 
+        # seg_map_fn(WRN分割头前向)与padding无关,4个padding候选共享——只算一次/图,避免
+        # calibrate()慢4倍(SAM predict本身依赖padding算出的box坐标,不可省,仍需per-padding重跑)。
+        from PIL import Image
+        cache = {}
+        for i in range(n):
+            img, mk_native = defect_imgs[i], defect_masks[i]
+            amap = seg_map_fn(img)
+            if amap is None or thr is None:
+                continue
+            raw_mask = (amap >= thr).astype(np.uint8)
+            H, W = raw_mask.shape
+            gt = (np.array(Image.fromarray(mk_native).resize((W, H), Image.NEAREST)) > 0).astype(np.uint8)
+            arr = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8) if img.dim() == 3 else \
+                  (img[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY).astype(np.float32)
+            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3); gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            gmag = np.sqrt(gx ** 2 + gy ** 2)
+            cache[i] = (amap, raw_mask, gt, arr, gmag)
+
         best_overall = None
         for padding in PAD_CANDS:
             # 收集该padding下所有(fold, region)的特征+是否SAM优于raw的标签,按fold分组供OOF
@@ -168,19 +187,13 @@ class SamRefiner:
             for fi in range(kk):
                 idxs = folds[fi]
                 for i in idxs:
-                    img, mk_native = defect_imgs[i], defect_masks[i]
-                    amap = seg_map_fn(img)
-                    if amap is None or thr is None:
+                    if i not in cache:
                         continue
-                    raw_mask = (amap >= thr).astype(np.uint8)
+                    amap, raw_mask, gt, arr, gmag = cache[i]
+                    H, W = raw_mask.shape
                     boxes, stats, _n = self._region_boxes(raw_mask, padding)
                     if not boxes:
                         continue
-                    from PIL import Image
-                    H, W = raw_mask.shape
-                    gt = (np.array(Image.fromarray(mk_native).resize((W, H), Image.NEAREST)) > 0).astype(np.uint8)
-                    arr = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8) if img.dim() == 3 else \
-                          (img[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                     native_boxes = [[b[0], b[1], b[2], b[3]] for b in boxes]
                     try:
                         r = m.predict(arr, bboxes=native_boxes, imgsz=self.imgsz, verbose=False)[0]
@@ -188,9 +201,6 @@ class SamRefiner:
                         continue
                     if r.masks is None:
                         continue
-                    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY).astype(np.float32)
-                    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3); gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-                    gmag = np.sqrt(gx ** 2 + gy ** 2)
                     n_masks = r.masks.data.shape[0]
                     for kidx, b in enumerate(boxes):
                         if kidx >= n_masks:

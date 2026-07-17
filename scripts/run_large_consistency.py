@@ -85,11 +85,12 @@ def part2_ad2_iou(cat="sheet_metal"):
     for p in test_b:
         img = load_fast(p)
         o = det.locate(img)
-        S.append(o["anomaly_map"].ravel()); L.append(_read(mpath(p), HW).ravel())
+        S.append(det.segment(img).ravel()); L.append(_read(mpath(p), HW).ravel())
         nb.append(len(o["boxes"]))
     for p in good_t[:40]:
-        o = det.locate(load_fast(p))
-        S.append(o["anomaly_map"].ravel()); L.append(np.zeros(HW, np.uint8).ravel())
+        img = load_fast(p)
+        o = det.locate(img)
+        S.append(det.segment(img).ravel()); L.append(np.zeros(HW, np.uint8).ravel())
         nb.append(len(o["boxes"]))
     best, cal = iou_metrics(S, L, det.pix_thr)
     print(f"{cat}: best-IoU={best:.3f}  校准IoU={cal:.3f}  框数/图 中位={int(np.median(nb))} 最大={max(nb)}")

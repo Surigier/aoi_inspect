@@ -386,6 +386,56 @@ class CompetitionLargeDetector:
             self.seg_head.extractor = self._wrn_feats
             self.feat_mode = "single"
 
+    def _select_seg_head_style(self, defects, defect_masks, normals, k=4):
+        """【已停用,fit_fewshot不再调用——留档记录负结果】k折CV对比新式seg_head(4头bagging+
+        soft loss+OOF-IoU阈值)vs旧式(双头+pooled-F1,ae5fbbb存档于_seg_head_old_ae5fbbb.py)。
+        动机:真实3类AD2 A/B(run_seg_head_ab.py)暴露均值净平(0.598≈0.598)掩盖逐类反号大方差
+        (sheet_metal新+0.111 / walnuts旧+0.020 / fruit_jelly旧+0.092),按类选优理论上限≈0.635。
+        结果:单次留出split版3/3选错;升级4折CV后仍3/3选新(fruit_jelly真实差距0.092也没抓住)
+        ——不是split噪声,是fit/test分布漂移:新式在fit分布held-out上真不差,回归只在test分布
+        出现,fit侧任何CV原理上都看不见。门控挣不到位置(永远选默认+浪费8次fit),已从
+        fit_fewshot撤下;新式保持唯一默认(均值持平,且赢的sheet_metal细小缺陷/工业表面
+        最接近赛题手机件场景,新式又直接优化赛题主指标逐图IoU)。"""
+        import numpy as np
+        from ._seg_head_old_ae5fbbb import SupervisedSegHead as _OldSegHead
+        if len(defects) < 8:
+            return
+        extractor = self.seg_head.extractor
+        rams_extractor = self.seg_head.rams_extractor
+        n = len(defects)
+        kk = min(k, max(2, n // 4))
+        order = list(range(n))
+        import random as _r
+        _r.Random(0).shuffle(order)
+        folds = [order[i::kk] for i in range(kk)]
+
+        def _cv_iou(cls):
+            all_ious = []
+            for fi in range(kk):
+                hold = folds[fi]
+                tr = [i for i in range(n) if i not in set(hold)]
+                h = cls(device=self.seg_head.device, extractor=extractor, rams_extractor=rams_extractor)
+                ok = h.fit(self._eff(), [defects[i] for i in tr], [defect_masks[i] for i in tr], normals[:15])
+                thr = getattr(h, "thr", None)
+                if not ok or thr is None:
+                    continue
+                for i in hold:
+                    amap = h.map(self._eff(), defects[i], self.seg_eval_hw)
+                    gt = _mask_np(defect_masks[i], self.seg_eval_hw)
+                    pred = amap >= thr
+                    TP = int((pred & (gt == 1)).sum()); FP = int((pred & (gt == 0)).sum()); FN = int((~pred & (gt == 1)).sum())
+                    all_ious.append(TP / max(TP + FP + FN, 1))
+            return float(np.mean(all_ious)) if all_ious else -1.0
+
+        iou_new = _cv_iou(SupervisedSegHead)
+        iou_old = _cv_iou(_OldSegHead)
+        if iou_old > iou_new + 0.01:                       # 旧式要赢出margin才切换(新式默认更值得信任)
+            self.seg_head = _OldSegHead(device=self.seg_head.device, extractor=extractor,
+                                         rams_extractor=rams_extractor)
+            self.seg_head_style = "old_ensemble_pooledF1"
+        else:
+            self.seg_head_style = "new_bagging_oofIoU"
+
     @torch.no_grad()
     def _wrn_feats_diff(self, img):
         """模板差分特征:concat[feat(test), feat(test)-feat(ECC对齐最近邻正常参考)]。"""

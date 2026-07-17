@@ -146,6 +146,8 @@ class CompetitionLargeDetector:
             self.seg_head.fit(self._eff(), d_imgs, d_masks, normals[:30])
             self._calibrate_boxes(defects, defect_masks)             # fit标定碎框合并距离
         self._calibrate_pixel(normals)
+        if defect_masks is not None and self.sam is not None:
+            self.sam.calibrate(self, defects, defect_masks, seg_map_fn=self.segment)  # SAM受控精化OOF标定
         self.rescue_gray = None; self.rescue_seg_thr = None          # 救援默认关(v1-v6净收益≈0已放弃)
         if getattr(self, "use_rescue", False):
             self._calibrate_rescue(normals, defects)
@@ -156,8 +158,12 @@ class CompetitionLargeDetector:
         return self.threshold
 
     def _calibrate_latency(self, normals):
-        """延时预算自适应:fit发生在评委真机上且不计时→免费自测。探针=真评分口径——把fit里
-        最大图写成真实文件(格式取 probe_format,submit按真实测试文件后缀设置,默认png最坏),
+        """延时预算自适应:fit发生在评委真机上且不计时→免费自测。探针必须是**真实原生分辨率
+        文件**,禁止用已缩放张量(submit.py用load_fast(max_size=1152)加载normals/defects,
+        若拿这些张量重建"probe文件"→ probe长边最多1152,原生2500²的真实解码耗时被系统性
+        低估,自裁会因此偏松、真机可能超线)。优先用 probe_paths(submit传入的真实fit文件
+        路径,同产线同分辨率的原生文件)直接端到端计时;没有时(如合成数据测试)才退化为
+        重建模式并打印警告。
         端到端计时 load_fast解码 + locate最坏链(强制全判缺陷→SAM/框必走)。分解式预算(GPU链
         +解码相加)实测系统性低估30-40ms(张量上传/预处理隐性成本),故必须量真口径。
         超预算(170)按'每ms换的分'逆序裁:①第二EAD学生②DINO门③EAD面积降档;
@@ -173,14 +179,30 @@ class CompetitionLargeDetector:
             return
         hard = 190.0                                        # 端到端硬线(200留10ms余量)
         budget = min(budget, hard)
-        probe = max(normals, key=lambda im: int(im.shape[-1]) * int(im.shape[-2]))
-        fmt = str(getattr(self, "probe_format", "png")).lower().lstrip(".")
-        arr = (probe.clamp(0, 1).cpu().numpy().transpose(1, 2, 0) * 255).astype("uint8")
-        pf = _P(tempfile.mkdtemp(prefix="latprobe_")) / f"probe.{fmt}"
-        if fmt in ("jpg", "jpeg"):
-            _Im.fromarray(arr).save(str(pf), quality=92)
-        else:
-            _Im.fromarray(arr).save(str(pf))
+
+        probe_paths = getattr(self, "probe_paths", None)
+        pf = None
+        if probe_paths:
+            def _native_size(p):
+                try:
+                    with _Im.open(p) as im:
+                        return im.size[0] * im.size[1]
+                except Exception:
+                    return -1
+            existing = [p for p in probe_paths if _P(p).exists()]
+            if existing:
+                pf = max(existing, key=_native_size)         # 原生分辨率最大的真实文件,不重建
+        if pf is None:
+            print("!! _calibrate_latency: 无probe_paths(真实文件路径),退化为张量重建探针"
+                  "(可能低估解码耗时,submit.py应传入真实fit文件路径)", flush=True)
+            probe = max(normals, key=lambda im: int(im.shape[-1]) * int(im.shape[-2]))
+            fmt = str(getattr(self, "probe_format", "png")).lower().lstrip(".")
+            arr = (probe.clamp(0, 1).cpu().numpy().transpose(1, 2, 0) * 255).astype("uint8")
+            pf = _P(tempfile.mkdtemp(prefix="latprobe_")) / f"probe.{fmt}"
+            if fmt in ("jpg", "jpeg"):
+                _Im.fromarray(arr).save(str(pf), quality=92)
+            else:
+                _Im.fromarray(arr).save(str(pf))
         ead = self.branches[0].det.det                      # TiledEfficientAD→内层EfficientADDetector
 
         def timed():
@@ -480,7 +502,7 @@ class CompetitionLargeDetector:
             if self.roi_zoom:
                 mask = self._zoom_refine(img if img.dim() == 3 else img[0], mask, thr)  # 原生裁块重分割
             if self.sam is not None:
-                mask = self.sam.refine(img if img.dim() == 3 else img[0], mask)  # SAM粗到细,IoU均值+23%
+                mask = self.sam.refine(img if img.dim() == 3 else img[0], mask, amap=amap)  # SAM受控精化(逐区域OOF)
             res["mask"] = mask
             # 掩膜已阈值化+SAM精化,面积门槛放宽到~13px(默认52px会滤掉pcb类5×5微小缺陷)
             from .seg_head import merge_boxes

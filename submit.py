@@ -98,13 +98,16 @@ def _run_large(args, device):
     from aoi.imageio import load_fast
     from aoi.video import moving_average, group_events
     det = CompetitionLargeDetector(device=device, compile_infer=True)   # 竞赛入口开 torch.compile 加速
-    # 延时自适应探针按真实测试文件格式计时(PNG解码~50-80ms vs JPG~30ms,影响自裁深度)
-    test_files = [p for p in sorted(Path(args.test).iterdir()) if p.suffix in IMG_EXT]
-    if test_files:
-        det.probe_format = test_files[0].suffix.lstrip(".")
-        print(f"  延时探针格式: {det.probe_format}(取自真实测试文件)", flush=True)
     dfiles = _img_files(args.defect)
-    normals = [load_fast(p) for p in _img_files(args.normal)]
+    nfiles = _img_files(args.normal)
+    # 延时探针传真实【测试】文件路径(原生分辨率+原生格式),禁止用load_fast缩放后的张量重建
+    # (那样长边最多1152,原生2500²真实解码耗时会被系统性低估,自裁偏松、真机可能超线)。
+    # fit不计时协议约束的是墙钟时间不算分,不禁止窥探test目录文件特征做校准(读path/size不解码
+    # 不算"用了测试结果")。测试目录不可用时退化到fit文件(同产线同分辨率,仍是真实原生文件)。
+    test_img_files = [p for p in sorted(Path(args.test).iterdir()) if p.suffix in IMG_EXT] \
+        if Path(args.test).is_dir() else []
+    det.probe_paths = [str(p) for p in (test_img_files or (dfiles + nfiles))]
+    normals = [load_fast(p) for p in nfiles]
     defects = [load_fast(p) for p in dfiles]
     if not normals or not defects:
         raise SystemExit("normal/ 与 defect/ 必须各含至少一张图片")

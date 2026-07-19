@@ -173,6 +173,7 @@ class SupervisedSegHead:
         # 5折OOF标定的3个候选阈值(_oof_calibrate_thr):self.thr默认=thr_iou(逐图平均IoU最优,
         # 赛题评分主指标);thr_boxhit/thr_f1供按官方最终输出类型切换(见run_pareto_scan等脚本)。
         self.thr = self.thr_iou = self.thr_boxhit = self.thr_f1 = None
+        self.oof_maps = None                               # {原defect下标: OOF预测图256²}(下游门控无偏base)
         self.rams = None                                   # RAMS-R修正支(fit留出门控启用)
         self._rams_stats = None
 
@@ -367,6 +368,10 @@ class SupervisedSegHead:
         self.thr_boxhit = _best(boxhit_at)
         self.thr_f1 = _best(f1_at)
         self.thr = self.thr_iou                  # 默认口径=逐图平均IoU(赛题评分主指标)
+        # 留存OOF预测图(键=原defect_masks下标):下游门控(如组件图)评估"某机制对seg的边际
+        # 增益"必须用未见折预测当base——用self.map()会因这些图正是训练图而base过拟合地好,
+        # 系统性低估边际增益(组件图门控实测在juice_bottle上-0.097 vs test真值+0.080的教训)。
+        self.oof_maps = {real_orig_idx[q]: oof_amap[q] for q in keys}
 
     def _calibrate_thr(self, det, defect_imgs, defect_masks):
         """[已弃用,由_oof_calibrate_thr取代]保留供opt-in/对比用:pooled-pixel F1阈值,

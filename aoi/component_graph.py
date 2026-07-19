@@ -144,15 +144,24 @@ class ComponentGraph:
 
         if defect_imgs is None or defect_masks is None or len(defect_imgs) < 8:
             return                                           # 无标注不启用(没法验证净增益)
-        # OOF留出门控:每3取1做holdout,比较 seg基线 vs seg∪组件掩膜 的逐图IoU
+        # 门控设计定稿(完整证据链,防后人重蹈):
+        # ①holdout用全量30张fit缺陷(组件统计只来自正常图→零泄漏;首版每3取1白白放大3倍方差)。
+        # ②base用生产seg图(det.segment)。曾试OOF无偏base(seg_head.oof_maps)治"fit图是seg
+        #   训练图→base过拟合好→低估边际增益"的偏差:juice_bottle估值-0.112→-0.037有改善,
+        #   但仍测不出test真值+0.081,且把breakfast_box错判成+0.059(test真值-0.012)——fit侧
+        #   对±0.1量级小信号两版都是掷硬币,此路确认到头。
+        # ③生产base的保守偏差是特性不是bug:真·逻辑缺陷(局部纹理与正常相同)seg_head连fit图
+        #   都记不住→base在fit侧也烂→门控才转正,恰好对应组件图该开的极端场景;而灾难级伤害
+        #   (纹理类伪组件,sheet_metal强制开Δ=-0.218)门控估-0.169方向量级都对,能可靠拦截。
+        #   代价:中间态(juice_bottle:局部可分但泛化差,test真值+0.081)会被错过——换取严格
+        #   零回退,按项目纪律取安全侧。
         from .seg_head import _mask_to, _per_image_iou
-        hold = list(range(0, len(defect_imgs), 3))
         gains = []
-        for i in hold:
+        for i in range(len(defect_imgs)):
             img, mk = defect_imgs[i], defect_masks[i]
             amap = det.segment(img)
-            fh, fw = amap.shape
             thr = det.pix_thr if det.pix_thr is not None else float(amap.mean() + 3 * amap.std())
+            fh, fw = amap.shape
             base = (amap >= thr).astype(np.uint8)
             gt = _mask_to(mk, fh, fw)
             merged = self.refine(det, img, base.copy(), feat=None)

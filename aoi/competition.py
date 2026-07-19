@@ -66,7 +66,7 @@ class _AuxBranch:
 class CompetitionLargeDetector:
     def __init__(self, device="cuda", aux_size=320, train_steps=10000, seg_eval_hw=(256, 256),
                  compile_infer=False, sam_refine=True, roi_zoom=False, seg_in=512, rams=False,
-                 ead_students=2, crop_cascade=False):
+                 ead_students=2, crop_cascade=False, comp_graph=False):
         # ead_students=2:多种子EAD学生集成(检测分,教师共享)。实测工作类方差收窄~2×、
         # 现场一次fit下限+0.012、均值零代价;fit不计时训练免费,推理+一次学生前向(延时待验)。
         # rams 默认关:RAMS-R残差注意力修正支隔离探针+0.013~0.033(3/4类),但生产全管线实测净平
@@ -103,6 +103,10 @@ class CompetitionLargeDetector:
         # 独立mu/sd/阈值),fit时OOF留出验证净正才启用,opt-in等待真实数据确认前不默认开。
         self.use_crop_cascade = crop_cascade
         self.crop_cascade = None
+        # comp_graph默认关:组件图逻辑异常分支(UniVAD思想轻量落地,SAM只在fit期打组件
+        # 伪标签,热路径ECC+复用WRN特征ROI池化)。fit时OOF留出验证净正才启用,零回退。
+        self.use_comp_graph = comp_graph
+        self.comp_graph = None
 
     @torch.no_grad()
     def _wrn_feats(self, img):
@@ -161,6 +165,14 @@ class CompetitionLargeDetector:
             cc.fit(self, self._ref_bank, defects, defect_masks, normals)   # OOF留出验证净正才启用
             if cc.enabled:
                 self.crop_cascade = cc
+        self.comp_graph = None
+        if self.use_comp_graph:
+            from .component_graph import ComponentGraph
+            cg = ComponentGraph(device=self._bb_loc.device)
+            cg.fit(self, normals, defect_imgs=defects if defect_masks is not None else None,
+                   defect_masks=defect_masks)               # OOF留出验证净正才启用(零回退)
+            if cg.enabled:
+                self.comp_graph = cg
         self.rescue_gray = None; self.rescue_seg_thr = None          # 救援默认关(v1-v6净收益≈0已放弃)
         if getattr(self, "use_rescue", False):
             self._calibrate_rescue(normals, defects)
@@ -547,6 +559,8 @@ class CompetitionLargeDetector:
         延时热路径:EAD/DINO判正常且不处于救援灰区→立即返回,不算WRN分割/SAM/crop级联
         (它们只有判缺陷才有意义,正常图是生产大多数,省的是主要延时)。"""
         import numpy as np
+        if torch.cuda.is_available() and img.device.type == "cpu":
+            img = img.to(self._bb_loc.device)   # 单次H2D上传:下游EAD/DINO/WRN/aux的.to()全变no-op
         res = self.predict(img)
         # 受控补检v6:EAD判正常但处于自适应灰区(score≥g×阈值,g由fit B半联合验证选定)
         # 且seg信号超线→翻正。g与线在fit上按"联合翻正条件零误翻"标定,守不住则整体禁用。
@@ -574,6 +588,8 @@ class CompetitionLargeDetector:
                 mask = self.sam.refine(img if img.dim() == 3 else img[0], mask, amap=amap)  # SAM受控精化(逐区域OOF)
             if self.crop_cascade is not None:
                 mask = self.crop_cascade.refine(self, img if img.dim() == 3 else img[0], mask, mask.shape)  # 独立crop-head补微小缺陷
+            if self.comp_graph is not None:
+                mask = self.comp_graph.refine(self, img, mask)          # 组件图补逻辑缺陷(缺件/错位)
             res["mask"] = mask
             # 掩膜已阈值化+SAM精化,面积门槛放宽到~13px(默认52px会滤掉pcb类5×5微小缺陷)
             from .seg_head import merge_boxes
@@ -624,8 +640,10 @@ class CompetitionLargeDetector:
         return self.branches[max(range(len(zs)), key=lambda i: zs[i])].defect_type
 
     def _aux_raws(self, img):
-        """3路轻辅助分支(色彩/尺寸/结构)分,仅判缺陷才需要(定类型)——共享一次下采样。"""
-        aux_x = _down(img, self.aux_size)
+        """3路轻辅助分支(色彩/尺寸/结构)分,仅判缺陷才需要(定类型)——共享一次下采样。
+        显式回CPU:分支的统计bank是fit期在CPU建的(色彩bank等),GPU张量会cdist设备不匹配;
+        320²小图回传开销可忽略,单次上传的收益留给EAD/DINO/WRN大头。"""
+        aux_x = _down(img, self.aux_size).cpu()
         return [b.score(img, pre=aux_x) for b in self.branches[1:]]
 
     def predict(self, img):

@@ -121,13 +121,26 @@ def _run_large(args, device):
     det.fit_fewshot(normals, defects, defect_masks=masks)
     print(f"  监督分割头: {'已训(用掩膜)' if det.seg_head.head is not None else '未训(无掩膜→无监督定位)'}", flush=True)
     rows = []
-    for p in sorted(Path(args.test).iterdir()):
-        if p.suffix in IMG_EXT:
-            o = det.locate(load_fast(p))
-            boxes = ";".join(f"{b[0]},{b[1]},{b[2]},{b[3]}" for b in o["boxes"])
-            rows.append([p.name, "image", int(o["is_defect"]), round(o["score"], 4),
-                         o["defect_type"], boxes])
-        elif p.suffix in VID_EXT:
+    # CPU解码/GPU推理双缓冲:后台线程预取下一张图的load_fast(2500²PNG解码~60-100ms纯CPU),
+    # 与当前图的GPU推理重叠——目录评测吞吐口径下解码几乎全被藏掉(单图延时口径不变)。
+    from concurrent.futures import ThreadPoolExecutor
+    all_files = sorted(Path(args.test).iterdir())
+    img_next = {}                                            # path -> Future(下一张图张量)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        for i, p in enumerate(all_files):
+            if p.suffix in IMG_EXT:
+                fut = img_next.pop(p, None)
+                img = fut.result() if fut is not None else load_fast(p)
+                for q in all_files[i + 1:]:                  # 预取紧邻的下一张图片
+                    if q.suffix in IMG_EXT:
+                        img_next[q] = pool.submit(load_fast, q)
+                        break
+                o = det.locate(img)
+                boxes = ";".join(f"{b[0]},{b[1]},{b[2]},{b[3]}" for b in o["boxes"])
+                rows.append([p.name, "image", int(o["is_defect"]), round(o["score"], 4),
+                             o["defect_type"], boxes])
+    for p in all_files:
+        if p.suffix in VID_EXT:
             frames = read_video_frames(str(p), size=2048)
             scores = [det.frame_score(f) for f in frames]         # 图级门同口径(含受控DINO co-detector)
             thr = det.decision_threshold()

@@ -7,3 +7,5 @@ runs/
 *.pth
 *.onnx
 data/_dl/
+data/_dl/
+_logs/

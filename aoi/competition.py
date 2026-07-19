@@ -16,7 +16,13 @@ from .tiled_efficientad import TiledEfficientAD
 from .branches.color_ad import ColorADBranch
 from .branches.dimension_ad import DimensionADBranch
 from .branches.structural_ad import StructuralADBranch
-from .seg_head import SupervisedSegHead, map_to_boxes
+from .seg_head import map_to_boxes
+# 生产seg_head=旧实现(双头集成+pooled-F1自洽阈值)。新实现(bagging+soft loss+OOF阈值,
+# aoi/seg_head.py)8类实证:AD2三类净平、成绩单5类全输(均值-0.104,pcb 0.251→0.028/
+# battery 0.374→0.122崩塌——OOF抛弃头阈值跨头迁移失败,绝对值/分位数两种迁移都不成:
+# 分位数版救pcb却砸hazelnut -0.204)。唯一确证收益sheet_metal+0.111不抵。按纪律回退,
+# 新头及OOF基建留作opt-in研究件(run_seg_head_ab_scorecard.py为证据)。
+from ._seg_head_old_ae5fbbb import SupervisedSegHead
 
 
 def _mask_np(mk, hw):

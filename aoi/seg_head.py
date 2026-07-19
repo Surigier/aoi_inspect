@@ -364,9 +364,27 @@ class SupervisedSegHead:
             prec = TP / max(TP + FP, 1); rec = TP / max(TP + FN, 1)
             return 2 * prec * rec / max(prec + rec, 1e-9)
 
-        self.thr_iou = _best(iou_at)
-        self.thr_boxhit = _best(boxhit_at)
-        self.thr_f1 = _best(f1_at)
+        # ⚠️阈值跨头迁移:OOF图来自抛弃式单头,最终上生产的是4头bagging——两者logit分布在
+        # 难类上偏移巨大(Real-IAD pcb实测:抛弃头绝对阈值-17.4套到最终头→IoU 0.028,旧头
+        # 自洽标定0.251,battery同模式0.122 vs 0.374,三指标阈值全退化到同一极端分位)。
+        # 修复:OOF只选【分位数】(跨头可迁移的相对量),再映射到最终bagging头在同批fit缺陷
+        # 图上的logit分布取绝对阈值——OOF无偏选口径 + 最终头自洽定标度,两全。
+        def _rank(t):
+            return float((all_vals < t).mean() * 100.0)
+
+        q_iou, q_boxhit, q_f1 = _rank(_best(iou_at)), _rank(_best(boxhit_at)), _rank(_best(f1_at))
+        final_vals = []
+        with torch.no_grad():
+            for q in keys:
+                X = feats[real_pos[q]][None].to(self.device).float()
+                logit = self.head((X - self.mu) / self.sd)
+                up = F.interpolate(logit, size=out_hw, mode="bilinear",
+                                   align_corners=False)[0, 0].cpu().numpy()
+                final_vals.append(up.ravel())
+        final_vals = np.concatenate(final_vals)
+        self.thr_iou = float(np.percentile(final_vals, q_iou))
+        self.thr_boxhit = float(np.percentile(final_vals, q_boxhit))
+        self.thr_f1 = float(np.percentile(final_vals, q_f1))
         self.thr = self.thr_iou                  # 默认口径=逐图平均IoU(赛题评分主指标)
         # 留存OOF预测图(键=原defect_masks下标):下游门控(如组件图)评估"某机制对seg的边际
         # 增益"必须用未见折预测当base——用self.map()会因这些图正是训练图而base过拟合地好,

@@ -46,7 +46,7 @@ def prep_logic(cat, n_norm=100, n_fit=30):
 
 
 def evaluate(name, normals, fit_i, fit_m, test_defs, test_goods):
-    det = CompetitionLargeDetector()
+    det = CompetitionLargeDetector(train_steps=3000, ead_students=1)   # 快跑基线(与组件图A/B同预算对齐)
     det.fit_fewshot(normals, fit_i, defect_masks=fit_m)
     ious_gated, ious_pure, hits, lats = [], [], [], []
     n_ok = 0; total = 0

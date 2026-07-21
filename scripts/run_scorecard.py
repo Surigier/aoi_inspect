@@ -97,29 +97,36 @@ def evaluate(name, normals, fit_i, fit_m, test_defs, test_goods):
     return acc, np.mean(ious_gated), np.mean(ious_pure), np.mean(hits)
 
 
+# 统一口径(2026-07-19定):fit与test全部走生产加载器load_fast(保长宽比,上限1152),
+# 与submit.py赛场入口逐字节一致。此前基准专用_load_img(640)一刀切正方形resize是额外变量
+# (cable台架artifact部分由它放大;Real-IAD原生256被硬拉640不增信息只改特征尺度)。
+# 换口径后数字与旧基线不可比,以本文件跑出的新数为准。
+from aoi.imageio import load_fast
+
+
 def prep_mvtec(cat, folders):
     root = Path(f"data/mvtec/{cat}")
-    normals = [_load_img(p, 640) for p in sorted(glob.glob(str(root / "train/good/*.png")))[:100]]
-    goods = [(_load_img(p, 640), None) for p in sorted(glob.glob(str(root / "test/good/*.png")))[:40]]
+    normals = [load_fast(p) for p in sorted(glob.glob(str(root / "train/good/*.png")))[:100]]
+    goods = [(load_fast(p), None) for p in sorted(glob.glob(str(root / "test/good/*.png")))[:40]]
     df = []
     for fo in folders:
         df += [(p, fo) for p in sorted(glob.glob(str(root / "test" / fo / "*.png")))]
     random.Random(0).shuffle(df); k = max(5, len(df) // 3)
-    fit_i = [_load_img(p, 640) for p, _ in df[:k]]
+    fit_i = [load_fast(p) for p, _ in df[:k]]
     fit_m = [_read(GT / cat / "ground_truth" / fo / (Path(p).stem + "_mask.png"), HW) for p, fo in df[:k]]
-    test_defs = [(_load_img(p, 640), _read(GT / cat / "ground_truth" / fo / (Path(p).stem + "_mask.png"), HW)) for p, fo in df[k:]]
+    test_defs = [(load_fast(p), _read(GT / cat / "ground_truth" / fo / (Path(p).stem + "_mask.png"), HW)) for p, fo in df[k:]]
     return normals, fit_i, fit_m, test_defs, goods
 
 
 def prep_realiad(cat):
     d = json.load(open(RJ / f"{cat}.json")); R = RI / cat
     tok = [x for x in d["train"] if x["anomaly_class"] == "OK"]; random.Random(0).shuffle(tok)
-    normals = [_load_img(R / x["image_path"], 640) for x in tok[:100]]
+    normals = [load_fast(R / x["image_path"]) for x in tok[:100]]
     ng = [x for x in d["test"] if x["anomaly_class"] != "OK"]; random.Random(0).shuffle(ng)
-    fit_i = [_load_img(R / x["image_path"], 640) for x in ng[:30]]
+    fit_i = [load_fast(R / x["image_path"]) for x in ng[:30]]
     fit_m = [_read(R / x["mask_path"], HW) for x in ng[:30]]
-    test_defs = [(_load_img(R / x["image_path"], 640), _read(R / x["mask_path"], HW)) for x in ng[30:70]]
-    goods = [(_load_img(R / x["image_path"], 640), None) for x in d["test"] if x["anomaly_class"] == "OK"][:40]
+    test_defs = [(load_fast(R / x["image_path"]), _read(R / x["mask_path"], HW)) for x in ng[30:70]]
+    goods = [(load_fast(R / x["image_path"]), None) for x in d["test"] if x["anomaly_class"] == "OK"][:40]
     return normals, fit_i, fit_m, test_defs, goods
 
 

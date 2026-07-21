@@ -351,8 +351,13 @@ class CompetitionLargeDetector:
             bes.append(_bal_acc(list(ed[vd]), list(en[vn]), thr_e))
             bfs.append(_bal_acc(list(fz(ed[vd], dd[vd])), list(fz(en[vn], dn[vn])), thr_f))
         bf, be = np.nanmean(bfs), np.nanmean(bes)
-        if not (np.isfinite(bf) and np.isfinite(be) and bf >= be):
-            return                                            # CV均值无增益→不启用,守住纯EAD
+        # 启用规则偏向融合(margin=0.03):cable@640实测test正常图EAD分系统性漂高(fit侧
+        # 一切正常、任何fit守卫都看不见),EAD-only test acc=0.236,DINO融合0.873——CV在
+        # fit侧对这种病理只能掷硬币,这轮掷输就是-0.64。融合门对单支漂移更鲁棒(双z归一
+        # max),历史pcb上过度触发的代价仅-0.011,期望值压倒性偏向融合。严格"bf>=be"改
+        # "bf>=be-0.03":CV明确说融合更差(>3个点)才守纯EAD。
+        if not (np.isfinite(bf) and np.isfinite(be) and bf >= be - 0.03):
+            return                                            # CV显著劣化→不启用,守住纯EAD
         # 启用:全fit重标准化+联合阈值
         emu, esd = en.mean(), en.std() + 1e-9
         dmu, dsd = dn.mean(), dn.std() + 1e-9

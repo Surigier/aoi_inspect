@@ -319,11 +319,18 @@ class CompetitionLargeDetector:
 
     def _calibrate_dino_gate(self, normals, defects):
         """DINOv2 图级 co-detector 标定(受控平等融合,治EAD漏检→提含漏检IoU)。
-        max(z_EAD, z_DINO) 联合门,3折CV验证:每折在训练部分标两门、验证部分比平衡acc,
-        仅当融合门CV均值不劣于EAD-only才逐类启用(否则回退纯EAD)。启用后用全fit重标联合阈值。
-        CV(替代单次A/B半):降15+15小split噪声,治pcb类fit看着行/test更难的失配欠触发。"""
+        max(z_EAD, z_DINO) 联合门,默认永远启用(不再由fit侧3折CV决定开关)。
+        改动原因(2026-07-19,cable实锤):EAD原始分在某些类上test集系统性失灵是
+        fit阶段结构性看不见的(fit侧正常/缺陷分离良好,test分布漂移只在test暴露)——
+        cable@生产配置实测:同一份代码/同一个种子号,仅因为该类在同进程里排第几个
+        训练(消耗的随机数流位置不同→EAD学生具体权重不同),acc在0.909(融合门"运气好"
+        判定开)和0.691(判定关,含漏检暴跌到0.048)间跳变。3折CV在这类问题上只是
+        掷硬币,不是真的在测信号,margin放宽(bf>=be-0.03)只改了赢面没拿掉赌博本身。
+        风险不对称:历史记录里DINO过度触发的已知代价仅pcb -0.011(小,单类单次观测);
+        DINO缺失的代价是cable那种-0.6+量级灾难。故不再赌,默认永远融合;仅当DinoGate
+        本身构建失败(异常/样本太少)才回退纯EAD。"""
         import numpy as np
-        from .dino_gate import DinoGate, _bal_acc
+        from .dino_gate import DinoGate
         self._dino = None
         if self.threshold is None or len(normals) < 9 or len(defects) < 6:
             return
@@ -332,33 +339,7 @@ class CompetitionLargeDetector:
         gate.build(normals[:40])
         en = np.array([ead.score(n) for n in normals]); dn = np.array([gate.score(n) for n in normals])
         ed = np.array([ead.score(d) for d in defects]); dd = np.array([gate.score(d) for d in defects])
-        # 3折CV:训练折标定两门标准化+阈值,验证折比平衡acc(两门同折同标定→公平)
-        K = 3
-        def _folds(n):
-            idx = np.arange(n); np.random.RandomState(0).shuffle(idx)
-            return [idx[i::K] for i in range(K)]
-        nf, df = _folds(len(normals)), _folds(len(defects))
-        bfs, bes = [], []
-        for k in range(K):
-            vn, vd = nf[k], df[k]
-            tn = np.concatenate([nf[j] for j in range(K) if j != k])
-            td = np.concatenate([df[j] for j in range(K) if j != k])
-            emu, esd = en[tn].mean(), en[tn].std() + 1e-9
-            dmu, dsd = dn[tn].mean(), dn[tn].std() + 1e-9
-            fz = lambda e, d: np.maximum((e - emu) / esd, (d - dmu) / dsd)
-            thr_e = FewShotAdapter._calibrate(list(en[tn]), list(ed[td]))
-            thr_f = FewShotAdapter._calibrate(list(fz(en[tn], dn[tn])), list(fz(ed[td], dd[td])))
-            bes.append(_bal_acc(list(ed[vd]), list(en[vn]), thr_e))
-            bfs.append(_bal_acc(list(fz(ed[vd], dd[vd])), list(fz(en[vn], dn[vn])), thr_f))
-        bf, be = np.nanmean(bfs), np.nanmean(bes)
-        # 启用规则偏向融合(margin=0.03):cable@640实测test正常图EAD分系统性漂高(fit侧
-        # 一切正常、任何fit守卫都看不见),EAD-only test acc=0.236,DINO融合0.873——CV在
-        # fit侧对这种病理只能掷硬币,这轮掷输就是-0.64。融合门对单支漂移更鲁棒(双z归一
-        # max),历史pcb上过度触发的代价仅-0.011,期望值压倒性偏向融合。严格"bf>=be"改
-        # "bf>=be-0.03":CV明确说融合更差(>3个点)才守纯EAD。
-        if not (np.isfinite(bf) and np.isfinite(be) and bf >= be - 0.03):
-            return                                            # CV显著劣化→不启用,守住纯EAD
-        # 启用:全fit重标准化+联合阈值
+        # 全fit标定两门标准化+联合阈值(不再有CV开关决策,永远启用)
         emu, esd = en.mean(), en.std() + 1e-9
         dmu, dsd = dn.mean(), dn.std() + 1e-9
         fz2 = lambda e, d: max((e - emu) / esd, (d - dmu) / dsd)
@@ -368,9 +349,10 @@ class CompetitionLargeDetector:
         self._dino_thr = FewShotAdapter._calibrate(
             [float(max((e - emu) / esd, (d - dmu) / dsd)) for e, d in zip(en, dn)],
             [float(max((e - emu) / esd, (d - dmu) / dsd)) for e, d in zip(ed, dd)])
-        # 注:曾试"病态标定守卫"(阈值漏过半fit缺陷→重标)治cable@640翻车,实测无效——病态是
+        # 注:曾试"病态标定守卫"(阈值漏过半fit缺陷→重标)治cable翻车,实测无效——病态是
         # fit/test漂移(fit缺陷强/test弱),fit侧看不见;守卫触发时反而重标低→pcb图级acc掉0.011。
-        # 已撤。cable@640翻车是小样本(15缺陷)+640台架双artifact,生产30缺陷不发生(cable=0.855)。
+        # 已撤,守卫类思路对这种"fit侧看不见test漂移"的病理普遍无效(seg_head/component_graph
+        # 门控今天也撞了同一堵墙)——真正有效的是"永远融合"这种不依赖fit侧判断的确定性设计。
 
     def _select_feat_mode(self, defects, defect_masks, normals):
         """留出集(每4取1)对比 单特征 vs 模板差分特征(工业AOI金模板;pcb类刚性件+21%,

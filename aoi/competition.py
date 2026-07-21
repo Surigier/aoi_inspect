@@ -197,8 +197,12 @@ class CompetitionLargeDetector:
         重建模式并打印警告。
         端到端计时 load_fast解码 + locate最坏链(强制全判缺陷→SAM/框必走)。分解式预算(GPU链
         +解码相加)实测系统性低估30-40ms(张量上传/预处理隐性成本),故必须量真口径。
-        超预算(170)按'每ms换的分'逆序裁:①第二EAD学生②DINO门③EAD面积降档;
-        SAM(定位IoU+23%最值钱)与最深档只在超硬线(190=200留10余量)时动。"""
+        超预算裁剪顺序(2026-07-19重排,按当前证据"每ms换的分"排序,不是历史顺序):
+        ①第二EAD学生 ②EAD面积降档(max_pixels,Pareto扫描证实对纯定位IoU零影响,纯白拿)
+        ③SAM(sam_refine.py逐区域OOF门控5/5域实测全判reject_all,已短路近零成本;若未
+        标定/仍在跑推理则一并弃,反正当前无证实正贡献)④DINO门(cable实锤:融合门是
+        cable唯一救命机制,弃它代价可达-0.6+量级,历史"SAM最值钱"的旧排序已过时,DINO
+        才是最后才能动的)⑤最深max_pixels(700k,仍超硬线190时)。"""
         import time
         import tempfile
         from pathlib import Path as _P
@@ -262,12 +266,9 @@ class CompetitionLargeDetector:
             ead.pairs = ead.pairs[:1]                                # ①弃第二学生
             self.lat_trimmed.append("student2")
             self.lat_probe_ms = timed()
-        if self.lat_probe_ms > budget and getattr(self, "_dino", None) is not None:
-            self._dino = None                                        # ②弃DINO门(回退EAD阈值)
-            self.lat_trimmed.append("dino_gate")
-            self.lat_probe_ms = timed()
-        # ③EAD面积预算降档(方形2500²的主开销;image-area是EAD唯一随图涨的GPU成本,
-        #   WRN/SAM/DINO均定尺寸)。1.4M→1.1M→0.9M,每档~-20%EAD耗时;精度代价温和于砍SAM。
+        # ②EAD面积预算降档(方形2500²的主开销;image-area是EAD唯一随图涨的GPU成本,
+        #   WRN/SAM/DINO均定尺寸)。1.4M→1.1M→0.9M,每档~-20%EAD耗时,Pareto扫描证实
+        #   对纯定位IoU零影响——白拿,排在DINO之前砍。
         tiled = self.branches[0].det
         for mp in (1_100_000, 900_000):
             if self.lat_probe_ms <= budget:
@@ -276,9 +277,13 @@ class CompetitionLargeDetector:
                 tiled.max_pixels = mp
                 self.lat_trimmed.append(f"max_pixels={mp//1000}k")
                 self.lat_probe_ms = timed()
-        if self.lat_probe_ms > hard and self.sam is not None:
-            self.sam = None                                          # ④超真硬线(200-解码)才弃SAM
+        if self.lat_probe_ms > budget and self.sam is not None:
+            self.sam = None                                          # ③弃SAM(5/5域实测reject_all,无证实正贡献)
             self.lat_trimmed.append("sam")
+            self.lat_probe_ms = timed()
+        if self.lat_probe_ms > hard and getattr(self, "_dino", None) is not None:
+            self._dino = None                                        # ④超真硬线才弃DINO门(cable实锤:
+            self.lat_trimmed.append("dino_gate")                     #   弃它代价可达-0.6+,放到最后才动)
             self.lat_probe_ms = timed()
         if self.lat_probe_ms > hard and getattr(tiled, "max_pixels", 0) > 700_000:
             tiled.max_pixels = 700_000                               # ⑤最深档(仍超真硬线时)

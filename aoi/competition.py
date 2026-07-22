@@ -72,7 +72,7 @@ class _AuxBranch:
 class CompetitionLargeDetector:
     def __init__(self, device="cuda", aux_size=320, train_steps=10000, seg_eval_hw=(256, 256),
                  compile_infer=False, sam_refine=True, roi_zoom=False, seg_in=512, rams=False,
-                 ead_students=2, crop_cascade=False, comp_graph=False):
+                 ead_students=2, crop_cascade=False, comp_graph=False, boundary_refine=False):
         # ead_students=2:多种子EAD学生集成(检测分,教师共享)。实测工作类方差收窄~2×、
         # 现场一次fit下限+0.012、均值零代价;fit不计时训练免费,推理+一次学生前向(延时待验)。
         # rams 默认关:RAMS-R残差注意力修正支隔离探针+0.013~0.033(3/4类),但生产全管线实测净平
@@ -113,6 +113,10 @@ class CompetitionLargeDetector:
         # 伪标签,热路径ECC+复用WRN特征ROI池化)。fit时OOF留出验证净正才启用,零回退。
         self.use_comp_graph = comp_graph
         self.comp_graph = None
+        # boundary_refine默认关:DCP-SFR启发的边界残差头(浅层edge cue修正分割logit边界,
+        # 零初始化残差)。fit时k折OOF验证净正才启用,零回退。
+        self.use_boundary_refine = boundary_refine
+        self.boundary_refiner = None
 
     @torch.no_grad()
     def _wrn_feats(self, img):
@@ -162,8 +166,17 @@ class CompetitionLargeDetector:
             self.seg_head.fit(self._eff(), d_imgs, d_masks, normals[:30])
             self._calibrate_boxes(defects, defect_masks)             # fit标定碎框合并距离
         self._calibrate_pixel(normals)
+        self.boundary_refiner = None
+        if defect_masks is not None and self.use_boundary_refine:
+            from .boundary_refine import BoundaryRefiner
+            br = BoundaryRefiner(device=self._bb_loc.device)
+            br.fit(self, defects, defect_masks)               # k折OOF验证净正才启用
+            if br.enabled:
+                self.boundary_refiner = br
         if defect_masks is not None and self.sam is not None:
             self.sam.calibrate(self, defects, defect_masks, seg_map_fn=self.segment)  # SAM受控精化OOF标定
+            # (若boundary_refiner已启用,self.segment()此时已含边界修正,SAM门控看到的
+            #  就是生产真实会用的base——两套门控解耦生效,不重复实现SAM那套逻辑)
         self.crop_cascade = None
         if defect_masks is not None and self.use_crop_cascade:
             from .crop_cascade import CropHeadCascade
@@ -550,7 +563,10 @@ class CompetitionLargeDetector:
         无掩膜→回退无监督 EAD 异常图。"""
         eff = self._eff()
         sup = self.seg_head.map(eff, img, self.seg_eval_hw)
-        return sup if sup is not None else eff.anomaly_map_large(img, out_hw=self.seg_eval_hw)
+        amap = sup if sup is not None else eff.anomaly_map_large(img, out_hw=self.seg_eval_hw)
+        if self.boundary_refiner is not None:
+            amap = self.boundary_refiner.refine(self, img, amap)  # DCP-SFR边界残差(fit留出验证净正才启用)
+        return amap
 
     def locate(self, img):
         """完整定位输出:图级分(EAD)+ 判决 + 类型 + 像素图 + 检测框。

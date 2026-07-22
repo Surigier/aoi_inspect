@@ -63,17 +63,22 @@ reject_all无正贡献,max_pixels对纯定位IoU零影响,DINO是cable唯一救�
 - crop_cascade(独立crop-head级联):ViSA pcb1实测-0.059,门控自动禁用。
 - 按类选新旧seg_head的fit侧门控:CV原理上测不到fit/test漂移,3/3选错,已撤。
 - 组件图"默认开":纹理类伪组件-0.218灾难;fit侧±0.1小信号边际增益估计=掷硬币。
+- UniVAD v2(Hungarian组件匹配替代z-score)已判负(commit 44e07a7):同一fit受控A/B
+  (排除训练随机性混杂)LOCO 5类均值Δ含漏检 v1=+0.016 vs v2=+0.004,理论动机(抓
+  错序/缺件)未在真实数据兑现——单一全局刚性ECC warp限制了错序检测空间,"并集贴
+  两块"策略判断不准时反而伤精度。默认回退v1,Hungarian代码留opt-in。
 - 更早:DINO/SubspaceAD定位、AnomalyCLIP融合、RAMS-R上生产、CutPaste合成、
   roi_zoom原版——全负,勿重开。
 - GPU"脏卡"陷阱:连轴跑后SM降频,延时读数系统性偏高;测延时前查nvidia-smi温度/频率。
 
-## 待办(优先级序,含文献路线图讨论共识2026-07-19)
-1. **UniVAD v2**(component_graph.py增量):补Hungarian匹配+关系图边(距离/包含/排列
-   顺序),v1只有逐组件z-score、没有显式"缺了几个组件""顺序错了"的判断——真正对应
-   缺件/错序的信号,值得投入
-2. **DCP-SFR边界残差头**(opt-in,慎重):零初始化残差修正+OOF在raw/refined/SAM三者
+## 待办(优先级序,2026-07-20更新)
+1. **DCP-SFR边界残差头**(opt-in,慎重):零初始化残差修正+OOF在raw/refined/SAM三者
    选,架构上几乎是RAMS-R(已因"8张留出门控噪声漏判强类"生产判负,见下)的v2——
-   若做,门控必须上k折而非单次小留出,否则大概率重蹈覆辙
+   若做,门控必须上k折且做同一fit受控A/B(参考UniVAD v2的验证方法论),否则大概率
+   重蹈覆辙
+2. **UniVAD v3**(component_graph.py,v2已判负见下):若要继续投入,方向是给组件加
+   局部搜索(在期望槽位周围找实际最佳匹配位置,而非固定用全局刚性warp的模板槽位)
+   ——这才是Hungarian匹配能兑现价值的前提,当前受控数据显示原因就在这里
 3. pcb/battery微小缺陷仍是主拉分点(0.26/0.37量级)
 4. TF-IDG生成增广:官方代码github.com/rubymiaomiao/TF-IDG,需>8GB VRAM机器跑生成
    (AnyDoor ckpt+DINOv2 ViT-G),本机侧门控评审脚本scripts/run_tfidg_gate.py已就绪

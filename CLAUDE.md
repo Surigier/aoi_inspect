@@ -80,6 +80,12 @@ reject_all无正贡献,max_pixels对纯定位IoU零影响,DINO是cable唯一救�
   两类)+AD2 sheet_metal三类验证,均值Δ纯定位=-0.052/Δ框=-0.069。pcb/battery门控
   正确拦截;唯一判"开"的sheet_metal fit留出gain=+0.074,test集实际只有-0.012/
   +0.043——fit侧正增益估计不可靠这条教训今天第三次应验。默认关,代码留opt-in。
+- TTA(水平翻转取logit均值)已判负(commit ebd1ca6):5类均值Δ纯定位=-0.080/
+  Δ框=-0.060,3/5类明显负(sheet_metal-0.173/walnuts-0.205/fruit_jelly-0.033),
+  2/5类接近持平(pcb/battery)。这次不是"fit侧判不准"的老问题(TTA无需学习/门控,
+  确定性),而是新教训:seg_head/WRN特征和标定统计量是在原始朝向图像上训练/标定的,
+  不具备翻转不变性,喂模型从未见过朝向的镜像图产出系统性更差的预测,平均进去反而
+  拖累原始预测。默认关,代码留opt-in。
 - 更早:DINO/SubspaceAD定位、AnomalyCLIP融合、RAMS-R上生产、CutPaste合成、
   roi_zoom原版——全负,勿重开。
 - GPU"脏卡"陷阱:连轴跑后SM降频,延时读数系统性偏高;测延时前查nvidia-smi温度/频率。

@@ -38,6 +38,15 @@ few-shot工业异常检测+定位:每产品100正常+30标注缺陷现场迁移(
 基线**。cable问题**已彻底根治并确定性复现**(见下),不再是开放问题。
 延时:最轻档p90≈205ms@4060L(compile_infer=True,悲观代理);2060真机待验。
 
+**端到端2500²联合验证(2026-07-20,run_e2e_2500_check.py)**:此前延时/精度分开验证
+(延时用AD2/PKU探针,精度用MVTec/RealIAD/LOCO),首次用当天最终代码在真实大图
+(AD2 sheet_metal 4224×1056/vial 1400×1900,真实per-pixel掩膜)联合确认,真实
+probe_paths(非重建张量)。结果健康:sheet_metal无需裁剪(lat_trimmed=[],探针146ms)
+locate均值95ms/p90=110ms,acc=0.750 IoU=0.414 框=0.271;vial触发裁剪(弃学生2+
+max_pixels降900k,探针168ms)但DINO/SAM全程保留(验证了裁剪顺序重排的真实效果)
+locate均值122ms/p90=134ms,acc=0.750 IoU=0.622 框=0.583。辅助分支类型归属+视频
+frame_score路径也冒烟确认未受今天predict()/locate()重构影响。
+
 **cable问题根治记录(2026-07-20,已解决)**:表面看是"随机性",实为两处独立机制打架。
 ①精度侧`_calibrate_dino_gate`原用3折CV决定DINO门开关,在cable上是掷硬币(fit侧对
 "训练台架↔测试台架"系统性差异结构性看不见)→改为默认永远融合(commit 4cdc115)。

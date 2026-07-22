@@ -67,27 +67,29 @@ reject_all无正贡献,max_pixels对纯定位IoU零影响,DINO是cable唯一救�
   (排除训练随机性混杂)LOCO 5类均值Δ含漏检 v1=+0.016 vs v2=+0.004,理论动机(抓
   错序/缺件)未在真实数据兑现——单一全局刚性ECC warp限制了错序检测空间,"并集贴
   两块"策略判断不准时反而伤精度。默认回退v1,Hungarian代码留opt-in。
+- DCP-SFR边界残差头已判负(commit 1f7495c):目标场景pcb/battery(本项目历史最弱
+  两类)+AD2 sheet_metal三类验证,均值Δ纯定位=-0.052/Δ框=-0.069。pcb/battery门控
+  正确拦截;唯一判"开"的sheet_metal fit留出gain=+0.074,test集实际只有-0.012/
+  +0.043——fit侧正增益估计不可靠这条教训今天第三次应验。默认关,代码留opt-in。
 - 更早:DINO/SubspaceAD定位、AnomalyCLIP融合、RAMS-R上生产、CutPaste合成、
   roi_zoom原版——全负,勿重开。
 - GPU"脏卡"陷阱:连轴跑后SM降频,延时读数系统性偏高;测延时前查nvidia-smi温度/频率。
 
-## 待办(优先级序,2026-07-20更新)
-1. **DCP-SFR边界残差头**(opt-in,慎重):零初始化残差修正+OOF在raw/refined/SAM三者
-   选,架构上几乎是RAMS-R(已因"8张留出门控噪声漏判强类"生产判负,见下)的v2——
-   若做,门控必须上k折且做同一fit受控A/B(参考UniVAD v2的验证方法论),否则大概率
-   重蹈覆辙
+## 待办(优先级序,2026-07-20更新——DCP-SFR/UniVAD v2均已试验判负,见下)
+1. **pcb/battery微小缺陷仍是主拉分点**(0.26/0.37量级)——DCP-SFR边界残差、UniVAD v2
+   Hungarian两条文献路线都已验证判负(见"重大负结果"),这两类目前没有已验证的
+   改进候选在手,需要重新想机制而非在现有分割头上加小修正
 2. **UniVAD v3**(component_graph.py,v2已判负见下):若要继续投入,方向是给组件加
    局部搜索(在期望槽位周围找实际最佳匹配位置,而非固定用全局刚性warp的模板槽位)
    ——这才是Hungarian匹配能兑现价值的前提,当前受控数据显示原因就在这里
-3. pcb/battery微小缺陷仍是主拉分点(0.26/0.37量级)
-4. TF-IDG生成增广:官方代码github.com/rubymiaomiao/TF-IDG,需>8GB VRAM机器跑生成
+3. TF-IDG生成增广:官方代码github.com/rubymiaomiao/TF-IDG,需>8GB VRAM机器跑生成
    (AnyDoor ckpt+DINOv2 ViT-G),本机侧门控评审脚本scripts/run_tfidg_gate.py已就绪
    (3切分OOF均升+最差类回退≤0.01+真实占比≥50%三条全过才准入)
-5. Boxes2Pixels(低优先级/待定):仅当官方30张缺陷标注只有框、没有精确掩膜时启用
+4. Boxes2Pixels(低优先级/待定):仅当官方30张缺陷标注只有框、没有精确掩膜时启用
    (SAM出伪掩膜训紧凑学生+单向自纠正);标注格式未知前不必先实现
-6. 2060真机延时验证:scripts/run_2060_check.py(合成图,免数据集);4060L(256GB/s)
+5. 2060真机延时验证:scripts/run_2060_check.py(合成图,免数据集);4060L(256GB/s)
    悲观代理+2070(448GB/s)乐观代理可夹逼2060(336GB/s)
-7. GitHub push(repo Surigier/aoi_inspect私有,token用时向用户要)
+6. GitHub push(repo Surigier/aoi_inspect私有,token用时向用户要)
 
 **不建议做**(已讨论/已负结果,勿重开):RadioCore/FastRef/SubspaceAD/O2MAG——VFM榜单
 强不等于PCB严格IoU强已实证;FastRef测试时优化增加热路径且面向少样本,契合度低;

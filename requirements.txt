@@ -4,6 +4,7 @@ timm>=1.0               # WideResNet50_2 定位骨干 + DINOv2 图级co-detector
 numpy>=1.24
 Pillow>=10.0
 opencv-python-headless>=4.5   # 图像IO/连通域框/ECC模板配准
+scipy>=1.10             # component_graph.py组件图Hungarian匹配(linear_sum_assignment)
 ultralytics>=8.3        # MobileSAM 边界精化(models/mobile_sam.pt);缺→静默回退粗掩膜,定位IoU掉~0.05
 pyspng>=0.1             # 2500² PNG 快速解码(~2×PIL);缺→回退慢解码,PNG测试图延时可能超200ms
 

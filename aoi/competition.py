@@ -118,9 +118,13 @@ class CompetitionLargeDetector:
         # 零初始化残差)。fit时k折OOF验证净正才启用,零回退。
         self.use_boundary_refine = boundary_refine
         self.boundary_refiner = None
-        # tta默认关:测试时增强(水平翻转取logit均值),确定性无需学习/门控,风险性质与
-        # UniVAD v2/DCP-SFR/crop_cascade(学习型小修正,已判负)不同。真实数据验证净正
-        # 才默认开,见run_tta_ab.py。
+        # tta默认关(2026-07-20真实数据判负,run_tta_ab.py):5类均值Δ纯定位=-0.080/
+        # Δ框=-0.060,3/5类明显负(sheet_metal-0.173/walnuts-0.205/fruit_jelly-0.033),
+        # 2/5类接近持平(pcb+0.011/battery+0.001),没有一类真正获益。当初"确定性技术,
+        # 不依赖fit侧判断,风险性质与已判负的学习型小修正不同"的推理本身没错,但漏了
+        # 一个新失败模式:seg_head/WRN特征和标定统计量本来就不是为翻转不变性设计的,
+        # 喂模型从没见过的镜像图产出的不是"降噪的另一视角"而是系统性更差的预测,平均
+        # 进去反而拖累整体。opt-in代码留档,不进生产候选。
         self.use_tta = tta
 
     @torch.no_grad()

@@ -17,7 +17,16 @@ refined_logit = base_logit + correction(correction起点恒为0,起点≡raw,不
 seg_head/component_graph两次单次/小样本门控踩坑也印证了这点)比较raw vs refined
 的OOF held-out IoU,净正过margin才启用。不强制过SAM(SAM有自己独立的逐区域门控,
 在refine()之后照常生效,两者解耦——避免RAMS-R"SAM下游重塑边界冲掉raw增益"重演)。
-opt-in,默认关,fit留出验证净正才启用。"""
+opt-in,默认关,fit留出验证净正才启用。
+
+【真实数据验证结果,2026-07-20,run_boundary_refine_ab.py】DCP-SFR目标场景(微小
+缺陷/边界丢失)pcb/battery+AD2 sheet_metal三类整体负:pcb门控正确拦截(test集强制
+开Δ纯定位=-0.075/Δ框=-0.200),battery同样门控正确拦截(Δ=-0.069/-0.050);唯一
+门控判"开"的sheet_metal(fit留出估gain=+0.074)在独立test集只有-0.012/+0.043——
+又一次印证"fit侧正增益估计不可靠"(今天第三次撞到这堵墙)。均值Δ纯定位=-0.052、
+Δ框=-0.069。结论:DCP-SFR的边界残差思想在本项目当前形态下未见真实收益,默认关闭
+是对的,暂不作为生产候选,代码留作opt-in研究件(若要继续投入,方向可能是重新审视
+输入特征/loss设计,而非门控本身——门控这次至少在2/3类上判断方向正确)。"""
 import random as _random
 import numpy as np
 import torch

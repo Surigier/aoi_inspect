@@ -72,7 +72,8 @@ class _AuxBranch:
 class CompetitionLargeDetector:
     def __init__(self, device="cuda", aux_size=320, train_steps=10000, seg_eval_hw=(256, 256),
                  compile_infer=False, sam_refine=True, roi_zoom=False, seg_in=512, rams=False,
-                 ead_students=2, crop_cascade=False, comp_graph=False, boundary_refine=False):
+                 ead_students=2, crop_cascade=False, comp_graph=False, boundary_refine=False,
+                 tta=False):
         # ead_students=2:多种子EAD学生集成(检测分,教师共享)。实测工作类方差收窄~2×、
         # 现场一次fit下限+0.012、均值零代价;fit不计时训练免费,推理+一次学生前向(延时待验)。
         # rams 默认关:RAMS-R残差注意力修正支隔离探针+0.013~0.033(3/4类),但生产全管线实测净平
@@ -117,6 +118,10 @@ class CompetitionLargeDetector:
         # 零初始化残差)。fit时k折OOF验证净正才启用,零回退。
         self.use_boundary_refine = boundary_refine
         self.boundary_refiner = None
+        # tta默认关:测试时增强(水平翻转取logit均值),确定性无需学习/门控,风险性质与
+        # UniVAD v2/DCP-SFR/crop_cascade(学习型小修正,已判负)不同。真实数据验证净正
+        # 才默认开,见run_tta_ab.py。
+        self.use_tta = tta
 
     @torch.no_grad()
     def _wrn_feats(self, img):
@@ -557,15 +562,32 @@ class CompetitionLargeDetector:
         vals = [self.segment(n).ravel() for n in normals[:20]]
         self.pix_thr = float(np.quantile(np.concatenate(vals), 0.995))
 
-    def segment(self, img):
-        """像素级异常图(原始尺度,不逐图标准化→阈值语义清晰)。
-        有监督头(迁移带掩膜)→用它的 logit(BCE训,>0≈缺陷,实测均值0.890,救弱项);
-        无掩膜→回退无监督 EAD 异常图。"""
+    def _segment_once(self, img):
+        """单次前向的像素级异常图(无TTA)。"""
         eff = self._eff()
         sup = self.seg_head.map(eff, img, self.seg_eval_hw)
         amap = sup if sup is not None else eff.anomaly_map_large(img, out_hw=self.seg_eval_hw)
         if self.boundary_refiner is not None:
             amap = self.boundary_refiner.refine(self, img, amap)  # DCP-SFR边界残差(fit留出验证净正才启用)
+        return amap
+
+    def segment(self, img):
+        """像素级异常图(原始尺度,不逐图标准化→阈值语义清晰)。
+        有监督头(迁移带掩膜)→用它的 logit(BCE训,>0≈缺陷,实测均值0.890,救弱项);
+        无掩膜→回退无监督 EAD 异常图。
+        TTA(测试时增强,self.use_tta):水平翻转取logit均值。和今天判负的几条(UniVAD v2/
+        DCP-SFR/crop_cascade)风险性质不同——那几条是"学一个小修正模块,靠fit留出少量
+        数据判断该不该信",连续撞了三次"fit侧判不准test侧"的墙;TTA是确定性多视角平均,
+        不需要任何学习/门控决策,原理上不会因为fit数据不够而误判。仍需真实数据验证净
+        增益(见run_tta_ab.py),默认关。"""
+        amap = self._segment_once(img)
+        if getattr(self, "use_tta", False):
+            import numpy as np
+            native = img if img.dim() == 3 else img[0]
+            flipped = torch.flip(native, dims=[-1])
+            amap2 = self._segment_once(flipped)
+            amap2 = np.flip(amap2, axis=-1).copy()            # 翻回原方向对齐
+            amap = (amap + amap2) / 2.0
         return amap
 
     def locate(self, img):

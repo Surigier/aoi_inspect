@@ -1,6 +1,11 @@
 """YOLO候选框提议器可行性探针(先别急着训练):差异通道(Lab色差+梯度差+局部SSIM)
 在Real-IAD电子/手机件真实数据上到底有没有判别信号?
-①最近邻正常模板配对+ECC对齐+算差异通道(aoi/diff_channels.py)
+
+【本文件属于rddn_yolo/独立实验子工程,不修改aoi/生产代码,只只读复用其中的通用
+工具(load_fast等)——生产管线(CompetitionLargeDetector)完全不受影响,原有结果
+随时可复现。见rddn_yolo/README.md。】
+
+①最近邻正常模板配对+ECC对齐+算差异通道(rddn_yolo/diff_channels.py)
 ②量两个诚实指标(不用AUROC,用项目一贯的IoU口径):
    - mask区域 vs 背景 差异强度均值比值(信号强度粗判)
    - 差异通道直接阈值化当预测的"纯定位IoU上限"(和crop_cascade当初-0.059的候选生成器
@@ -8,7 +13,8 @@
      手机件多类,数据量和域都更贴近赛题)
 这个IoU上限如果比crop_cascade当初的±0还差或差不多,说明差异通道本身信息量不够,
 YOLO训练也救不回来(garbage in garbage out);如果明显更好,才值得投入YOLO训练管线。
-用法:PYTHONPATH=. python scripts/diag_diff_signal.py
+用法:PYTHONPATH=. python rddn_yolo/diag_diff_signal.py  (PYTHONPATH=仓库根目录,和
+其余scripts/一致的约定)
 """
 import glob
 import json
@@ -17,7 +23,7 @@ import numpy as np
 import torch
 from pathlib import Path
 from PIL import Image
-from aoi.diff_channels import build_6ch
+from rddn_yolo.diff_channels import build_6ch
 from aoi.imageio import load_fast
 
 RI = Path("data/_dl/Real-IAD"); RJ = Path("data/_dl/realiad_jsons/realiad_jsons_sv")

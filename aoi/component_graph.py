@@ -56,11 +56,14 @@ class ComponentGraph:
         self.device = device
         self.max_comps = max_comps
         self.z_thr = z_thr
-        # use_local_search(v3,opt-in,与use_hungarian互斥):v2判负时点出的假设——单一
-        # 全局刚性ECC warp假定组件严格停在模板槽位的warp位置,真正的"错位"(组件移动到
-        # 别的地方)找不到,因为只查了warp给出的固定坐标。v3在每个槽位的期望位置周围做
-        # 局部平移搜索(特征格上,不额外经过模型,复用已池化特征),找该组件原型在附近
-        # 的最佳匹配位置——直接测试这个假设,不和Hungarian混在一起(单变量对照)。
+        # use_local_search(v3,opt-in,与use_hungarian互斥)默认False——2026-07-20同一fit
+        # 受控A/B(run_comp_graph_v1v3.py)判负:LOCO 5类均值Δ含漏检 v1(固定槽位)=+0.018
+        # vs v3(局部搜索)=-0.033,v3在4/5类明显更差(breakfast_box -0.086/juice_bottle
+        # -0.078/pushpins仅+0.010远弱于v1+0.080),唯一持平的splicing_connectors也没有
+        # 真正优势。原本想验证"单一全局刚性ECC warp限制错位检测"这个v2判负时点出的假设,
+        # 但冒烟测试就已经暴露信号:局部搜索让合并掩膜像素几乎翻倍(候选自由度K×多偏移,
+        # 更容易凑巧贴出过度激进的假匹配)——受控数据证实这个多重比较开销超过了它找回
+        # 的真实错位信号,是净负。代码留opt-in研究件,不默认开。
         self.use_local_search = use_local_search
         self.search_radius = search_radius
         self.search_step = search_step

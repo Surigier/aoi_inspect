@@ -41,13 +41,29 @@ def _gray_u8(img):
     return (img.mean(0).cpu().numpy() * 255).astype(np.uint8)
 
 
+def _translate_mask(mask_u8, dx, dy):
+    """整数偏移平移掩膜(特征格坐标),边界外填0。"""
+    H, W = mask_u8.shape
+    M = np.float32([[1, 0, dx], [0, 1, dy]])
+    return cv2.warpAffine(mask_u8, M, (W, H), flags=cv2.INTER_NEAREST, borderValue=0)
+
+
 class ComponentGraph:
     """fit见模块docstring。所有掩膜/特征在128²WRN特征格上操作(与seg_head同格)。"""
 
-    def __init__(self, device="cuda", max_comps=12, z_thr=3.0, use_hungarian=False):
+    def __init__(self, device="cuda", max_comps=12, z_thr=3.0, use_hungarian=False,
+                 use_local_search=False, search_radius=6, search_step=3):
         self.device = device
         self.max_comps = max_comps
         self.z_thr = z_thr
+        # use_local_search(v3,opt-in,与use_hungarian互斥):v2判负时点出的假设——单一
+        # 全局刚性ECC warp假定组件严格停在模板槽位的warp位置,真正的"错位"(组件移动到
+        # 别的地方)找不到,因为只查了warp给出的固定坐标。v3在每个槽位的期望位置周围做
+        # 局部平移搜索(特征格上,不额外经过模型,复用已池化特征),找该组件原型在附近
+        # 的最佳匹配位置——直接测试这个假设,不和Hungarian混在一起(单变量对照)。
+        self.use_local_search = use_local_search
+        self.search_radius = search_radius
+        self.search_step = search_step
         # use_hungarian默认False(2026-07-20受控A/B判负,见下)。
         # 曾试Hungarian(v2,run_comp_graph_v1v2.py同一fit隔离算法差异做受控对比):LOCO 5类
         # 均值Δ含漏检 v1=+0.016 vs v2=+0.004,v2在4/5类持平或更差,唯一"赢"的pushpins框命中
@@ -184,7 +200,8 @@ class ComponentGraph:
 
     @torch.no_grad()
     def refine(self, det, img, mask, feat=None):
-        """测试图:Hungarian找槽位↔身份全局最优对应(v2),按两种异常类型并入掩膜。
+        """测试图定位:v1(默认,槽位i只查自己身份i)/v2(use_hungarian,全局槽位↔身份
+        最优对应)/v3(use_local_search,槽位周围局部平移搜索)三选一,按各自逻辑并入掩膜。
         feat可传locate()已算的WRN特征省一次前向;mask原样修改副本返回。"""
         if self.comp_masks is None or not _HAS_CV2:
             return mask
@@ -200,6 +217,33 @@ class ComponentGraph:
             mk = masks_t[idx].astype(np.uint8)
             rs = cv2.resize(mk, (W, H), interpolation=cv2.INTER_NEAREST)
             return rs
+
+        if self.use_local_search:
+            # v3:每个槽位在期望位置周围局部平移搜索最佳匹配(不额外经过模型,复用已算
+            # 特征图,只是换个位置重新池化——纯tensor操作,K×候选数量级,成本可控)。
+            r, step = self.search_radius, self.search_step
+            offsets = [(dx, dy) for dx in range(-r, r + 1, step) for dy in range(-r, r + 1, step)]
+            for i in range(len(masks_t)):
+                best_z, best_off = None, (0, 0)
+                for dx, dy in offsets:
+                    shifted = _translate_mask(masks_t[i].astype(np.uint8), dx, dy) > 0
+                    if shifted.sum() < 4:
+                        continue
+                    feat_i = self._pool(f, [shifted])[0]
+                    zi = float((torch.norm(feat_i - self.mu[i]) - self.d_mu[i]) / self.d_sd[i])
+                    if best_z is None or zi < best_z:
+                        best_z, best_off = zi, (dx, dy)
+                if best_z is None:
+                    continue
+                if best_z >= self.z_thr:
+                    out |= _paste(i)                          # 局部搜索遍历后仍不像→缺件/替换,原槽位
+                elif best_off != (0, 0):
+                    out |= _paste(i)                          # 原槽位已空
+                    moved = _translate_mask(masks_t[i].astype(np.uint8), *best_off) > 0
+                    rs = cv2.resize(moved.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
+                    out |= rs                                 # ∪ 局部搜索找到的实际位置(组件挪到这里了)
+                # else: best_off==(0,0)且best_z<阈值→原位正常,不标记
+            return out
 
         if not self.use_hungarian:
             # v1(诊断/A-B对比用):槽位i只查自己身份i的正常范围,测不出错序互换。

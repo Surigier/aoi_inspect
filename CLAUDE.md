@@ -76,6 +76,12 @@ reject_all无正贡献,max_pixels对纯定位IoU零影响,DINO是cable唯一救�
   (排除训练随机性混杂)LOCO 5类均值Δ含漏检 v1=+0.016 vs v2=+0.004,理论动机(抓
   错序/缺件)未在真实数据兑现——单一全局刚性ECC warp限制了错序检测空间,"并集贴
   两块"策略判断不准时反而伤精度。默认回退v1,Hungarian代码留opt-in。
+- UniVAD v3(局部搜索,试图解决v2判负点出的"全局刚性warp"问题)也已判负(commit
+  5732111):同一fit受控A/B,LOCO 5类均值Δ含漏检 v1=+0.018 vs v3=-0.033,4/5类
+  明显更差。冒烟测试就暴露信号(合并掩膜像素翻倍)——局部搜索的额外自由度(K组件×
+  多候选偏移)带来更严重的多重比较问题,假阳性成本压过真实错位信号。教训:给逻辑
+  异常检测加候选/自由度不是越灵活越好。默认关,代码留opt-in。至此UniVAD衍生的两次
+  增量都判负,v1(严格门控)仍是唯一在产版本。
 - DCP-SFR边界残差头已判负(commit 1f7495c):目标场景pcb/battery(本项目历史最弱
   两类)+AD2 sheet_metal三类验证,均值Δ纯定位=-0.052/Δ框=-0.069。pcb/battery门控
   正确拦截;唯一判"开"的sheet_metal fit留出gain=+0.074,test集实际只有-0.012/
@@ -94,17 +100,14 @@ reject_all无正贡献,max_pixels对纯定位IoU零影响,DINO是cable唯一救�
 1. **pcb/battery微小缺陷仍是主拉分点**(0.26/0.37量级)——DCP-SFR边界残差、UniVAD v2
    Hungarian两条文献路线都已验证判负(见"重大负结果"),这两类目前没有已验证的
    改进候选在手,需要重新想机制而非在现有分割头上加小修正
-2. **UniVAD v3**(component_graph.py,v2已判负见下):若要继续投入,方向是给组件加
-   局部搜索(在期望槽位周围找实际最佳匹配位置,而非固定用全局刚性warp的模板槽位)
-   ——这才是Hungarian匹配能兑现价值的前提,当前受控数据显示原因就在这里
-3. TF-IDG生成增广:官方代码github.com/rubymiaomiao/TF-IDG,需>8GB VRAM机器跑生成
+2. TF-IDG生成增广:官方代码github.com/rubymiaomiao/TF-IDG,需>8GB VRAM机器跑生成
    (AnyDoor ckpt+DINOv2 ViT-G),本机侧门控评审脚本scripts/run_tfidg_gate.py已就绪
    (3切分OOF均升+最差类回退≤0.01+真实占比≥50%三条全过才准入)
-4. Boxes2Pixels(低优先级/待定):仅当官方30张缺陷标注只有框、没有精确掩膜时启用
+3. Boxes2Pixels(低优先级/待定):仅当官方30张缺陷标注只有框、没有精确掩膜时启用
    (SAM出伪掩膜训紧凑学生+单向自纠正);标注格式未知前不必先实现
-5. 2060真机延时验证:scripts/run_2060_check.py(合成图,免数据集);4060L(256GB/s)
+4. 2060真机延时验证:scripts/run_2060_check.py(合成图,免数据集);4060L(256GB/s)
    悲观代理+2070(448GB/s)乐观代理可夹逼2060(336GB/s)
-6. GitHub push(repo Surigier/aoi_inspect私有,token用时向用户要)
+5. GitHub push(repo Surigier/aoi_inspect私有,token用时向用户要)
 
 **不建议做**(已讨论/已负结果,勿重开):RadioCore/FastRef/SubspaceAD/O2MAG——VFM榜单
 强不等于PCB严格IoU强已实证;FastRef测试时优化增加热路径且面向少样本,契合度低;

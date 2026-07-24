@@ -25,6 +25,40 @@ few-shot工业异常检测+定位:每产品100正常+30标注缺陷现场迁移(
 - 热路径:正常图EAD/DINO判定后立即返回;单次GPU上传;submit.py目录评测双缓冲
 - 延时探针:真实原生文件路径(det.probe_paths),预算190ms自适应裁剪
 
+## 赛题完整度核查(2026-07-24,重读赛题原文后发现的重大方向调整)
+赛题原文竞赛得分(60%)= **方案完整度(50%)+ 答案准确率(20%)+ 检测时间(30%)**,另有
+专家评分(40%)看提交的可解释性文档+使用说明。**此前一个月+今天几乎全部精力都在打磨
+"答案准确率"这20%权重的定位IoU**(WRN-LoRA/Top-1 ROI/UniVAD/DCP-SFR/TTA等一串实验),
+权重最大的"方案完整度"(50%)和专家评分要看的交付文档反而被忽视。核查结果:
+- `docs/delivery/可解释性文档.md`/`使用说明.md`**严重过时**(最后改动2026-07-07,
+  `aoi/competition.py`最后改动2026-07-22,不算今天工作)。文档描述的是**另一套架构**
+  (PatchCore记忆库5分支融合+ActiveLearningLoop+LLM报告,对应`submit.py`的
+  `_run_small`/`_run_zeroshot`小图/零样本路径),而真正跑2500²真实测试图的
+  `_run_large`→`CompetitionLargeDetector`(EAD+DINO+WRN+SAM+crop_cascade+
+  component_graph)在文档里只字未提。**待办:文档要等下面几项功能补完后统一重写**
+  (用户明确要求:先把题目要求的功能做完,再一次性写文档,不要边做边改)。
+- `submit.py`本身路由是对的(长边≥1024→`_run_large`用`CompetitionLargeDetector`,
+  否则`_run_small`;`--zeroshot`走独立CLIP路径),不是要推倒重来,只是文档没跟上代码。
+- **用户反馈驱动优化("赛题必做支柱")已验证接入`CompetitionLargeDetector`可行且有效**
+  (`aoi/active_learning.py`扩展了`defect_masks`可选追踪,向后兼容,见
+  `scripts/run_active_learning_large.py`):phone_battery真实验证,初始仅10张缺陷
+  fit时留出test IoU=0.236/框命中=0.267,模拟操作员反馈5张漏检(defect集10→15张,
+  每次反馈重跑完整`fit_fewshot`)后同一留出集IoU=0.335(+0.099)/框命中=0.333
+  (+0.067)——反馈机制在生产大图架构上真实生效,不是理论上能接而已。
+- **零样本冷启动路径评估为"设计上合理,不需要改"**:`submit.py --zeroshot`走独立
+  `ZeroShotAdapter`(CLIP文本提示),不复用`CompetitionLargeDetector`——这是必然的,
+  因为EAD/WRN/SAM/DINO所有机制都需要至少若干张校准图,零样本(0张任何样本)只有
+  纯CLIP这类完全免标定的方法能做。文档需要写清楚这个架构决策,不是缺口。
+- **CPU<2s挑战目标:当前重架构不可行,需诚实记录**。`scripts/run_cpu_latency.py`
+  测的是旧的OpenVINO ResNet18分块架构(和`CompetitionLargeDetector`完全无关,已过时)。
+  真实测试(`scripts/run_cpu_latency_large.py`,device=cpu,仅8张正常+3张缺陷、
+  不训掩膜的最小fit_fewshot)跑了**近2小时仍未跑完fit阶段**(CPU占用持续
+  1100%+,确认是真实计算量大而非卡死,非死锁)。**结论:现有EAD双学生+WRN+
+  DINOv2+SAM的重组合在CPU上不具备实用性,这是"可挑战目标"而非硬性门槛,文档里
+  如实说明"未达成"即可,不必现在勉强凑数字**。模型体量本身不算大(WRN浅层
+  4.1M+EAD PDN×3约9.2M+DINOv2 ViT-S/14约22M+MobileSAM约10M,合计约45M参数,
+  "鼓励使用小模型"这条不算严重违背),瓶颈是CPU上多模型级联的计算延时而非参数量。
+
 ## 当前成绩(2026-07-20最终,统一口径load_fast+DINO永远融合+延时梯队重排,本机4060L)
 | 类 | 图级acc | 含漏检IoU | 纯定位IoU | 框命中@0.5 |
 |---|---|---|---|---|

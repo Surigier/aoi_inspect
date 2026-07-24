@@ -36,3 +36,35 @@ def test_feedback_grows_normal_set():
     )
     n_norm, n_def = loop.feedback(torch.zeros(3, 8, 8), is_defect=False)
     assert (n_norm, n_def) == (5, 4)
+
+
+class _MaskAwareAdapter:
+    """模拟CompetitionLargeDetector的fit_fewshot(normals, defects, defect_masks=...)
+    三参数签名,验证ActiveLearningLoop正确地把掩膜一路带过去(不是只兼容旧的
+    两参数记忆库适配器)。"""
+    def __init__(self):
+        self.fit_calls = []
+
+    def fit_fewshot(self, normals, defects, defect_masks=None):
+        self.fit_calls.append((len(normals), len(defects),
+                               len(defect_masks) if defect_masks is not None else None))
+
+    def predict(self, image):
+        return None, False
+
+
+def test_feedback_threads_defect_masks():
+    import numpy as np
+    adapter = _MaskAwareAdapter()
+    loop = ActiveLearningLoop(
+        adapter,
+        normal_images=[torch.zeros(3, 8, 8) for _ in range(2)],
+        defect_images=[torch.ones(3, 8, 8)],
+        defect_masks=[np.ones((8, 8), "uint8")],
+    )
+    assert adapter.fit_calls[-1] == (2, 1, 1)          # 初始fit已带掩膜
+    n_norm, n_def = loop.feedback(torch.ones(3, 8, 8), is_defect=True,
+                                  mask=np.ones((8, 8), "uint8"))
+    assert (n_norm, n_def) == (2, 2)
+    assert adapter.fit_calls[-1] == (2, 2, 2)          # 反馈后掩膜数同步增长
+    assert len(loop.masks) == 2

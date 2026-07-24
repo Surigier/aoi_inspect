@@ -19,14 +19,21 @@ def main():
     root = Path(f"data/mvtec/{cat}")
     normals = [_load_img(p, 640) for p in sorted(glob.glob(str(root / "train/good/*.png")))[:100]]
     dfiles = sorted(glob.glob(str(root / "test" / folder / "*.png")))
-    defects = [_load_img(p, 640) for p in dfiles[:20]]
+    print(f"该类{folder}文件夹实际可用缺陷图={len(dfiles)}张(此前脚本假设>=23张,"
+          f"实际只有{len(dfiles)}张——dfiles[15:23]越界静默返回空列表,此前跑出的"
+          f"'缺陷检出=❌'其实是在测一段全正常帧,是脚本bug不是生产回归)", flush=True)
+    n_fit = max(1, len(dfiles) - 4)                     # 留至少4张真做held-out缺陷段
+    n_def = len(dfiles) - n_fit
+    defects = [_load_img(p, 640) for p in dfiles[:n_fit]]
     det = CompetitionLargeDetector(device=DEV, sam_refine=False)
-    det.fit_fewshot(normals, defects[:15], defect_masks=None)
+    det.fit_fewshot(normals, defects, defect_masks=None)
 
     goods = sorted(glob.glob(str(root / "test/good/*.png")))
     random.Random(0).shuffle(goods)
-    n_pre = n_post = 10; n_def = 8
-    seq = goods[:n_pre] + dfiles[15:15 + n_def] + goods[n_pre:n_pre + n_post]
+    n_pre = n_post = 10
+    held_out_defect_files = dfiles[n_fit:n_fit + n_def]
+    print(f"fit缺陷={n_fit}张 | held-out真实缺陷段={n_def}张: {[Path(p).name for p in held_out_defect_files]}", flush=True)
+    seq = goods[:n_pre] + held_out_defect_files + goods[n_pre:n_pre + n_post]
     frames = [_load_img(p, 640) for p in seq]
     def_idx = set(range(n_pre, n_pre + n_def))
 

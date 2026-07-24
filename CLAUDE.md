@@ -120,22 +120,32 @@ reject_all无正贡献,max_pixels对纯定位IoU零影响,DINO是cable唯一救�
   结果,不是候选框proposer单独指标;(d)强制异常路径(非纯正常图捷径)测端到端
   p90延时;(e)同时报告该ROI分支的实际启用比例和每张图新增时延。这五条是Top-1
   参考ROI落地前的验收门槛,不是可选项。
+- **Top-1参考ROI精修已按5条验收门槛真实验证,三条数据路线都没给出净正,暂不
+  转正**(独立子工程rddn_yolo/roi_refine.py,未改aoi/):①Real-IAD pcb/
+  phone_battery原生只有256×256(比WRN分割用的512还小),min_native门槛正确
+  整体自禁用(0/40两类都是)——这个数据集本身没有分辨率headroom可供机制验证,
+  不是bug。②MVTec LOCO(breakfast_box/juice_bottle/splicing_connectors,原生
+  800~1700px,真有分辨率余量,只用structural_anomalies子集)3/3类OOF gain全负
+  (-0.735/-0.289/-0.565),阈值扫描全收敛到网格下限0.05——YOLO是Real-IAD电子件
+  上预训练的,LOCO是日用品,候选框置信度分布本身不可靠,fit()的OOF门控正确识别
+  并全部禁用(enabled=False×3),test集结果原样未受影响(Δ=0.000,零回退纪律
+  生效)。③pku_pcb(原生2000~3000px,真PCB,域匹配度最好,已在项目里用作大图
+  延时探针)缺少clean/normal参考图,无法套用few-shot结构,未测——是真实数据缺口,
+  不是判负。**结论:安全门控本身工作正常,但"同域+大分辨率+有normal参考"这三个
+  条件本地数据凑不齐,至今未能在任何真实数据上验证出Top-1 ROI净正。** 默认不
+  接入competition.py,代码留opt-in。下一步若要继续这个方向,需要找/补带normal
+  模板的大分辨率同域(手机/电子件)数据,而非在现有三条路线上继续调参。
 - 更早:DINO/SubspaceAD定位、AnomalyCLIP融合、RAMS-R上生产、CutPaste合成、
   roi_zoom原版——全负,勿重开。
 - GPU"脏卡"陷阱:连轴跑后SM降频,延时读数系统性偏高;测延时前查nvidia-smi温度/频率。
 
-## 待办(优先级序,2026-07-24更新——WRN-LoRA已封存判负,资源转回Top-1参考ROI)
-1. **Top-1参考ROI精修**(WRN-LoRA封存后的新优先级):EAD+DINO判异常→现有WRN粗定位
-   选Top-1可疑区域→原始分辨率裁剪同一ROI(原图+模板)→resize 640→差分通道→
-   rddn_yolo/已测出候选框召回能力上界(phone_battery 0.700 vs朴素基线0.280,但
-   该数字是测试集自身阈值扫描出的上界,非生产验证)的YOLO→框内WRN/现有分割头
-   精修→低置信度回退全图WRN结果。需扩展`_calibrate_latency`延时梯队(p90<145ms
-   →Top-2 ROI;145-170ms→Top-1;170-185ms→仅低置信度WRN图启用;>185ms→完全
-   关闭)。不改变现有网络结构,纯增量。**落地前验收门槛(缺一不可,见"重大负
-   结果"RDDN-YOLO条目)**:①阈值只在fit/OOF数据上定,不摸测试集;②独立测试集
-   报告框命中率+严格IoU,不只候选框召回;③报完整管线(含低置信回退)端到端结果,
-   不是候选框proposer单指标;④强制异常路径(而非纯正常图捷径)测端到端p90;
-   ⑤报该分支实际启用比例+每图新增时延。
+## 待办(优先级序,2026-07-24更新——WRN-LoRA已封存判负,Top-1参考ROI三路验证均未净正)
+1. **数据缺口:找/补带normal模板的大分辨率同域(手机/电子件)数据**——Top-1参考ROI
+   在Real-IAD pcb/phone_battery(256×256,无headroom)/MVTec LOCO(800~1700px但
+   域不匹配,3/3类OOF全负)/pku_pcb(2000~3000px真PCB但无normal图)三条路线上都
+   没能验证出净正(见"重大负结果"Top-1参考ROI条目),根因是本地没有同时满足"同域+
+   大分辨率+有normal参考"的数据,不是机制本身被证伪。找到/补齐这类数据前,不建议
+   继续在现有三条路线上调参。
 2. **pcb/battery微小缺陷仍是主拉分点**(0.26/0.37量级)——DCP-SFR边界残差、UniVAD v2
    Hungarian、WRN-LoRA三条路线都已验证判负(见"重大负结果"),这几类目前没有已
    验证的改进候选在手,需要重新想机制而非在现有分割头上加小修正

@@ -40,7 +40,7 @@ class LoRAConv2d(nn.Module):
         # up.weight:(out_ch,r,kh,kw), down.weight:(r,in_ch,1,1) -> 等效(out_ch,in_ch,kh,kw)
         eq = torch.einsum("orhw,ri->oihw", self.up.weight, self.down.weight[:, :, 0, 0])
         merged = nn.Conv2d(in_ch, out_ch, kernel_size=(kh, kw), stride=base.stride,
-                          padding=base.padding, bias=base.bias is not None)
+                          padding=base.padding, bias=base.bias is not None).to(base.weight.device)
         merged.weight.copy_(base.weight + self.scale * eq)
         if base.bias is not None:
             merged.bias.copy_(base.bias)

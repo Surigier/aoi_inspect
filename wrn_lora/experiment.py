@@ -3,9 +3,30 @@ conv2,rank=2③layer2最后2块conv2,rank=4。三组用【同一套训练循环/
 唯一变量是LoRA配置——不同时改损失/增广/阈值,才能判断增益真的来自LoRA。
 
 真实数据(AD2 sheet_metal/walnuts/fruit_jelly,已有掩膜,今天反复用过的验证床)×
-3个随机种子,报中位数IoU+最差类别IoU双门槛:只有中位数提升且最差类别不明显下降
-才算通过,单点最优值不算数。
-用法:PYTHONPATH=. python wrn_lora/experiment.py
+3个随机种子,报配对margin判定(见main()末尾):median(Δ)>=0.005 且 mean(Δ)>0 且
+>=2/3类中位数为正 且 min(Δ)>=-0.01,单点最优值不算数。
+
+【已判负,结论封存】9次跑(3类×3种子)结果:LoRA_r2 median(Δ)=0.000 mean(Δ)=+0.003
+类中位数=[0.000,0.000,0.000](0/3为正) min(Δ)=-0.005 → 不通过;LoRA_r4
+median(Δ)=+0.001 mean(Δ)=+0.004 类中位数=[+0.001,0.000,+0.013](2/3为正)
+min(Δ)=0.000 → 不通过(中位数增益远低于0.005门槛)。sheet_metal/walnuts跨种子
+稳定打平,fruit_jelly出现的+0.013~+0.034离群正向不能归因为稳定LoRA收益(该类
+本身是对头部/阈值高方差敏感类,新旧分割头A/B也在该类出现过约0.092反号差异)。
+
+封存前诊断(见diagnose.py,排除"配置太保守/适配器没动"的可能性):①各层
+||ΔW||_F/||W_base||_F 在保守配置(lr=2e-4,150步)下已达1.3e-3~1.7e-3,远高于
+"没动"的1e-4门槛,LoRA权重确实产生了可测更新;②同测试图logit差异sheet_metal/
+walnuts mean仅0.006~0.009(权重动了但输出几乎不变),fruit_jelly mean=0.28
+(该类对同样幅度的权重扰动格外敏感,与其本身高方差体质一致);③fit/test IoU
+保守配置下同向小幅变化(无fit涨test不涨的过拟合特征)。唯一压力测试(fruit_jelly
+seed1,r4/last2,lr=1e-3,steps=300,仅为验证LoRA机制能否真的移动模型,不作为
+成绩证据)显示权重可大幅移动(ΔW/W达2.9e-2~4.5e-2)且fit(+0.108)/test(+0.114)
+同向大涨——证实LoRA机制本身有效、能真实改变模型,但在9次受控实验的保守/合理
+超参下这个能力没有转化为跨类别可复现的IoU收益。**结论:WRN表示已经足够,LoRA
+在此项目的价值命题不成立,不进入生产,保留为零时延opt-in研究件。** 资源转回
+Top-1参考ROI精修和RDDN-YOLO。
+
+用法:PYTHONPATH=. python wrn_lora/experiment.py(封存实验,不再新增大搜索)
 """
 import random
 import numpy as np
@@ -141,12 +162,22 @@ def main():
     for name, _, _ in groups:
         vals = results[name]
         print(f"{name:24s} 中位数={np.median(vals):.3f}  均值={np.mean(vals):.3f}  最差={min(vals):.3f}", flush=True)
-    base_med = np.median(results["baseline(冻结,无LoRA)"])
-    base_min = min(results["baseline(冻结,无LoRA)"])
+    baseline = np.array(results["baseline(冻结,无LoRA)"])
     for name, _, _ in groups[1:]:
-        med, mn = np.median(results[name]), min(results[name])
-        verdict = "✅通过(中位数提升且最差类别不明显下降)" if (med > base_med and mn >= base_min - 0.01) else "❌不通过"
-        print(f"{name}: Δ中位数={med-base_med:+.3f} Δ最差={mn-base_min:+.3f}  {verdict}", flush=True)
+        candidate = np.array(results[name])
+        deltas = candidate - baseline                          # 配对差(同cat/同seed一一对应),不是组间中位数相减
+        ns = len(SEEDS)
+        category_medians = [np.median(deltas[i * ns:(i + 1) * ns]) for i in range(len(CATS))]  # results按cat外层/seed内层循环填充,连续ns个一段=同一类别
+        passed = (
+            np.median(deltas) >= 0.005
+            and np.mean(deltas) > 0
+            and sum(cm > 0 for cm in category_medians) >= 2
+            and np.min(deltas) >= -0.01
+        )
+        verdict = "✅通过(有margin的配对判定)" if passed else "❌不通过"
+        print(f"{name}: Δ中位数(配对)={np.median(deltas):+.3f} Δ均值={np.mean(deltas):+.3f} "
+              f"各类Δ中位数={[f'{cm:+.3f}' for cm in category_medians]} Δ最小={np.min(deltas):+.3f}  {verdict}",
+              flush=True)
 
 
 if __name__ == "__main__":

@@ -122,6 +122,19 @@ reject_all无正贡献,max_pixels对纯定位IoU零影响,DINO是cable唯一救�
 不再随执行顺序/GPU状态波动。**教训:门控/裁剪类改动必须检查是否存在下游独立机制
 能把上游判断悄悄推翻,单点验证不代表端到端生效。**
 
+**⚠️新发现的潜在风险(2026-07-25,global_context实验中意外撞见)**:`_calibrate_latency`
+硬线超时时仍会把已标定好的DINO门砍掉(见上①②修复里的"DINO排最后才砍"——这条路径
+本身没错,但"最后才砍"不等于"不会砍")。今天本机GPU连轴跑了一整天(WRN-LoRA/Top-1
+ROI/反馈闭环等多个后台任务,温度一度到87°C)后,同一份代码在9次fit里有5次真的触发
+了硬线超时→`lat_trimmed`带上"dino_gate"→cable唯一救命机制被砍。**这不是今天验证
+实验的bug,是生产`_calibrate_latency`本身在机器负载/温度较高时会真实发生的行为**——
+如果评委机器评测时也处于高负载/高温状态(比如同时跑多个选手提交,或GPU刚跑完别的
+任务),cable这类靠DINO门救回来的类目有可能在评委机器上重新暴露旧问题。**待办:
+需要专门验证`_calibrate_latency`的硬线阈值(190ms预算)在GPU负载/温度不同状态下
+的探针读数稳定性,必要时给"DINO门"设一条比其他裁剪项更高的免砍优先级(比如探针
+读数异常高时优先怀疑机器状态而不是砍最后一道保险),而不是依赖"顺序排最后"这种
+相对保护。**
+
 ## 重大负结果(勿重蹈,证据在commit与代码注释)
 - DINO门"3折CV决定开关"已废弃(commit 4cdc115):cable上被证明是掷硬币而非真信号,
   fit侧对"test集系统性漂移"结构性看不见,同seg_head/component_graph今天的教训一致。
@@ -199,28 +212,49 @@ reject_all无正贡献,max_pixels对纯定位IoU零影响,DINO是cable唯一救�
   条件本地数据凑不齐,至今未能在任何真实数据上验证出Top-1 ROI净正。** 默认不
   接入competition.py,代码留opt-in。下一步若要继续这个方向,需要找/补带normal
   模板的大分辨率同域(手机/电子件)数据,而非在现有三条路线上继续调参。
+- **GCAD风格全局上下文分支已判负**(独立子工程global_context/,未改aoi/):动机是
+  现有EAD/WRN/DINO门全是patch级局部判断,对"缺件/错位/组合"这类局部都正常、整体
+  构图错了的逻辑异常结构性看不见(参照MVTec LOCO论文自己的baseline GCAD,加一条
+  "整图过瓶颈,重建误差判构图对不对"的支路)。两个变体(PixelAE=忠实原论文的整图
+  像素级卷积自编码器;EmbedAE=DINOv2 CLS token瓶颈重建,测语义嵌入是否有额外增益)
+  ×9类目(5类LOCO logical_anomalies目标场景+2类LOCO structural_anomalies回归检查+
+  cable/pcb 2类生产回归检查)充分对比:PixelAE median(ΔIoU)=+0.002 min=-0.021
+  (juice_bottle逻辑异常);EmbedAE median=0.000 min=-0.014(screw_bag逻辑异常)。
+  两者均远低于0.005门槛且跌破-0.01最差类别底线,即使只看5类目标场景中位数也只有
+  +0.003,同样跌破底线。5/9(PixelAE)、4/9(EmbedAE)类目有正向移动(breakfast_box
+  逻辑异常+juice_bottle结构异常两个变体都表现不错),但不足以支撑广泛稳定收益。
+  **顺带回答了驱动这次实验的问题("语义容量是不是瓶颈"):EmbedAE中位数(0.000)
+  并不明显优于PixelAE(纯像素,+0.002)——加更强语义表示本身不是瓶颈,"整图瓶颈
+  重建判构图"这个架构思路收益本身有限,不是换更大模型能解决的。** 默认不接入
+  competition.py,代码留opt-in研究件。副产品:意外发现`_calibrate_latency`硬线
+  超时会砍DINO门这条路径在GPU高负载/高温时真实触发(9次里5次),已记入上方
+  "cable问题根治记录"后的风险提示,待专门验证。
 - 更早:DINO/SubspaceAD定位、AnomalyCLIP融合、RAMS-R上生产、CutPaste合成、
   roi_zoom原版——全负,勿重开。
 - GPU"脏卡"陷阱:连轴跑后SM降频,延时读数系统性偏高;测延时前查nvidia-smi温度/频率。
 
-## 待办(优先级序,2026-07-24更新——WRN-LoRA已封存判负,Top-1参考ROI三路验证均未净正)
-1. **数据缺口:找/补带normal模板的大分辨率同域(手机/电子件)数据**——Top-1参考ROI
+## 待办(优先级序,2026-07-25更新——GCAD全局分支已封存判负,新增DINO门风险排查)
+1. **排查`_calibrate_latency`硬线超时砍DINO门的真实触发概率**(今天意外发现,见
+   cable根治记录后的风险提示):9次fit里5次在GPU高负载/高温下真实触发,评委机器
+   若也处于高负载/高温状态,cable这类靠DINO门救回来的类目有回归旧问题的风险。
+   需要专门验证不同GPU状态下探针读数的稳定性,评估是否要给DINO门更高的免砍优先级。
+2. **数据缺口:找/补带normal模板的大分辨率同域(手机/电子件)数据**——Top-1参考ROI
    在Real-IAD pcb/phone_battery(256×256,无headroom)/MVTec LOCO(800~1700px但
    域不匹配,3/3类OOF全负)/pku_pcb(2000~3000px真PCB但无normal图)三条路线上都
    没能验证出净正(见"重大负结果"Top-1参考ROI条目),根因是本地没有同时满足"同域+
    大分辨率+有normal参考"的数据,不是机制本身被证伪。找到/补齐这类数据前,不建议
    继续在现有三条路线上调参。
-2. **pcb/battery微小缺陷仍是主拉分点**(0.26/0.37量级)——DCP-SFR边界残差、UniVAD v2
-   Hungarian、WRN-LoRA三条路线都已验证判负(见"重大负结果"),这几类目前没有已
-   验证的改进候选在手,需要重新想机制而非在现有分割头上加小修正
-3. TF-IDG生成增广:官方代码github.com/rubymiaomiao/TF-IDG,需>8GB VRAM机器跑生成
+3. **pcb/battery微小缺陷仍是主拉分点**(0.26/0.37量级)——DCP-SFR边界残差、UniVAD v2
+   Hungarian、WRN-LoRA、GCAD全局分支四条路线都已验证判负(见"重大负结果"),这几类
+   目前没有已验证的改进候选在手,需要重新想机制而非在现有分割头上加小修正
+4. TF-IDG生成增广:官方代码github.com/rubymiaomiao/TF-IDG,需>8GB VRAM机器跑生成
    (AnyDoor ckpt+DINOv2 ViT-G),本机侧门控评审脚本scripts/run_tfidg_gate.py已就绪
    (3切分OOF均升+最差类回退≤0.01+真实占比≥50%三条全过才准入)
-4. Boxes2Pixels(低优先级/待定):仅当官方30张缺陷标注只有框、没有精确掩膜时启用
+5. Boxes2Pixels(低优先级/待定):仅当官方30张缺陷标注只有框、没有精确掩膜时启用
    (SAM出伪掩膜训紧凑学生+单向自纠正);标注格式未知前不必先实现
-5. 2060真机延时验证:scripts/run_2060_check.py(合成图,免数据集);4060L(256GB/s)
+6. 2060真机延时验证:scripts/run_2060_check.py(合成图,免数据集);4060L(256GB/s)
    悲观代理+2070(448GB/s)乐观代理可夹逼2060(336GB/s)
-6. GitHub push(repo Surigier/aoi_inspect私有,token用时向用户要)
+7. GitHub push(repo Surigier/aoi_inspect私有,token用时向用户要)
 
 **不建议做**(已讨论/已负结果,勿重开):RadioCore/FastRef/SubspaceAD/O2MAG——VFM榜单
 强不等于PCB严格IoU强已实证;FastRef测试时优化增加热路径且面向少样本,契合度低;

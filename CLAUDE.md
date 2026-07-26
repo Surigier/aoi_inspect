@@ -229,6 +229,26 @@ ROI/反馈闭环等多个后台任务,温度一度到87°C)后,同一份代码�
   competition.py,代码留opt-in研究件。副产品:意外发现`_calibrate_latency`硬线
   超时会砍DINO门这条路径在GPU高负载/高温时真实触发(9次里5次),已记入上方
   "cable问题根治记录"后的风险提示,待专门验证。
+- **AHL(Anomaly Heterogeneity Learning,CVPR2024,赛题唯一点名参考文献)适配
+  seg_head训练过程已判负**(独立子工程ahl_seghead/,未改aoi/):动机是这篇文献
+  方法论上最贴合赛题场景(少量标注异常+需泛化到训练时没见过的异常类型="open-set
+  supervised anomaly detection"),且推理零增量延时(论文原文只用训好的统一模型
+  推理)。适配思路:fit期正常图聚类(k-means,C=3)→每次随机取一簇正常+随机70%
+  标注缺陷组成"异态代理集"(support/query各切一半,重复T=7次)→每个代理集
+  support上各训一个基础头(和生产SupervisedSegHead同架构)→在全部代理集的query
+  集(对训出该代理集基础头是"没见过的")上协同训练**一个统一头**,只有这个统一头
+  用于推理,替换进`det.seg_head`后复用`det.locate()`完整下游评测。3类摸底
+  (breakfast_box逻辑异常/pushpins逻辑异常/cable生产回归检查)**3/3全负且方向
+  一致**(ΔIoU=-0.037/-0.039/-0.015,median=-0.037 mean=-0.030)——不是GCAD那种
+  类目间正负交替的噪声信号,是干净一致的负结果,没有扩到9类目普查的必要。
+  **最可能根因**:我们的fit缺陷集本来就极小(15~30张),这套机制的核心动作是把
+  这个已经很小的集合再切成T=7个更小的support/query子集训练——论文场景(DevNet/
+  DRA分类式打分网络)下这样切片能提升泛化,但对我们这种逐像素分割任务、标注样本
+  本来就少到individual instance都数得过来的场景,再切片等于让每个子集看到的
+  独特缺陷实例更少,"人为制造开放集泛化信号"的收益没能盖过"可用监督信号被进一步
+  稀释"的代价。**不代表AHL思路在更大样本量场景下没用,是"30张缺陷"这个量级本身
+  可能撑不起论文假设的"充分切片仍有信号"这个前提。** 默认不接入competition.py,
+  代码留opt-in研究件。
 - 更早:DINO/SubspaceAD定位、AnomalyCLIP融合、RAMS-R上生产、CutPaste合成、
   roi_zoom原版——全负,勿重开。
 - GPU"脏卡"陷阱:连轴跑后SM降频,延时读数系统性偏高;测延时前查nvidia-smi温度/频率。
@@ -245,8 +265,9 @@ ROI/反馈闭环等多个后台任务,温度一度到87°C)后,同一份代码�
    大分辨率+有normal参考"的数据,不是机制本身被证伪。找到/补齐这类数据前,不建议
    继续在现有三条路线上调参。
 3. **pcb/battery微小缺陷仍是主拉分点**(0.26/0.37量级)——DCP-SFR边界残差、UniVAD v2
-   Hungarian、WRN-LoRA、GCAD全局分支四条路线都已验证判负(见"重大负结果"),这几类
-   目前没有已验证的改进候选在手,需要重新想机制而非在现有分割头上加小修正
+   Hungarian、WRN-LoRA、GCAD全局分支、AHL异态代理集五条路线都已验证判负(见"重大
+   负结果"),这几类目前没有已验证的改进候选在手,需要重新想机制而非在现有分割头
+   上加小修正
 4. TF-IDG生成增广:官方代码github.com/rubymiaomiao/TF-IDG,需>8GB VRAM机器跑生成
    (AnyDoor ckpt+DINOv2 ViT-G),本机侧门控评审脚本scripts/run_tfidg_gate.py已就绪
    (3切分OOF均升+最差类回退≤0.01+真实占比≥50%三条全过才准入)

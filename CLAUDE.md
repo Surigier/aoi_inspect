@@ -1,3 +1,81 @@
+1. 全部用中文回复
+2. 称呼规则：每次回复必须使用 leon 作为称呼
+3. 遇到不确定的代码设计问题时，必须先询问 leon，不得直接行动
+4. 代码兼容性：不能写兼容性代码，除非主动提要求
+
+
+## Plugins
+
+This project uses the following Claude Code plugins (installed at user scope):
+
+- **superpowers@superpowers-dev** — Full software development workflow with brainstorming, TDD, plan-driven execution, and subagent-driven development skills. Activate via the Skill tool.
+- **andrej-karpathy-skills@karpathy-dev** — Behavioral guidelines (karpathy-guidelines skill) to reduce common LLM coding mistakes: Think Before Coding, Simplicity First, Surgical Changes, Goal-Driven Execution.
+
+## Karpathy Coding Guidelines
+
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+
+### 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+### 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+### 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+### 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+
+```
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+```
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
 # aoi_inspect — 项目状态与工作准则(跨机器/跨会话迁移用)
 
 2026研究生AI大赛·华为赛题一《可自学习的AOI实时在线AI质检》,截止2026年8月。
@@ -5,6 +83,7 @@ few-shot工业异常检测+定位:每产品100正常+30标注缺陷现场迁移(
 测试图判缺陷+定位,<200ms@2060(2500²输入,隐藏域=手机部件:屏幕/电池/中框)。
 
 ## 铁律(用户明确定下,任何会话都必须遵守)
+
 1. **只用评分真口径汇报**:图级acc/逐图含漏检IoU/框命中@0.5/延时。严禁拿AUROC说事。
 2. **定位精度用户没认可前,不做答辩材料、不自作主张转方向**。
 3. **零回退纪律**:任何新机制必须真实数据留出/OOF验证净正才进生产;验负就回退并留档
@@ -13,6 +92,7 @@ few-shot工业异常检测+定位:每产品100正常+30标注缺陷现场迁移(
 5. 简洁直接,少问多做,快速定位问题;负结果照实说,不粉饰。
 
 ## 当前生产架构(competition.py CompetitionLargeDetector)
+
 - 检测:EfficientAD学生-教师(多种子ead_students=2,无记忆库延时恒定)+ DINOv2受控图级门
 - 定位:WRN50浅层(1,2)@512监督分割头 = **旧实现`_seg_head_old_ae5fbbb.py`**(双头集成+
   pooled-F1自洽阈值)——见下"seg_head回退"
@@ -26,10 +106,12 @@ few-shot工业异常检测+定位:每产品100正常+30标注缺陷现场迁移(
 - 延时探针:真实原生文件路径(det.probe_paths),预算190ms自适应裁剪
 
 ## 赛题完整度核查(2026-07-24,重读赛题原文后发现的重大方向调整)
+
 赛题原文竞赛得分(60%)= **方案完整度(50%)+ 答案准确率(20%)+ 检测时间(30%)**,另有
 专家评分(40%)看提交的可解释性文档+使用说明。**此前一个月+今天几乎全部精力都在打磨
 "答案准确率"这20%权重的定位IoU**(WRN-LoRA/Top-1 ROI/UniVAD/DCP-SFR/TTA等一串实验),
 权重最大的"方案完整度"(50%)和专家评分要看的交付文档反而被忽视。核查结果:
+
 - `docs/delivery/可解释性文档.md`/`使用说明.md`**严重过时**(最后改动2026-07-07,
   `aoi/competition.py`最后改动2026-07-22,不算今天工作)。文档描述的是**另一套架构**
   (PatchCore记忆库5分支融合+ActiveLearningLoop+LLM报告,对应`submit.py`的
@@ -70,14 +152,16 @@ few-shot工业异常检测+定位:每产品100正常+30标注缺陷现场迁移(
   能力是完整的,此前"完整度审查"没有发现真实回归,是一次被脚本bug放大的虚惊。
 
 ## 当前成绩(2026-07-20最终,统一口径load_fast+DINO永远融合+延时梯队重排,本机4060L)
-| 类 | 图级acc | 含漏检IoU | 纯定位IoU | 框命中@0.5 |
-|---|---|---|---|---|
-| hazelnut | 0.882 | 0.629 | 0.719 | 0.625 |
-| cable | **0.927** | **0.811** | 0.811 | **0.933** |
-| pill | 1.000 | 0.440 | 0.440 | 0.426 |
-| pcb | 0.825 | 0.253 | 0.260 | 0.287 |
-| phone_battery | 0.875 | 0.370 | 0.376 | 0.475 |
-| **均值** | **0.902** | **0.501** | 0.521 | **0.549** |
+
+| 类            | 图级acc   | 含漏检IoU | 纯定位IoU | 框命中@0.5 |
+| ------------- | --------- | --------- | --------- | ---------- |
+| hazelnut      | 0.882     | 0.629     | 0.719     | 0.625      |
+| cable         | **0.927** | **0.811** | 0.811     | **0.933**  |
+| pill          | 1.000     | 0.440     | 0.440     | 0.426      |
+| pcb           | 0.825     | 0.253     | 0.260     | 0.287      |
+| phone_battery | 0.875     | 0.370     | 0.376     | 0.475      |
+| **均值**      | **0.902** | **0.501** | 0.521     | **0.549**  |
+
 历史基线:含漏检IoU均值0.484/框0.600。**均值含漏检IoU=0.501首次突破0.5,超过历史
 基线**。cable问题**已彻底根治并确定性复现**(见下),不再是开放问题。
 延时:最轻档p90≈205ms@4060L(compile_infer=True,悲观代理);2060真机待验。
@@ -101,6 +185,32 @@ LOCO的logical_anomalies官方定义是"计数/位置/搭配错误"(比如某格
 配错接头),不完全等同赛题原文"逻辑错误(如顺序错误)"字面意思——"顺序错误"可能指
 2500²图像4块1024²拼接的空间顺序,或产线装配的时序先后,这条已列入给出题人的邮件
 问题清单,回复前不确定我们现在的机制(component_graph等)是否真的对上号。
+
+**严格按赛题5类缺陷的完整成绩单(2026-07-27,scripts/run_scorecard_5types.py)**:在上面
+基础上补齐色彩变化(此前只有pill一类)和缺件少件(此前只有cable一类)的更多真实数据:
+
+| 缺陷类型 | 数据来源 | 图级acc | 含漏检IoU | 框命中@0.5 |
+|---|---|---|---|---|
+| 常见外观缺陷 | hazelnut | 0.921 | 0.660 | 0.653 |
+| 缺件少件 | cable | 0.927 | 0.811 | 0.933 |
+| 缺件少件(新) | pcb的QS子集(Real-IAD官方缺陷编码,104张真实缺件标注) | 0.713 | 0.321 | 0.438 |
+| 色彩变化 | pill | 1.000 | 0.440 | 0.426 |
+| 色彩变化(新) | carpet/leather/metal_nut/wood均值(MVTec官方color子目录) | 0.977 | 0.574 | 0.698 |
+| 逻辑错误(如顺序错误) | LOCO 3类均值(定义存疑,见上) | 0.704 | 0.192 | 0.230 |
+| **尺寸偏差** | — | **无数据** | **无数据** | **无数据** |
+
+**尺寸偏差彻查结论**:本地7个数据集(MVTec AD/LOCO/Real-IAD/DAGM/VisA/MPDD/pku_pcb)
+逐一查过缺陷子类目录名/官方编码表,没有一个明确标注"尺寸偏差"这个缺陷类型
+(Real-IAD官方8类编码AK=凹坑/BX=变形/CH=磨损/HS=划伤/PS=破损/QS=缺件/YW=异物/
+ZW=污染,没有"尺寸"这一类)。外部搜索找到"Open-Industry Benchmark"(convex/
+concave/deformation)但是3D点云数据,和本系统2D图像架构不兼容,且无公开下载链接。
+**这不是没做完,是这道题本身缺这块公开语料**,现场只能靠"尺寸"辅助分支(仅类型
+归属,未做检测验证)兜底,文档需如实写明此项无数据支撑。
+
+**顺带发现**:pcb-QS(缺件)比pcb整体(acc=0.825/IoU=0.253/框命中=0.287)acc更低
+(0.713)但IoU/框命中更高(0.321/0.438)——缺件类一旦被判定为缺陷,定位反而更准
+(缺件造成的空洞边界清晰),但检测confidence不如pcb其他缺陷类型(异物/污染/划伤)
+稳定,这是个新观察,暂未深究原因。
 
 **端到端2500²联合验证(2026-07-20,run_e2e_2500_check.py)**:此前延时/精度分开验证
 (延时用AD2/PKU探针,精度用MVTec/RealIAD/LOCO),首次用当天最终代码在真实大图
@@ -136,6 +246,7 @@ ROI/反馈闭环等多个后台任务,温度一度到87°C)后,同一份代码�
 相对保护。**
 
 ## 重大负结果(勿重蹈,证据在commit与代码注释)
+
 - DINO门"3折CV决定开关"已废弃(commit 4cdc115):cable上被证明是掷硬币而非真信号,
   fit侧对"test集系统性漂移"结构性看不见,同seg_head/component_graph今天的教训一致。
   改为默认永远融合(风险不对称:pcb过度触发代价仅-0.011,漏融合代价可达-0.6+)。
@@ -173,16 +284,16 @@ ROI/反馈闭环等多个后台任务,温度一度到87°C)后,同一份代码�
   只在WRN layer2最后1~2个Bottleneck的conv2插低秩空间卷积旁路(BN全程冻结eval,
   权重可数学精确合并回普通conv、推理零增量延时),3类(sheet_metal/walnuts/
   fruit_jelly)×3种子×2配置(r2/r4)受控A/B,margin配对判定(median(Δ)>=0.005且
-  >=2/3类中位数为正且min(Δ)>=-0.01)双双不通过:LoRA_r2 median(Δ)=0.000
-  (0/3类为正),LoRA_r4 median(Δ)=+0.001(2/3类为正,远低于0.005门槛)。封存前
-  诊断排除"配置太保守/适配器没真动"的可能:保守配置下||ΔW||/||W_base||已达
-  1.3~1.7e-3(远超1e-4死区);唯一压力测试(fruit_jelly r4/lr=1e-3/300步)证实
-  权重可大幅移动(ΔW/W达4.5e-2)且fit/test同向大涨(+0.108/+0.114)。**准确结论:
-  fruit_jelly上确实可能存在类别特定的真实收益,压力测试没有排除这一点——不能说
-  "WRN表示已经足够"或"绝非超参数问题"。能确定的只是收益不广泛、不稳定(3类中
-  2类稳定打平),继续在这个方向调参的竞赛期望值低。** 默认关,代码留opt-in研究件。
-  最大价值:排除了一个"零时延但可能提分"的诱人方向,让资源能放心转向已有明显
-  候选框信号的参考ROI。
+  > =2/3类中位数为正且min(Δ)>=-0.01)双双不通过:LoRA_r2 median(Δ)=0.000
+  > (0/3类为正),LoRA_r4 median(Δ)=+0.001(2/3类为正,远低于0.005门槛)。封存前
+  > 诊断排除"配置太保守/适配器没真动"的可能:保守配置下||ΔW||/||W_base||已达
+  > 1.3~1.7e-3(远超1e-4死区);唯一压力测试(fruit_jelly r4/lr=1e-3/300步)证实
+  > 权重可大幅移动(ΔW/W达4.5e-2)且fit/test同向大涨(+0.108/+0.114)。**准确结论:
+  > fruit_jelly上确实可能存在类别特定的真实收益,压力测试没有排除这一点——不能说
+  > "WRN表示已经足够"或"绝非超参数问题"。能确定的只是收益不广泛、不稳定(3类中
+  > 2类稳定打平),继续在这个方向调参的竞赛期望值低。** 默认关,代码留opt-in研究件。
+  > 最大价值:排除了一个"零时延但可能提分"的诱人方向,让资源能放心转向已有明显
+  > 候选框信号的参考ROI。
 - **RDDN-YOLO(参考图差分切片+YOLO候选框)冻结模型阶段测出候选框能力上界,尚未
   完成生产验证;LoRA微调阶段验证为负**(独立子工程rddn_yolo/,未改aoi/):ECC
   配准+Lab/梯度/局部SSIM差分通道构成6通道输入,在Real-IAD 12类phone/electronics
@@ -249,11 +360,25 @@ ROI/反馈闭环等多个后台任务,温度一度到87°C)后,同一份代码�
   稀释"的代价。**不代表AHL思路在更大样本量场景下没用,是"30张缺陷"这个量级本身
   可能撑不起论文假设的"充分切片仍有信号"这个前提。** 默认不接入competition.py,
   代码留opt-in研究件。
+- **统一骨干提案(用户提出:一骨干四头+多教师蒸馏,替代EAD+DINO+WRN三模型三特征
+  空间)的两条低成本探针均判负**(独立子工程unified_student/,未改aoi/):
+  ①图级判决蒸馏探针(`probe_distill.py`)——测"复用现有冻结WRN特征能不能替代
+  EAD+DINO联合判决",mean/top-k两版聚合方式都试了,一致率median分别0.724/0.674,
+  远低于0.90门槛,且按类目分化(局部缺陷类top-k更好,逻辑异常类top-k反而更差)。
+  最damning:pcb上mean pooling相关系数只有0.068,cable上学生漏判DINO独立救回的
+  那部分缺陷。②SAM实例计数探针(`probe_sam_counting.py`+`_defect.py`)——测
+  "MobileSAM everything模式计数能不能捕捉逻辑异常",地基(计数稳定性)4/5类没问题,
+  但**everything模式延时5.9~7.2秒/张,是190ms预算的30~36倍**,决定性判负,区分度
+  本身也不稳定(juice_bottle 9/10张明显,其余3类0~2/10)。**结论:这两条低成本捷径
+  (复用现成特征、复用现成SAM)都不可行,不代表"专门蒸馏新骨干+真实标注监督"这个
+  更大的方案本身失败——那需要真正投入建才能验证,今天没做,只是排除了两条更便宜
+  的替代路线。** 默认不接入competition.py,代码留opt-in研究件。
 - 更早:DINO/SubspaceAD定位、AnomalyCLIP融合、RAMS-R上生产、CutPaste合成、
   roi_zoom原版——全负,勿重开。
 - GPU"脏卡"陷阱:连轴跑后SM降频,延时读数系统性偏高;测延时前查nvidia-smi温度/频率。
 
 ## 待办(优先级序,2026-07-25更新——GCAD全局分支已封存判负,新增DINO门风险排查)
+
 1. **排查`_calibrate_latency`硬线超时砍DINO门的真实触发概率**(今天意外发现,见
    cable根治记录后的风险提示):9次fit里5次在GPU高负载/高温下真实触发,评委机器
    若也处于高负载/高温状态,cable这类靠DINO门救回来的类目有回归旧问题的风险。
@@ -282,10 +407,11 @@ ROI/反馈闭环等多个后台任务,温度一度到87°C)后,同一份代码�
 SubspaceAD已负(含漏检IoU 0.484→0.462)。
 
 ## 关键脚本
+
 - scripts/run_scorecard.py:5类全量生产成绩单(真口径,最终裁判)
 - scripts/run_seg_head_ab_scorecard.py:新旧seg_head归因A/B
 - scripts/run_2060_check.py:租卡/新机延时+显存一键验证
 - scripts/run_pareto_scan.py:students×DINO×SAM×max_pixels Pareto扫描
 - scripts/run_comp_graph_ab.py / run_comp_graph_harm.py:组件图A/B与伤害检查
 - scripts/run_tfidg_gate.py:生成增广三条门控评审
-- 实验日志写_logs/(gitignore),用nohup跑长任务(会话重启不陪葬)
+- 实验日志写\_logs/(gitignore),用nohup跑长任务(会话重启不陪葬)

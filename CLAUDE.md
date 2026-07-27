@@ -373,6 +373,24 @@ ROI/反馈闭环等多个后台任务,温度一度到87°C)后,同一份代码�
   (复用现成特征、复用现成SAM)都不可行,不代表"专门蒸馏新骨干+真实标注监督"这个
   更大的方案本身失败——那需要真正投入建才能验证,今天没做,只是排除了两条更便宜
   的替代路线。** 默认不接入competition.py,代码留opt-in研究件。
+- **FocalLoss+DiceLoss替换seg_head的BCE+pos_weight已判负**(独立子工程
+  focal_dice_seghead/,未改aoi/;借鉴自MultiADS论文的训练配方,FocalLoss/DiceLoss
+  本身是通用技术非其原创,重新推公式实现,不涉及MultiADS的AGPL版权问题):5类真实
+  数据(pcb/phone_battery/cable/breakfast_box逻辑/pushpins逻辑)ΔIoU=
+  [-0.039,-0.016,+0.009,+0.032,-0.024],median=-0.016 mean=-0.0076 min=-0.039,
+  2/5类为正,不过关,中位数均值都是负的。**反直觉**:理论上FocalLoss该救的微小
+  缺陷类目(pcb/phone_battery)跌得最狠,反而在breakfast_box(逻辑异常,不是微小
+  缺陷)上涨最多——"损失函数换成FocalLoss能救微小缺陷"这个理论预期没有兑现,
+  具体原因未深究(可能WRN特征表达能力才是瓶颈,损失函数怎么调都够不着;也可能
+  alpha/gamma超参没针对我们数据调过,直接用了MultiADS默认值)。默认不接入
+  competition.py,代码留opt-in研究件。
+- **顺带一提**:调研MultiADS(ICCV2025,boschresearch/MultiADS,AGPL-3.0协议)
+  确认它的核心视觉机制(CLIP+linear adapter做逐像素密集预测)和已判负的
+  AnomalyCLIP是同一路数,"多类型缺陷同时检测"这个卖点在MVTec/MPDD/Real-IAD等
+  数据集上实际也是"每张图仍是单一缺陷类型",和我们现有"色彩/尺寸/结构3分支
+  z-score竞争决定类型"这套设计本质上是同一个思路的另一种实现(CLIP文本相似度
+  vs 手工统计z-score),不是全新架构。唯一真正借鉴到并验证过的是上面的
+  FocalLoss+DiceLoss训练配方(已判负)。
 - 更早:DINO/SubspaceAD定位、AnomalyCLIP融合、RAMS-R上生产、CutPaste合成、
   roi_zoom原版——全负,勿重开。
 - GPU"脏卡"陷阱:连轴跑后SM降频,延时读数系统性偏高;测延时前查nvidia-smi温度/频率。

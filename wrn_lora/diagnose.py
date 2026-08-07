@@ -17,11 +17,14 @@ from wrn_lora.experiment import _mask_to, _linear_head, _conv_head, _Ensemble, p
 from scripts.run_seg_head_ab import prep_ad2
 
 
-def train_and_collect(cat, seed, n_late_blocks, r, lora_lr=2e-4, head_lr=5e-3, steps=150, device=None):
-    """训一组,返回(head, extractor, lora_modules, fit_iou, test_iou, thr, test_defs)。"""
+def train_and_collect(cat, seed, n_late_blocks, r, lora_lr=2e-4, head_lr=5e-3, steps=150, device=None,
+                       prep_fn=prep_ad2):
+    """训一组,返回(head, extractor, lora_modules, fit_iou, test_iou, thr, test_defs)。
+    prep_fn(cat)默认prep_ad2(仅测大图延时/形状用途),换成prep_mvtec等生产类目
+    数据源时传入prep_fn即可,不改变其余逻辑。"""
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(seed); random.seed(seed)
-    normals, fit_i, fit_m, test_defs = prep_ad2(cat)
+    normals, fit_i, fit_m, test_defs = prep_fn(cat)
 
     bb, extractor, lora_modules, lora_params = build_lora_wrn(
         device=device, n_late_blocks=max(n_late_blocks, 1) if n_late_blocks > 0 else 1, r=r)

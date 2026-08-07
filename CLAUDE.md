@@ -2,6 +2,8 @@
 2. 称呼规则：每次回复必须使用 leon 作为称呼
 3. 遇到不确定的代码设计问题时，必须先询问 leon，不得直接行动
 4. 代码兼容性：不能写兼容性代码，除非主动提要求
+5. 代码风格：必须遵守 karpathy-guidelines 里的四条行为准则(Think Before Coding, Simplicity First, Surgical Changes, Goal-Driven Execution)
+6.不要总是自大，总是不看别人的代码，不要总是自己猜
 
 
 ## Plugins
@@ -411,6 +413,19 @@ ROI/反馈闭环等多个后台任务,温度一度到87°C)后,同一份代码�
   地方或存在结构性盲区的bug**——和当天8条机制路线全部判负互相印证:现有EAD+
   DINO局部patch比对范式,对"轻度构成性替换/欠量"类逻辑异常原始信号本来就弱。
   仅n=2漏检样本的定性观察,不构成可直接改动生产的证据,只作诊断记录。
+- **INP-Former(CVPR2025,MIT协议,github.com/luow23/INP-Former)融合进图级检测
+  已判负,且是本session最差的一次**(inp_former_probe/probe_inp.py,未改aoi/;
+  官方Few-Shot(k=4) MVTec-AD checkpoint直接可测,hazelnut/cable/pill/carpet/
+  leather/metal_nut/wood都在其训练用的标准15类里,无需自己训练):机制是每张图
+  从自身patch分布提取"内在正常原型"做重建,误差当异常分数,融合进max(z_EAD,
+  z_DINO,z_INP)。7类验证ΔIoU=[0.000,-0.111,0.000,0.000,-0.130,0.000,-0.143],
+  median=0.000 mean=-0.055 min=-0.143,四项判据全部不过关。**不是中性无效果,
+  是真实倒退**:cable/leather/wood三类接入后把原本正确的EAD+DINO判断压过去,
+  分数实打实变差。初步归因:INP-Former给出的分数尺度/置信区间没有针对我们的
+  融合场景校准过,直接max()等于让一个未经消化的外来信号越权推翻两个已大量调优
+  的信号源的判断——本session另几条判负路线(ECC残差、蒸馏探针)也不同程度暴露
+  同类问题,"外来信号直接max()进决策"这个模式本身可能需要重新审视,不只是逐个
+  信号源试错。默认不接入competition.py,代码留opt-in研究件。
 - **今日阶段性小结(2026-07-27)**:当天累计验证WRN-LoRA/Top-1参考ROI/GCAD全局
   分支/AHL异态代理集/图级蒸馏探针/SAM实例计数/FocalDice损失/ECC残差图级信号
   共8条独立路线,**全部未能broadly过关**(个别类目偶有正向离群点,但没有一条

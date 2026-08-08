@@ -419,6 +419,13 @@ ROI/反馈闭环等多个后台任务,温度一度到87°C)后,同一份代码�
   具体原因未深究(可能WRN特征表达能力才是瓶颈,损失函数怎么调都够不着;也可能
   alpha/gamma超参没针对我们数据调过,直接用了MultiADS默认值)。默认不接入
   competition.py,代码留opt-in研究件。
+- **FocalDice的alpha反向假说已证伪(2026-07-29)**(focal_dice_seghead/
+  eval_focal_dice_alpha75.py):怀疑alpha=0.25(降权正样本)方向选反了,微小缺陷
+  该加权正样本才对,换alpha=0.75重测同5类:pcb=-0.053、phone_battery=-0.041、
+  cable=+0.008、breakfast_box=+0.045、pushpins=-0.043,median=-0.041 mean=
+  -0.017 min=-0.053,**比原alpha=0.25那次(median=-0.016)更差,两个微小缺陷类目
+  跌得更狠**。结论:不是alpha方向问题,原判负结论维持,且进一步确认FocalDice
+  这套损失函数在我们的极端类别不平衡场景下没有可调参数能救,不用再往这个方向试。
 - **顺带一提**:调研MultiADS(ICCV2025,boschresearch/MultiADS,AGPL-3.0协议)
   确认它的核心视觉机制(CLIP+linear adapter做逐像素密集预测)和已判负的
   AnomalyCLIP是同一路数,"多类型缺陷同时检测"这个卖点在MVTec/MPDD/Real-IAD等

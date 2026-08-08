@@ -90,7 +90,10 @@ def evaluate_with_head(det, test_defs):
     return float(np.mean(ious)), float(np.mean(hits))
 
 
-def run_one(name, normals, fit_i, fit_m, test_defs):
+def run_one(name, normals, fit_i, fit_m, test_defs, lossf=None):
+    """lossf默认None时用FocalDiceLoss()默认alpha=0.25,传入自定义实例可测别的
+    alpha/gamma(如反向验证alpha=0.75是否更适合我们的极端类别不平衡)。"""
+    lossf = lossf if lossf is not None else FocalDiceLoss()
     det = CompetitionLargeDetector()
     det.fit_fewshot(normals, fit_i, defect_masks=fit_m)
     if det.seg_head.head is None:
@@ -104,7 +107,7 @@ def run_one(name, normals, fit_i, fit_m, test_defs):
     grid_hw = feats[0].shape[-2:]
     gts = [torch.from_numpy(_mask_to(m, grid_hw[0], grid_hw[1]).astype(np.float32)) for m in fit_m]
 
-    fd_head, mu, sd = _train_head(feats, gts, FocalDiceLoss())
+    fd_head, mu, sd = _train_head(feats, gts, lossf)
     thr = _calibrate_thr(extractor, fd_head, mu, sd, fit_i, fit_m)
     if thr is None:
         print(f"{name}: FocalDice头阈值标定失败,跳过", flush=True)

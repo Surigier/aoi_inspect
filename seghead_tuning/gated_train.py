@@ -30,14 +30,12 @@ def _eval_head_on(extractor, head, mu, sd, thr, defs, device=DEV):
     return float(np.mean(ious)) if ious else 0.0
 
 
-def run_gated(name, normals, fit_i, fit_m, test_defs, val_frac=0.3, seed=0, device=DEV):
-    det = CompetitionLargeDetector()
-    det.fit_fewshot(normals, fit_i, defect_masks=fit_m)
-    if det.seg_head.head is None:
-        print(f"{name}: 生产seg_head未训成功,跳过", flush=True)
-        return None
-    extractor = det.seg_head.extractor
-
+def pick_gated_head(name, extractor, fit_i, fit_m, val_frac=0.3, seed=0, device=DEV):
+    """内部切train_sub/val_sub,保守/激进都只在train_sub上训,val_sub上自检选边。
+    返回((h_base,mu_b,sd_b,thr_b), (h_gated,mu_g,sd_g,thr_g,是否选了激进))——
+    base是"未门控"对照(train_sub上的保守配置),gated是门控后实际要用的那个。
+    供run_gated和外部脚本(如combined_probe.py)复用同一套门控决策,避免"门控
+    选了但没传回真正在用的det"这种脚本间不一致的bug。"""
     n = len(fit_i)
     idx = list(range(n)); random.Random(seed).shuffle(idx)
     n_val = max(1, int(round(n * val_frac)))
@@ -68,31 +66,50 @@ def run_gated(name, normals, fit_i, fit_m, test_defs, val_frac=0.3, seed=0, devi
         print(f"{name}: 阈值标定失败,跳过", flush=True)
         return None
     gate_agg = val_agg > val_base
+    print(f"  [{name}] val(base={val_base:.3f} agg={val_agg:.3f}) gate={'激进' if gate_agg else '保守'}", flush=True)
+    base_cfg = (h_base, mu_b, sd_b, thr_b)
+    gated_cfg = (h_agg, mu_a, sd_a, thr_a, True) if gate_agg else (h_base, mu_b, sd_b, thr_b, False)
+    return base_cfg, gated_cfg
 
-    def _test_iou(head, mu, sd, thr):
-        orig = (det.seg_head.head, det.seg_head.mu, det.seg_head.sd, det.seg_head.thr, det.seg_head.rams)
-        det.seg_head.head, det.seg_head.mu, det.seg_head.sd = head, mu, sd
-        det.seg_head.thr = thr; det.seg_head.rams = None
-        ious, hits = [], []
-        for img, gt in test_defs:
-            o = det.locate(img)
-            if o.get("mask") is None:
-                ious.append(0.0); hits.append(0.0); continue
-            mask = o["mask"]
-            gt_r = (torch.nn.functional.interpolate(
-                torch.from_numpy(gt.astype(np.float32))[None, None],
-                size=mask.shape, mode="nearest")[0, 0].numpy() > 0.5).astype(np.uint8)
-            ious.append(_per_image_iou(mask, gt_r))
-            hits.append(box_hit(o["boxes"], gt_boxes(gt)) or 0.0)
-        det.seg_head.head, det.seg_head.mu, det.seg_head.sd, det.seg_head.thr, det.seg_head.rams = orig
-        return float(np.mean(ious)), float(np.mean(hits))
 
-    test_base, hit_base = _test_iou(h_base, mu_b, sd_b, thr_b)
-    test_agg, hit_agg = _test_iou(h_agg, mu_a, sd_a, thr_a)
-    test_gated, hit_gated = (test_agg, hit_agg) if gate_agg else (test_base, hit_base)
+def _test_iou_with_head(det, head, mu, sd, thr, test_defs):
+    orig = (det.seg_head.head, det.seg_head.mu, det.seg_head.sd, det.seg_head.thr, det.seg_head.rams)
+    det.seg_head.head, det.seg_head.mu, det.seg_head.sd = head, mu, sd
+    det.seg_head.thr = thr; det.seg_head.rams = None
+    ious, hits = [], []
+    for img, gt in test_defs:
+        o = det.locate(img)
+        if o.get("mask") is None:
+            ious.append(0.0); hits.append(0.0); continue
+        mask = o["mask"]
+        gt_r = (torch.nn.functional.interpolate(
+            torch.from_numpy(gt.astype(np.float32))[None, None],
+            size=mask.shape, mode="nearest")[0, 0].numpy() > 0.5).astype(np.uint8)
+        ious.append(_per_image_iou(mask, gt_r))
+        hits.append(box_hit(o["boxes"], gt_boxes(gt)) or 0.0)
+    det.seg_head.head, det.seg_head.mu, det.seg_head.sd, det.seg_head.thr, det.seg_head.rams = orig
+    return float(np.mean(ious)), float(np.mean(hits))
+
+
+def run_gated(name, normals, fit_i, fit_m, test_defs, val_frac=0.3, seed=0, device=DEV):
+    det = CompetitionLargeDetector()
+    det.fit_fewshot(normals, fit_i, defect_masks=fit_m)
+    if det.seg_head.head is None:
+        print(f"{name}: 生产seg_head未训成功,跳过", flush=True)
+        return None
+    extractor = det.seg_head.extractor
+
+    picked = pick_gated_head(name, extractor, fit_i, fit_m, val_frac=val_frac, seed=seed, device=device)
+    if picked is None:
+        return None
+    base_cfg, gated_cfg = picked
+    h_gated, mu_g, sd_g, thr_g, gate_agg = gated_cfg
+
+    test_base, hit_base = _test_iou_with_head(det, *base_cfg, test_defs)
+    test_gated, hit_gated = _test_iou_with_head(det, h_gated, mu_g, sd_g, thr_g, test_defs)
     d = test_gated - test_base
-    print(f"{name}: val(base={val_base:.3f} agg={val_agg:.3f}) gate={'激进' if gate_agg else '保守'}  "
-          f"test(base={test_base:.3f} agg={test_agg:.3f} gated={test_gated:.3f}) Δ(gated-base)={d:+.3f}", flush=True)
+    print(f"{name}: gate={'激进' if gate_agg else '保守'}  "
+          f"test(base={test_base:.3f} gated={test_gated:.3f}) Δ(gated-base)={d:+.3f}", flush=True)
     return d
 
 

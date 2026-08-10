@@ -137,13 +137,16 @@ def _per_image_iou(pred, gt):
     return TP / max(TP + FP + FN, 1)
 
 
-def fit_global_branches(det, normals, defects, dino):
+def fit_global_branches(det, normals, defects, dino, ae_steps=300, ae_lr=1e-3):
     """在同一批fit数据上标定两个全局分支的z-score统计量+融合阈值(与_calibrate_dino_gate
-    完全同款流程:全fit标定mu/sd,阈值用FewShotAdapter._calibrate在z-fused值上找)。"""
-    pix_ae = fit_ae(PixelAE().to(DEV), normals + defects[:len(normals) // 2 or 1], steps=300, device=DEV)
+    完全同款流程:全fit标定mu/sd,阈值用FewShotAdapter._calibrate在z-fused值上找)。
+    ae_steps/ae_lr默认300/1e-3(原判负用的配置),传入更激进的值可复查是不是训练
+    强度不够(和WRN-LoRA/seg_head同一个"配置太保守"假说)。"""
+    pix_ae = fit_ae(PixelAE().to(DEV), normals + defects[:len(normals) // 2 or 1],
+                     steps=ae_steps, lr=ae_lr, device=DEV)
     cls_normals = [dino.cls(n) for n in normals]
     cls_defects = [dino.cls(d) for d in defects]
-    emb_ae = fit_ae(EmbedAE().to(DEV), cls_normals, steps=300, device=DEV)
+    emb_ae = fit_ae(EmbedAE().to(DEV), cls_normals, steps=ae_steps, lr=ae_lr, device=DEV)
 
     pix_mu, pix_sd = calibrate_zscore(pix_ae, normals)
     emb_mu, emb_sd = calibrate_zscore(emb_ae, cls_normals, is_embed=True)
@@ -204,7 +207,7 @@ def evaluate_variant(det, fused_fn, thr, test_defs):
     return float(np.mean(ious)), float(np.mean(hits))
 
 
-def run_one(name, normals, fit_i, fit_m, test_defs):
+def run_one(name, normals, fit_i, fit_m, test_defs, ae_steps=300, ae_lr=1e-3):
     det = CompetitionLargeDetector()
     det.fit_fewshot(normals, fit_i, defect_masks=fit_m)
     if det._dino is None:
@@ -219,7 +222,7 @@ def run_one(name, normals, fit_i, fit_m, test_defs):
         print(f"{name}: 强制重标后DINO门仍未启用(样本量真的不够),跳过", flush=True)
         return None
     dino = DinoCLS(device=DEV)
-    fns = fit_global_branches(det, normals, fit_i, dino)
+    fns = fit_global_branches(det, normals, fit_i, dino, ae_steps=ae_steps, ae_lr=ae_lr)
     row = {}
     for tag in ["base", "pix", "emb"]:
         fn, thr = fns[tag]

@@ -30,45 +30,66 @@ def _eval_head_on(extractor, head, mu, sd, thr, defs, device=DEV):
     return float(np.mean(ious)) if ious else 0.0
 
 
+def _fit_head_full(extractor, imgs, masks, steps, lr, device=DEV):
+    """在给定图集上训一个头(和_train_head一样的loss/优化器/batch/种子),返回
+    (head,mu,sd,thr)。供pick_gated_head两处复用:一次在train_sub上做门控决策,
+    一次在决策完的全量fit集上重训最终部署的头。"""
+    with torch.no_grad():
+        feats = [extractor(im) for im in imgs]
+    grid_hw = feats[0].shape[-2:]
+    gts = [torch.from_numpy(_mask_to(m, grid_hw[0], grid_hw[1]).astype(np.float32)) for m in masks]
+    pos_total = sum(float(g.sum()) for g in gts)
+    neg_total = len(gts) * grid_hw[0] * grid_hw[1] - pos_total
+    pos_w = torch.tensor([neg_total / max(pos_total, 1)], device=device)
+    head, mu, sd = _train_head(feats, gts, pos_w, steps, lr, device=device)
+    thr = _calibrate_thr(extractor, head, mu, sd, imgs, masks)
+    return head, mu, sd, thr
+
+
 def pick_gated_head(name, extractor, fit_i, fit_m, val_frac=0.3, seed=0, device=DEV):
-    """内部切train_sub/val_sub,保守/激进都只在train_sub上训,val_sub上自检选边。
-    返回((h_base,mu_b,sd_b,thr_b), (h_gated,mu_g,sd_g,thr_g,是否选了激进))——
-    base是"未门控"对照(train_sub上的保守配置),gated是门控后实际要用的那个。
-    供run_gated和外部脚本(如combined_probe.py)复用同一套门控决策,避免"门控
-    选了但没传回真正在用的det"这种脚本间不一致的bug。"""
+    """内部切train_sub/val_sub,保守/激进都只在train_sub上训,val_sub上自检选边——
+    但这只是"决策"阶段,便宜、不浪费太多计算。决策完之后,**用全量fit集重新训一遍
+    胜出的配置**(以及保守配置的full-data版本当公平对照),避免"门控决策训练用了
+    更少数据,导致和真实baseline(用全量fit集训)比较时不公平"这个混淆——这个bug
+    在combined_probe.py组合测试里实际发生过:门控选中"保守"的类目,组合结果仍然
+    比真实baseline差,根因就是这个"保守"版本只在70%数据上训过,不是数据量对等的
+    公平比较。
+
+    返回((h_base_full,mu,sd,thr), (h_final,mu,sd,thr,是否选了激进))——两者都是
+    在全量fit_i/fit_m上训出来的,数据量对等,只有配置(steps/lr)不同。"""
     n = len(fit_i)
     idx = list(range(n)); random.Random(seed).shuffle(idx)
     n_val = max(1, int(round(n * val_frac)))
     val_idx, train_idx = idx[:n_val], idx[n_val:]
     train_i = [fit_i[i] for i in train_idx]; train_m = [fit_m[i] for i in train_idx]
     val_defs = [(fit_i[i], fit_m[i]) for i in val_idx]
-    print(f"  [{name}] fit={n} -> train_sub={len(train_idx)} val_sub={len(val_idx)}", flush=True)
+    print(f"  [{name}] fit={n} -> train_sub={len(train_idx)} val_sub={len(val_idx)}(仅用于门控决策)", flush=True)
 
-    with torch.no_grad():
-        feats = [extractor(im) for im in train_i]
-    grid_hw = feats[0].shape[-2:]
-    gts = [torch.from_numpy(_mask_to(m, grid_hw[0], grid_hw[1]).astype(np.float32)) for m in train_m]
-    pos_total = sum(float(g.sum()) for g in gts)
-    neg_total = len(gts) * grid_hw[0] * grid_hw[1] - pos_total
-    pos_w = torch.tensor([neg_total / max(pos_total, 1)], device=device)
-
-    def train_and_val(steps, lr):
-        head, mu, sd = _train_head(feats, gts, pos_w, steps, lr, device=device)
-        thr = _calibrate_thr(extractor, head, mu, sd, train_i, train_m)
+    def decide(steps, lr):
+        head, mu, sd, thr = _fit_head_full(extractor, train_i, train_m, steps, lr, device=device)
         if thr is None:
-            return None, None, None, None, 0.0
-        val_iou = _eval_head_on(extractor, head, mu, sd, thr, val_defs, device=device)
-        return head, mu, sd, thr, val_iou
+            return 0.0
+        return _eval_head_on(extractor, head, mu, sd, thr, val_defs, device=device)
 
-    h_base, mu_b, sd_b, thr_b, val_base = train_and_val(BASE_STEPS, BASE_LR)
-    h_agg, mu_a, sd_a, thr_a, val_agg = train_and_val(AGG_STEPS, AGG_LR)
-    if h_base is None or h_agg is None:
-        print(f"{name}: 阈值标定失败,跳过", flush=True)
-        return None
+    val_base = decide(BASE_STEPS, BASE_LR)
+    val_agg = decide(AGG_STEPS, AGG_LR)
     gate_agg = val_agg > val_base
-    print(f"  [{name}] val(base={val_base:.3f} agg={val_agg:.3f}) gate={'激进' if gate_agg else '保守'}", flush=True)
-    base_cfg = (h_base, mu_b, sd_b, thr_b)
-    gated_cfg = (h_agg, mu_a, sd_a, thr_a, True) if gate_agg else (h_base, mu_b, sd_b, thr_b, False)
+    print(f"  [{name}] val(base={val_base:.3f} agg={val_agg:.3f}) gate={'激进' if gate_agg else '保守'}"
+          f"  -> 用全量fit={n}张重训部署版本", flush=True)
+
+    # 决策完,两个版本都用全量fit集重训(数据量对等,唯一变量是steps/lr)
+    base_cfg = _fit_head_full(extractor, fit_i, fit_m, BASE_STEPS, BASE_LR, device=device)
+    if base_cfg[-1] is None:
+        print(f"{name}: 全量重训阈值标定失败,跳过", flush=True)
+        return None
+    if gate_agg:
+        gated_full = _fit_head_full(extractor, fit_i, fit_m, AGG_STEPS, AGG_LR, device=device)
+        if gated_full[-1] is None:
+            print(f"{name}: 全量重训阈值标定失败,跳过", flush=True)
+            return None
+        gated_cfg = (*gated_full, True)
+    else:
+        gated_cfg = (*base_cfg, False)
     return base_cfg, gated_cfg
 
 

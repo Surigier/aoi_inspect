@@ -26,6 +26,7 @@ from scripts.run_scorecard_5types import prep_mvtec_color
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH, SEED = 8, 0
+LIGHT_STEPS, LIGHT_LR = 100, 5e-3  # diag_pcb.py测出来的:微小缺陷(pcb)真正的峰值比base还早
 BASE_STEPS, BASE_LR = 300, 5e-3
 AGG_STEPS, AGG_LR = 900, 1e-2
 
@@ -102,6 +103,10 @@ def run_one(name, normals, fit_i, fit_m, test_defs):
     if det.seg_head.head is None:
         print(f"{name}: 生产seg_head未训成功,跳过", flush=True)
         return None
+    # DINO门可能被_calibrate_latency在GPU瞬时负载下砍掉(已知风险),不补会导致
+    # baseline/激进两次评测用的判定路径跨进程不一致,IoU数字跟着运气跳。
+    if det._dino is None:
+        det._calibrate_dino_gate(normals, fit_i)
     base_iou, base_hit = evaluate_with_head(det, test_defs)
 
     extractor = det.seg_head.extractor

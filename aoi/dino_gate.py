@@ -37,6 +37,7 @@ class DinoGate:
         self.std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
         self.bank = None                                     # bank 模式
         self.pca_mean = None; self.subspace = None           # subspace 模式
+        self.last_cls = None                                 # 上次_patches()顺手缓存的CLS token(GCAD-EmbedAE复用,零增量前向)
 
     @torch.no_grad()
     def _patches(self, img):
@@ -44,8 +45,9 @@ class DinoGate:
         x = x.to(self.device)
         x = F.interpolate(x, size=(DINO_SZ, DINO_SZ), mode="bilinear", align_corners=False)
         x = (x - self.mean) / self.std
-        t = self.m.forward_features(x)[:, self.m.num_prefix_tokens:, :]  # (1,N,C)
-        return t[0].float()
+        t = self.m.forward_features(x)                                   # (1,1+N,C)
+        self.last_cls = t[0, 0, :].float()                                # token 0 = CLS,同一次前向顺手存
+        return t[:, self.m.num_prefix_tokens:, :][0].float()
 
     def build(self, normals):
         vs = [self._patches(n).cpu() for n in normals]

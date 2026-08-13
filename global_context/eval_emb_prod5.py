@@ -1,23 +1,17 @@
-"""把今天验证过的两个"配置太保守"候选(seg_head核心配方OOF门控 + GCAD-EmbedAE
-激进配方)组合起来,在真正的生产5类目scorecard(hazelnut/cable/pill/pcb/
-phone_battery)上跑一遍,看合起来的真实效果——不是分别验证时的单独数字,是叠加
-后对同一批production评测口径的实际影响。
+"""GCAD-EmbedAE(激进配方900步/3e-3)单独(不接seg_head门控)在真正的5类生产
+scorecard(hazelnut/cable/pill/pcb/phone_battery)上验证——之前只在9类LOCO/
+cable/pcb上测过、不需门控直接过严格判据,这里换到真正要交的成绩单上确认是否
+依然成立。用真正的OR门(复用det.locate()真实判定,不联合重标定阈值)。
 
-LoRA门控本次不合并:它要换的是WRN骨干特征本身,和生产_select_feat_mode(768通道
-_wrn_feats vs 1536通道_wrn_feats_diff模板差分)有耦合,合并前需要单独确认不会
-静默出错,这次先跳过,只测seg_head门控+GCAD两个互相独立、已知安全的候选。
-
-用法:PYTHONPATH=. python combined_probe.py
+用法:PYTHONPATH=. python global_context/eval_emb_prod5.py
 """
 import numpy as np
 import torch
 from aoi.competition import CompetitionLargeDetector
-from aoi.seg_head import map_to_boxes
+from aoi.seg_head import map_to_boxes, merge_boxes
 from global_context.eval_global_branch import (
-    prep_mvtec, prep_realiad, gt_boxes, box_hit, fit_global_branches,
-    DinoCLS,
+    prep_mvtec, prep_realiad, gt_boxes, box_hit, fit_global_branches, DinoCLS,
 )
-from seghead_tuning.gated_train import pick_gated_head
 
 
 def _per_image_iou(pred, gt):
@@ -42,11 +36,8 @@ def baseline_eval(det, test_defs):
 
 
 def locate_with_emb_or(det, img, z_emb_fn, thr_emb_only):
-    """真正零回退的OR门:先跑det.locate()本身(包含灰区补检等全部生产判定逻辑,
-    一字不改),base抓到的原样返回。只有base说"正常"时才额外查一下EmbedAE是否
-    独立超过它自己的阈值——独立触发的话,手动补上locate()因为"判正常直接早退"
-    而跳过的分割/精化/框逻辑(逐字复刻locate()里is_defect分支做的事)。
-    这样保证:base原有判定边界一个像素都不会变,EmbedAE只能新增覆盖,不能收窄。"""
+    """同combined_probe.py:base该抓的用det.locate()真实判定原样返回,只有base说
+    "正常"时才额外查EmbedAE是否独立超过自己的阈值,触发的话手动补分割/框逻辑。"""
     res = det.locate(img)
     if res["is_defect"]:
         return res
@@ -64,7 +55,6 @@ def locate_with_emb_or(det, img, z_emb_fn, thr_emb_only):
         mask = det.crop_cascade.refine(det, native, mask, mask.shape)
     if det.comp_graph is not None:
         mask = det.comp_graph.refine(det, img, mask)
-    from aoi.seg_head import merge_boxes
     boxes = map_to_boxes(mask.astype(np.float32), 0.5, min_area_frac=0.0002, close=0)
     res["is_defect"] = True
     res["anomaly_map"] = amap
@@ -91,40 +81,19 @@ def combo_eval(det, z_emb_fn, thr_emb_only, test_defs):
 def run_one(name, normals, fit_i, fit_m, test_defs):
     det = CompetitionLargeDetector()
     det.fit_fewshot(normals, fit_i, defect_masks=fit_m)
-    if det.seg_head.head is None:
-        print(f"{name}: 生产seg_head未训成功,跳过", flush=True)
-        return None
-    # 打出_calibrate_latency真实砍了什么——这是GPU瞬时负载/温度决定的,不受seed控制,
-    # 跨进程结果不可比时第一件要查的事(2026-08-13复现过一次:两轮相同代码的组合测试
-    # 结果不一样,怀疑是两次运行时GPU负载状态不同导致砍的组件不同,但当时没打印这个,
-    # 事后无法确认)。
     print(f"{name}: lat_probe_ms={getattr(det, 'lat_probe_ms', None)} "
           f"lat_trimmed={getattr(det, 'lat_trimmed', None)}", flush=True)
-    # DINO门可能被_calibrate_latency在GPU瞬时负载下砍掉(已知风险,session里其它脚本
-    # 都在关键测量前强制补标定)——必须在baseline_eval之前做,否则baseline本身就可能
-    # 在"没有DINO融合"的运气差状态下跑,造成baseline_iou本身跨进程不可复现,而不是
-    # 后面门控/GCAD机制真的有问题。之前的-0.032就是这个位置错误导致的假象。
     if det._dino is None:
         det._calibrate_dino_gate(normals, fit_i)
     base_iou, base_hit = baseline_eval(det, test_defs)
 
-    # ① seg_head OOF门控:决定保守/激进,把选中的head/mu/sd/thr真正写回det.seg_head
-    picked = pick_gated_head(name, det.seg_head.extractor, fit_i, fit_m)
-    if picked is None:
-        print(f"{name}: seg_head门控失败,跳过", flush=True)
-        return None
-    _, (h_g, mu_g, sd_g, thr_g, gate_agg) = picked
-    det.seg_head.head, det.seg_head.mu, det.seg_head.sd = h_g, mu_g, sd_g
-    det.seg_head.thr = thr_g; det.seg_head.rams = None
-
-    # ② GCAD-EmbedAE(激进配方,900步/3e-3),融合进图级检测(DINO门已在函数开头保证过)
     dino = DinoCLS(device="cuda" if torch.cuda.is_available() else "cpu")
     fns = fit_global_branches(det, normals, fit_i, dino, ae_steps=900, ae_lr=3e-3)
     z_emb_fn, thr_emb_only = fns["emb_only"]
     combo_iou, combo_hit = combo_eval(det, z_emb_fn, thr_emb_only, test_defs)
 
     print(f"{name:20s} baseline IoU={base_iou:.3f}/hit={base_hit:.3f}  "
-          f"+seg_head门控+GCAD-EmbedAE IoU={combo_iou:.3f}/hit={combo_hit:.3f}  "
+          f"+GCAD-EmbedAE(单独) IoU={combo_iou:.3f}/hit={combo_hit:.3f}  "
           f"Δ(IoU)={combo_iou-base_iou:+.3f}", flush=True)
     return dict(base=(base_iou, base_hit), combo=(combo_iou, combo_hit))
 
@@ -141,17 +110,14 @@ def main():
     names, deltas = [], []
     for name, prep in jobs:
         row = run_one(name, *prep())
-        if row is None:
-            continue
         names.append(name)
         deltas.append(row["combo"][0] - row["base"][0])
-    if deltas:
-        d = np.array(deltas)
-        passed = (np.median(d) >= 0.005 and np.mean(d) > 0
-                 and (d > 0).sum() >= max(1, len(d) // 2 + 1) and np.min(d) >= -0.01)
-        print(f"\n=== 汇总(n={len(d)}) === median(Δ)={np.median(d):+.3f} mean(Δ)={np.mean(d):+.3f} "
-              f"min(Δ)={np.min(d):+.3f}  {'通过' if passed else '不通过'}", flush=True)
-        print(dict(zip(names, [round(float(x), 3) for x in d])), flush=True)
+    d = np.array(deltas)
+    passed = (np.median(d) >= 0.005 and np.mean(d) > 0
+             and (d > 0).sum() >= max(1, len(d) // 2 + 1) and np.min(d) >= -0.01)
+    print(f"\n=== 汇总(n={len(d)}) === median(Δ)={np.median(d):+.3f} mean(Δ)={np.mean(d):+.3f} "
+          f"min(Δ)={np.min(d):+.3f}  {'通过' if passed else '不通过'}", flush=True)
+    print(dict(zip(names, [round(float(x), 3) for x in d])), flush=True)
 
 
 if __name__ == "__main__":

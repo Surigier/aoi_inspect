@@ -176,13 +176,32 @@ def fit_global_branches(det, normals, defects, dino, ae_steps=300, ae_lr=1e-3):
     thr_base = FewShotAdapter._calibrate(list(fused_base_n), list(fused_base_d))
     thr_pix = FewShotAdapter._calibrate(list(fused_pix_n), list(fused_pix_d))
     thr_emb = FewShotAdapter._calibrate(list(fused_emb_n), list(fused_emb_d))
+    # EmbedAE独立标定自己的阈值(不参与base的联合重标定),供"emb_or"变体用——
+    # diag_interaction_pcb.py诊断出:三信号取max()后联合重标定一个阈值,会把base
+    # (EAD+DINO)原有的判定边界跟着抬高,导致原本能正确抓到的图反而漏检(pcb上1张
+    # 净损失换4张"抓到了但掩膜本身没用"的空欢喜,net亏)。emb_or用OR逻辑代替
+    # max()+联合重标定:base该抓的一定还抓得到(阈值不变),EmbedAE只能新增覆盖,
+    # 不能收窄base已有的判定边界。
+    thr_emb_only = FewShotAdapter._calibrate(list(z(gn, emb_mu, emb_sd)), list(z(gd, emb_mu, emb_sd)))
+
+    def _base_fn(img):
+        return max(z(ead.score(img), emu, esd), z(det._dino.score(img), dmu, dsd))
+
+    def _emb_or_fn(img):
+        z_emb_img = z(emb_ae.score(dino.cls(img)[None].to(DEV)), emb_mu, emb_sd)
+        return max(_base_fn(img) - thr_base, z_emb_img - thr_emb_only)
+
+    def _emb_only_fn(img):
+        return z(emb_ae.score(dino.cls(img)[None].to(DEV)), emb_mu, emb_sd)
 
     return dict(
-        base=(lambda img: max(z(ead.score(img), emu, esd), z(det._dino.score(img), dmu, dsd)), thr_base),
+        base=(_base_fn, thr_base),
+        emb_only=(_emb_only_fn, thr_emb_only),
         pix=(lambda img: max(z(ead.score(img), emu, esd), z(det._dino.score(img), dmu, dsd),
                              z(pix_ae.score(img[None].to(DEV)), pix_mu, pix_sd)), thr_pix),
         emb=(lambda img: max(z(ead.score(img), emu, esd), z(det._dino.score(img), dmu, dsd),
                              z(emb_ae.score(dino.cls(img)[None].to(DEV)), emb_mu, emb_sd)), thr_emb),
+        emb_or=(_emb_or_fn, 0.0),
     )
 
 

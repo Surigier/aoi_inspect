@@ -12,7 +12,8 @@ import torch
 from aoi.competition import CompetitionLargeDetector
 from aoi._seg_head_old_ae5fbbb import _mask_to
 from seghead_tuning.probe_aggressive_train import (
-    _train_head, _calibrate_thr, _per_image_iou, BASE_STEPS, BASE_LR, AGG_STEPS, AGG_LR, DEV,
+    _train_head, _calibrate_thr, _per_image_iou,
+    LIGHT_STEPS, LIGHT_LR, BASE_STEPS, BASE_LR, AGG_STEPS, AGG_LR, DEV,
 )
 from global_context.eval_global_branch import prep_loco, prep_mvtec, prep_realiad, gt_boxes, box_hit
 from scripts.run_scorecard_5types import prep_mvtec_color
@@ -46,16 +47,22 @@ def _fit_head_full(extractor, imgs, masks, steps, lr, device=DEV):
     return head, mu, sd, thr
 
 
-def pick_gated_head(name, extractor, fit_i, fit_m, val_frac=0.3, seed=0, device=DEV):
-    """内部切train_sub/val_sub,保守/激进都只在train_sub上训,val_sub上自检选边——
-    但这只是"决策"阶段,便宜、不浪费太多计算。决策完之后,**用全量fit集重新训一遍
-    胜出的配置**(以及保守配置的full-data版本当公平对照),避免"门控决策训练用了
-    更少数据,导致和真实baseline(用全量fit集训)比较时不公平"这个混淆——这个bug
-    在combined_probe.py组合测试里实际发生过:门控选中"保守"的类目,组合结果仍然
-    比真实baseline差,根因就是这个"保守"版本只在70%数据上训过,不是数据量对等的
-    公平比较。
+CANDIDATES = [("轻量", LIGHT_STEPS, LIGHT_LR), ("保守", BASE_STEPS, BASE_LR), ("激进", AGG_STEPS, AGG_LR)]
 
-    返回((h_base_full,mu,sd,thr), (h_final,mu,sd,thr,是否选了激进))——两者都是
+
+def pick_gated_head(name, extractor, fit_i, fit_m, val_frac=0.3, seed=0, device=DEV):
+    """内部切train_sub/val_sub,三档配置(轻量100/5e-3、保守300/5e-3、激进900/1e-2)
+    都只在train_sub上训,val_sub上自检三选一——这只是"决策"阶段,便宜、不浪费太多
+    计算。决策完之后,**用全量fit集重新训一遍胜出的配置**(以及保守配置的
+    full-data版本当公平对照),避免"门控决策训练用了更少数据,导致和真实
+    baseline(用全量fit集训)比较时不公平"这个混淆——这个bug在combined_probe.py
+    组合测试里实际发生过。
+
+    三档而非两档:diag_pcb.py诊断出pcb这类微小缺陷的真正训练甜点(~100步)比
+    现有"保守"基线(300步)还早,"保守vs激进"这两个候选都已经过了它的峰值,门控
+    怎么选都是次优——轻量档专门补上这个空缺。
+
+    返回((h_base_full,mu,sd,thr), (h_final,mu,sd,thr,选中的档位名))——两者都是
     在全量fit_i/fit_m上训出来的,数据量对等,只有配置(steps/lr)不同。"""
     n = len(fit_i)
     idx = list(range(n)); random.Random(seed).shuffle(idx)
@@ -71,25 +78,25 @@ def pick_gated_head(name, extractor, fit_i, fit_m, val_frac=0.3, seed=0, device=
             return 0.0
         return _eval_head_on(extractor, head, mu, sd, thr, val_defs, device=device)
 
-    val_base = decide(BASE_STEPS, BASE_LR)
-    val_agg = decide(AGG_STEPS, AGG_LR)
-    gate_agg = val_agg > val_base
-    print(f"  [{name}] val(base={val_base:.3f} agg={val_agg:.3f}) gate={'激进' if gate_agg else '保守'}"
-          f"  -> 用全量fit={n}张重训部署版本", flush=True)
+    vals = {tag: decide(steps, lr) for tag, steps, lr in CANDIDATES}
+    winner = max(vals, key=vals.get)
+    val_str = " ".join(f"{tag}={vals[tag]:.3f}" for tag, _, _ in CANDIDATES)
+    print(f"  [{name}] val({val_str}) gate={winner}  -> 用全量fit={n}张重训部署版本", flush=True)
 
-    # 决策完,两个版本都用全量fit集重训(数据量对等,唯一变量是steps/lr)
+    # 决策完,保守(baseline对照)和胜出档都用全量fit集重训(数据量对等,唯一变量是steps/lr)
     base_cfg = _fit_head_full(extractor, fit_i, fit_m, BASE_STEPS, BASE_LR, device=device)
     if base_cfg[-1] is None:
         print(f"{name}: 全量重训阈值标定失败,跳过", flush=True)
         return None
-    if gate_agg:
-        gated_full = _fit_head_full(extractor, fit_i, fit_m, AGG_STEPS, AGG_LR, device=device)
+    if winner == "保守":
+        gated_cfg = (*base_cfg, winner)
+    else:
+        w_steps, w_lr = next((s, l) for tag, s, l in CANDIDATES if tag == winner)
+        gated_full = _fit_head_full(extractor, fit_i, fit_m, w_steps, w_lr, device=device)
         if gated_full[-1] is None:
             print(f"{name}: 全量重训阈值标定失败,跳过", flush=True)
             return None
-        gated_cfg = (*gated_full, True)
-    else:
-        gated_cfg = (*base_cfg, False)
+        gated_cfg = (*gated_full, winner)
     return base_cfg, gated_cfg
 
 
@@ -118,18 +125,23 @@ def run_gated(name, normals, fit_i, fit_m, test_defs, val_frac=0.3, seed=0, devi
     if det.seg_head.head is None:
         print(f"{name}: 生产seg_head未训成功,跳过", flush=True)
         return None
+    # DINO门可能被_calibrate_latency在GPU瞬时负载下砍掉(已知风险),不补会导致
+    # test_base/test_gated用的判定路径跨进程不一致,IoU数字跟着运气跳——这正是
+    # pcb在combined_probe.py和这里数字对不上(-0.016 vs -0.032)的根因之一。
+    if det._dino is None:
+        det._calibrate_dino_gate(normals, fit_i)
     extractor = det.seg_head.extractor
 
     picked = pick_gated_head(name, extractor, fit_i, fit_m, val_frac=val_frac, seed=seed, device=device)
     if picked is None:
         return None
     base_cfg, gated_cfg = picked
-    h_gated, mu_g, sd_g, thr_g, gate_agg = gated_cfg
+    h_gated, mu_g, sd_g, thr_g, winner = gated_cfg
 
     test_base, hit_base = _test_iou_with_head(det, *base_cfg, test_defs)
     test_gated, hit_gated = _test_iou_with_head(det, h_gated, mu_g, sd_g, thr_g, test_defs)
     d = test_gated - test_base
-    print(f"{name}: gate={'激进' if gate_agg else '保守'}  "
+    print(f"{name}: gate={winner}  "
           f"test(base={test_base:.3f} gated={test_gated:.3f}) Δ(gated-base)={d:+.3f}", flush=True)
     return d
 

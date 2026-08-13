@@ -385,6 +385,22 @@ ROI/反馈闭环等多个后台任务,温度一度到87°C)后,同一份代码�
   变体都训练不足时下的判断,不准确——练够了之后EmbedAE明显强于PixelAE(语义嵌入
   确实有价值)。**列为P1候选**,是目前3个"保守配置"候选里唯一不需要OOF门控就
   直接过严格margin判据的,production集成前仍需多种子重复确认稳定性。
+- **重大教训(2026-08-13):GCAD-EmbedAE已真实接入生产`aoi/competition.py`又立刻
+  回退,默认关**(代码留`aoi/gcad_embed.py`+`aoi/dino_gate.py`的`last_cls`缓存,
+  opt-in)。接入方式是OR门(base=EAD+DINO该抓的原样保留,只有base判"正常"时才
+  独立查EmbedAE阈值,复用DINO门同一次前向的CLS token,零增量前向)。**根因:
+  当天所有验证脚本(eval_aggressive.py/eval_emb_prod5.py/combined_probe.py)
+  都只在test_defs(缺陷图)上算IoU/hit,从没用正常图测过假阳性率**——"9类/5类
+  不需门控直接过严格margin判据,min=0.000"这个结论只测了召回这一侧,完全是
+  方法论盲区。真用`scripts/run_scorecard.py`(含正常图的完整图级acc)一测:
+  **图级acc从0.902崩到0.703(-0.199)**,IoU/框命中只有+0.006~+0.022的小幅
+  提升,完全不能抵消——OR门的独立阈值只要稍松,在"正常图占多数"的真实测试集上
+  误报绝对数量就很大,不是只看缺陷图的判据能测出来的。立刻回退(`gcad_embed=
+  False`),重跑scorecard确认5类全部干净恢复基线(均值acc=0.909,在正常波动
+  范围内)。**这是今天最大的一条方法论教训:任何要接生产的候选,验证判据必须
+  同时包含"正常图假阳性率"和"缺陷图召回率"两侧,只测一侧(哪怕min=0.000看着
+  很稳)都可能是假象。** 后续若要重新推进,必须先补齐正常图OOF假阳性率验证,
+  独立阈值不能直接套用EAD/DINO那套"分离正常/缺陷"的常规标定逻辑。
 - **重要发现(2026-07-29):seg_head门控+GCAD-EmbedAE两个单独验证净正的候选,组合
   接入同一批生产5类目(hazelnut/cable/pill/pcb/phone_battery)后是净负**
   (combined_probe.py)。ΔIoU=[+0.031,-0.022,+0.066,-0.083,-0.053],median=

@@ -23,6 +23,7 @@ from .seg_head import map_to_boxes
 # 分位数版救pcb却砸hazelnut -0.204)。唯一确证收益sheet_metal+0.111不抵。按纪律回退,
 # 新头及OOF基建留作opt-in研究件(run_seg_head_ab_scorecard.py为证据)。
 from ._seg_head_old_ae5fbbb import SupervisedSegHead
+from .gcad_embed import fit_embed_ae, calibrate_zscore as _gcad_calibrate_zscore
 
 
 def _mask_np(mk, hw):
@@ -73,7 +74,7 @@ class CompetitionLargeDetector:
     def __init__(self, device="cuda", aux_size=320, train_steps=10000, seg_eval_hw=(256, 256),
                  compile_infer=False, sam_refine=True, roi_zoom=False, seg_in=512, rams=False,
                  ead_students=2, crop_cascade=False, comp_graph=False, boundary_refine=False,
-                 tta=False):
+                 tta=False, gcad_embed=False):
         # ead_students=2:多种子EAD学生集成(检测分,教师共享)。实测工作类方差收窄~2×、
         # 现场一次fit下限+0.012、均值零代价;fit不计时训练免费,推理+一次学生前向(延时待验)。
         # rams 默认关:RAMS-R残差注意力修正支隔离探针+0.013~0.033(3/4类),但生产全管线实测净平
@@ -126,6 +127,20 @@ class CompetitionLargeDetector:
         # 喂模型从没见过的镜像图产出的不是"降噪的另一视角"而是系统性更差的预测,平均
         # 进去反而拖累整体。opt-in代码留档,不进生产候选。
         self.use_tta = tta
+        # gcad_embed默认关(2026-08-13已回退):DINOv2 CLS token瓶颈自编码器判整图语义
+        # 构图,补EAD/DINO patch级比对看不到的逻辑异常。当天研究阶段的验证(global_context/
+        # eval_aggressive.py、eval_emb_prod5.py)只在test_defs(缺陷图)上测IoU/hit,
+        # **从没测过正常图会不会被误报**,得出"min=0.000零回退"的结论有方法论盲区。真上
+        # 生产scripts/run_scorecard.py(含正常图的完整acc)一测:图级acc从0.902崩到0.703
+        # (-0.199),IoU/框命中只有+0.006~+0.022的小幅提升,完全不能抵消——OR门只要
+        # 独立阈值稍微松一点,在"正常图占多数"的真实测试集上误报绝对数量就会很大,不是
+        # "min=0.000"这种只看缺陷图的口径能测出来的。按零回退纪律立刻回退,默认关。
+        # 代码留opt-in研究件(aoi/gcad_embed.py),真正要用必须先补上正常图假阳性率的
+        # OOF验证,不能只测缺陷图召回这一侧。
+        self.gcad_embed = gcad_embed
+        self._embed_ae = None
+        self._embed_stats = None
+        self._embed_thr = None
 
     @torch.no_grad()
     def _wrn_feats(self, img):
@@ -207,6 +222,9 @@ class CompetitionLargeDetector:
         self._dino = None                                            # DINOv2 图级co-detector(受控)
         if getattr(self, "use_dino_gate", True) and defects:
             self._calibrate_dino_gate(normals, defects)
+        self._embed_ae = None
+        if self.gcad_embed and self._dino is not None:
+            self._calibrate_gcad_embed(normals, defects)
         self._calibrate_latency(normals)                             # 延时预算自适应(评委真机自测自裁)
         return self.threshold
 
@@ -380,6 +398,46 @@ class CompetitionLargeDetector:
         # fit/test漂移(fit缺陷强/test弱),fit侧看不见;守卫触发时反而重标低→pcb图级acc掉0.011。
         # 已撤,守卫类思路对这种"fit侧看不见test漂移"的病理普遍无效(seg_head/component_graph
         # 门控今天也撞了同一堵墙)——真正有效的是"永远融合"这种不依赖fit侧判断的确定性设计。
+
+    def _calibrate_gcad_embed(self, normals, defects):
+        """GCAD-EmbedAE标定(见aoi/gcad_embed.py docstring:已验证净正)。复用DINO门
+        (self._dino)同一次前向顺手缓存的CLS token(last_cls,零增量前向),训一个瓶颈
+        MLP自编码器判整图语义构图对不对。需要self._dino已标定成功才启用。"""
+        import numpy as np
+        self._embed_ae = None
+        if len(normals) < 5:
+            return
+
+        def _cls_of(img):
+            self._dino.score(img)                     # 顺手populate last_cls;fit不计时,可接受
+            return self._dino.last_cls.cpu()
+
+        cls_n = [_cls_of(n) for n in normals]
+        cls_d = [_cls_of(d) for d in defects] if defects else []
+        ae = fit_embed_ae(cls_n, device=self._bb_loc.device)
+        mu, sd = _gcad_calibrate_zscore(ae, cls_n)
+
+        def z(v):
+            return (ae.score(v[None].to(self._bb_loc.device)) - mu) / sd
+
+        zn = [z(c) for c in cls_n]
+        if cls_d:
+            zd = [z(c) for c in cls_d]
+            thr = FewShotAdapter._calibrate(zn, zd)
+        else:
+            thr = float(np.mean(zn) + 3 * np.std(zn))  # 没有缺陷样本时退化为3-sigma
+        self._embed_ae = ae
+        self._embed_stats = (mu, sd)
+        self._embed_thr = thr
+
+    def _embed_score(self, img):
+        """GCAD-EmbedAE的z-score,复用self._dino.last_cls(调用方须保证在predict()/
+        self._dino.score(img)之后调用,否则last_cls是上一张图的、会读错)。"""
+        if self._embed_ae is None or self._dino is None or self._dino.last_cls is None:
+            return -1e9
+        mu, sd = self._embed_stats
+        raw = self._embed_ae.score(self._dino.last_cls[None].to(self._bb_loc.device))
+        return (raw - mu) / sd
 
     def _select_feat_mode(self, defects, defect_masks, normals):
         """留出集(每4取1)对比 单特征 vs 模板差分特征(工业AOI金模板;pcb类刚性件+21%,
@@ -609,7 +667,13 @@ class CompetitionLargeDetector:
                        and getattr(self, "rescue_seg_thr", None) is not None
                        and self.threshold is not None
                        and res["score"] >= g * self.threshold)
-        if not res["is_defect"] and not rescue_zone:
+        # GCAD-EmbedAE OR门:base(EAD+DINO)+灰区补检都判"正常"时才查,独立阈值,只能
+        # 新增覆盖、不改变base原有判定边界(self._dino.last_cls是predict()里self._dino.score()
+        # 同一次前向顺手缓存的,这里直接读,零增量前向)。已验证净正,见aoi/gcad_embed.py。
+        gcad_trigger = (not res["is_defect"] and not rescue_zone
+                        and self._embed_ae is not None
+                        and self._embed_score(img) >= self._embed_thr)
+        if not res["is_defect"] and not rescue_zone and not gcad_trigger:
             res["anomaly_map"] = None; res["mask"] = None; res["boxes"] = []
             return res
         amap = self.segment(img)
@@ -618,6 +682,11 @@ class CompetitionLargeDetector:
         if rescue_zone and float(amap.max()) >= self.rescue_seg_thr:
             res["is_defect"] = True
             res["rescued"] = "seg"
+            raws = res["_raws"] if res["_raws"] is not None else ([res["score"]] + self._aux_raws(img))
+            res["defect_type"] = self._ztype(raws)
+        if gcad_trigger and not res["is_defect"]:
+            res["is_defect"] = True
+            res["rescued"] = "gcad"
             raws = res["_raws"] if res["_raws"] is not None else ([res["score"]] + self._aux_raws(img))
             res["defect_type"] = self._ztype(raws)
         if res["is_defect"]:

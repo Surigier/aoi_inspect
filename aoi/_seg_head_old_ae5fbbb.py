@@ -113,9 +113,10 @@ class SupervisedSegHead:
     (实测 best-IoU 0.263→0.432 +64%,电子件上尤胜 DINOv2)。"""
 
     def __init__(self, device="cuda", steps=300, lr=0.01, neg_per_img=400, seed=0, n_synth=0,
-                 extractor=None, rams_extractor=None):
+                 extractor=None, rams_extractor=None, joint_ensemble=False):
         self.device = device if torch.cuda.is_available() else "cpu"
         self.steps, self.lr, self.neg_per_img, self.seed = steps, lr, neg_per_img, seed
+        self.joint_ensemble = joint_ensemble               # 双头联合训练(见fit()里的分支注释)
         # n_synth 默认0(关):实测合成在同域(赛题场景)可靠掉分-0.02~-0.07,跨域噪声不稳。保留代码opt-in。
         self.n_synth = n_synth
         self.extractor = extractor                         # img(3,H,W)→(C,h,w);None=EAD残差
@@ -214,10 +215,19 @@ class SupervisedSegHead:
         all_idx = list(range(len(feats)))
         # 双头集成(平均logit)替代硬选:实测均值IoU 0.443→0.487四类全涨,消小留出选择方差
         torch.manual_seed(self.seed)
-        lin = self._train_one(self._linear_head(C).to(self.device), feats, gts, all_idx, pos_w)
-        cnv = self._train_one(self._conv_head(C).to(self.device), feats, gts, all_idx, pos_w)
-        self.head = _Ensemble(lin, cnv)
-        self.head_kind = "ensemble"
+        if getattr(self, "joint_ensemble", False):
+            # 联合训练:把_Ensemble当整体训,梯度同时流过两个头让它们协同分工,
+            # 而不是各训各的再拼。零成本改动(推理结构完全不变,还是同一个_Ensemble,
+            # 不碰骨干、不碰图级判定)。验证见seghead_tuning/probe_joint_ensemble.py。
+            self.head = self._train_one(
+                _Ensemble(self._linear_head(C).to(self.device),
+                          self._conv_head(C).to(self.device)), feats, gts, all_idx, pos_w)
+            self.head_kind = "ensemble_joint"
+        else:
+            lin = self._train_one(self._linear_head(C).to(self.device), feats, gts, all_idx, pos_w)
+            cnv = self._train_one(self._conv_head(C).to(self.device), feats, gts, all_idx, pos_w)
+            self.head = _Ensemble(lin, cnv)
+            self.head_kind = "ensemble"
         self._fit_rams(det, defect_imgs, defect_masks, normal_imgs)  # RAMS-R修正支(留出门控)
         self._calibrate_thr(det, defect_imgs, defect_masks)   # 用fit缺陷掩膜标F1最优阈值(含已启用修正)
         return True

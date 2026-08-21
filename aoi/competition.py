@@ -48,8 +48,8 @@ class _EADBranch:
     def __init__(self, **kw):
         self.det = TiledEfficientAD(**kw)
 
-    def fit(self, normals, defects):
-        self.det.fit_fewshot(normals, defects)
+    def fit(self, normals, defects, retrain_student=True):
+        self.det.fit_fewshot(normals, defects, retrain_student=retrain_student)
 
     def score(self, img):
         return self.det._image_score(img)
@@ -176,14 +176,50 @@ class CompetitionLargeDetector:
         s1, s2 = torch.split(f12, (256, 512), dim=0)
         return [s1, s2, f3]
 
-    def fit_fewshot(self, normals, defects, defect_masks=None):
+    def _oof_aux_normal_scores(self, branch, normals, defects):
+        """辅助分支(色彩/尺寸/结构)在正常图上的分布统计,必须用**留出法**算。
+
+        原因(2026-08-21查实):这三个分支都是记忆库结构——fit(normals)把正常图特征
+        存进bank,infer算到bank的最近邻距离。原来的写法是bank用normals建、又拿同一批
+        normals去打分,**正常图在bank里匹配到自己,距离恒为0**:色彩分支实测
+        mean=0/std=0(2维色度数值干净,精确为0),结构分支实测mean=1.97/std=0.35——
+        那不是真实分布,是torch.cdist用矩阵乘法算欧氏距离的数值误差(1536维深度特征
+        数值大,误差显著)。拿这种假统计量做z归一,跨分支完全不可比:结构分支z爆到
+        197、其他分支只有1~7,**类型归属100%误判**(实测hazelnut的crack/cut/hole和
+        pill的color共36张缺陷图,全部判成"缺件/逻辑",一张都没对)。
+
+        2折留出:A半建库打B半、B半建库打A半,收集全部留出分——每张正常图的分都来自
+        "库里没有它自己"的状态,才是真实的正常分布。统计量算完由调用方用全量normals
+        重建生产库,推理质量不受影响。辅助分支很轻(320²、无训练),两次重建成本可忽略。"""
+        n = len(normals)
+        if n < 4:
+            branch.fit(normals, defects)
+            return [branch.score(x) for x in normals]     # 样本太少切不动,退回原行为
+        half = n // 2
+        A, B = normals[:half], normals[half:]
+        branch.fit(A, defects)
+        s_b = [branch.score(x) for x in B]
+        branch.fit(B, defects)
+        s_a = [branch.score(x) for x in A]
+        return s_a + s_b
+
+    def fit_fewshot(self, normals, defects, defect_masks=None, retrain_ead=True):
         """检测由 EAD 核心(branches[0])单独负责;辅助分支只为'类型归属'拟合并估 μ/σ。
         实测从少样本估融合权重不可靠(弱分支overfit→拖垮强EAD),故不做检测层融合。
-        defect_masks:每张缺陷的 (H,W){0,1} 掩膜(赛题迁移图带标注)→ 训监督分割头提定位精度。"""
+        defect_masks:每张缺陷的 (H,W){0,1} 掩膜(赛题迁移图带标注)→ 训监督分割头提定位精度。
+
+        retrain_ead=False:跳过EAD学生重训(其余标定全部照跑)。**仅当没有新增正常图时
+        才允许**——EAD学生只在正常图上训,缺陷图只参与阈值标定,所以操作员反馈漏检
+        (新增缺陷图)时重训学生纯属浪费。用于ActiveLearningLoop的增量反馈,见
+        aoi/active_learning.py。"""
         self.stats = []
-        for b in self.branches:
-            b.fit(normals, defects)
-            ns = [b.score(x) for x in normals]
+        for i, b in enumerate(self.branches):
+            if i == 0:
+                b.fit(normals, defects, retrain_student=retrain_ead)
+                ns = [b.score(x) for x in normals]        # EAD是训出来的学生,不是记忆库,无自匹配问题
+            else:
+                ns = self._oof_aux_normal_scores(b, normals, defects)
+                b.fit(normals, defects)                   # 生产库用全量normals重建(留出只为算统计量)
             m = sum(ns) / len(ns)
             s = (sum((x - m) ** 2 for x in ns) / len(ns)) ** 0.5
             self.stats.append((m, s))
@@ -793,3 +829,79 @@ class CompetitionLargeDetector:
         if getattr(self, "_dino", None) is not None:
             return self._dino_thr
         return self.threshold
+
+    def explain(self, img):
+        """回溯检测逻辑(赛题"用户反馈驱动的优化"明确要求"系统应能回溯检测逻辑"):
+        把这张图走过的完整判定链路摊开——每个分支的原始分、标准化后的z分、生效的
+        阈值、是哪一步做出的判定、缺陷类型怎么定的、掩膜经过哪些精化模块。
+
+        **不在热路径上**:locate()一行未改,explain()是操作员事后复盘时才调用的冷
+        路径(单独重算一遍),不占200ms预算。返回纯python字典,可直接json化给前端/
+        报告用。"""
+        import numpy as np
+        if torch.cuda.is_available() and img.device.type == "cpu":
+            img = img.to(self._bb_loc.device)
+        trace = {}
+
+        # ① 图级检测:EAD核心分(唯一无条件算的检测层)
+        ead_raw = float(self.branches[0].score(img))
+        trace["ead"] = {"raw": ead_raw, "threshold": self.threshold,
+                        "超阈值": bool(self.threshold is not None and ead_raw >= self.threshold)}
+
+        # ② DINO门(默认永远融合):max(z_EAD, z_DINO)联合判定
+        if getattr(self, "_dino", None) is not None:
+            dino_raw = float(self._dino.score(img))
+            emu, esd, dmu, dsd = self._dino_stats
+            z_ead, z_dino = (ead_raw - emu) / esd, (dino_raw - dmu) / dsd
+            fused = float(self._dino_fuse(ead_raw, dino_raw))
+            trace["dino"] = {"raw": dino_raw, "z_ead": float(z_ead), "z_dino": float(z_dino),
+                             "fused(取大)": fused, "threshold": float(self._dino_thr),
+                             "谁主导": "DINO" if z_dino > z_ead else "EAD"}
+            is_def = fused >= self._dino_thr
+            trace["图级判定依据"] = "EAD+DINO融合门"
+        else:
+            is_def = bool(self.threshold is not None and ead_raw >= self.threshold)
+            trace["dino"] = None
+            trace["图级判定依据"] = "纯EAD(DINO门未启用)"
+        trace["图级判定"] = bool(is_def)
+
+        # ③ 灰区补检 / GCAD OR门(两条可能翻正的救援路径,如果启用)
+        g = getattr(self, "rescue_gray", None)
+        if not is_def and g is not None and getattr(self, "rescue_seg_thr", None) is not None \
+                and self.threshold is not None:
+            in_zone = ead_raw >= g * self.threshold
+            trace["灰区补检"] = {"处于灰区": bool(in_zone), "灰区系数g": float(g),
+                                 "灰区下界": float(g * self.threshold)}
+        if not is_def and self._embed_ae is not None:
+            z_emb = float(self._embed_score(img))
+            trace["GCAD语义OR门"] = {"z": z_emb, "threshold": float(self._embed_thr),
+                                      "独立触发": bool(z_emb >= self._embed_thr)}
+
+        # ④ 缺陷类型归属(3路辅助分支z分竞争,最高者定类型)
+        if is_def:
+            raws = [ead_raw] + self._aux_raws(img)
+            zs = [float(znorm(r, m, s)) for r, (m, s) in zip(raws, self.stats)]
+            trace["类型归属"] = {
+                "各分支z分": {b.defect_type: z for b, z in zip(self.branches, zs)},
+                "判定类型": self.branches[int(np.argmax(zs))].defect_type,
+            }
+
+        # ⑤ 定位链路:掩膜依次经过哪些模块(只有判缺陷才走)
+        o = self.locate(img)
+        trace["定位"] = {
+            "像素阈值": float(self.pix_thr) if self.pix_thr is not None else None,
+            "分割头": "监督头(有掩膜训练)" if self.seg_head.head is not None else "回退EAD无监督异常图",
+            "特征模式": getattr(self, "feat_mode", "single"),
+            "精化模块": [n for n, on in [("roi_zoom", self.roi_zoom),
+                                          ("SAM边界精化", self.sam is not None),
+                                          ("crop级联", self.crop_cascade is not None),
+                                          ("组件图", self.comp_graph is not None)] if on],
+            "输出框数": len(o.get("boxes") or []),
+            "掩膜前景像素": int(o["mask"].sum()) if o.get("mask") is not None else 0,
+        }
+        trace["最终判定"] = {"is_defect": bool(o["is_defect"]),
+                             "defect_type": o["defect_type"],
+                             "救援路径": o.get("rescued")}
+        # 延时自适应把哪些模块裁掉了(评委真机上会影响判定链,必须可回溯)
+        trace["延时自适应裁剪"] = list(getattr(self, "lat_trimmed", []) or [])
+        return trace

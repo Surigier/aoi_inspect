@@ -32,11 +32,18 @@ class TiledEfficientAD:
     def _tiles(self, img):
         return list(make_tiles(img, self.tile, self.stride)[0])
 
-    def fit_fewshot(self, normals, defects):
-        norm_tiles = []
-        for im in normals:
-            norm_tiles.extend(self._tiles(im))
-        self.det.fit_fewshot(norm_tiles, None)          # 训学生于所有正常块
+    def fit_fewshot(self, normals, defects, retrain_student=True):
+        """retrain_student=False:跳过学生训练,只重标阈值。
+        依据:学生只在正常块上训(下面这行传的是norm_tiles和None),缺陷图**只参与
+        阈值标定**——所以操作员反馈的是缺陷图(漏检)时,重训学生纯属浪费:实测学生
+        训练占整个fit_fewshot的绝大部分耗时(~17-20分钟),跳过后反馈只需秒级到分钟级,
+        这是"实时反馈"能不能成立的关键。新增的是正常图(误检反馈)时必须重训(有新
+        正常数据),调用方负责判断。"""
+        if retrain_student:
+            norm_tiles = []
+            for im in normals:
+                norm_tiles.extend(self._tiles(im))
+            self.det.fit_fewshot(norm_tiles, None)      # 训学生于所有正常块
         ns = [self._image_score(im) for im in normals]
         ds = [self._image_score(im) for im in defects]
         self.threshold = FewShotAdapter._calibrate(ns, ds)

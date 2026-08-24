@@ -1,17 +1,21 @@
 """AOI 质检交互 Demo:python scripts/demo_app.py data/mvtec/bottle
 检测(热力图+判决)→ 操作员标注 → 一键提交反馈即在线学习并重检(实时纠错演示)。
-ensemble = 纹理(记忆库)+ 结构(位置感知)+ 判别头(监督)。"""
+
+跑的是**生产检测器** CompetitionLargeDetector 本体,不是另搭一套简化管线。
+唯一的让步是 train_steps 调小(见 DEMO_STEPS):生产默认 10000 步一次 fit 约 20 分钟,
+每点一次反馈还要再等一次重拟合,交互演示等不起。**精度数字一律以成绩单脚本为准,
+不要拿这个 Demo 的表现说事。**"""
 import sys
 import numpy as np
 import torch
 import gradio as gr
-from aoi.backbone import Backbone
-from aoi.ensemble import default_adapter
+from aoi.competition import CompetitionLargeDetector
 from aoi.active_learning import ActiveLearningLoop
 from aoi.viz import overlay_heatmap
 from eval.mvtec import load_category
 
 LOOP = None
+DEMO_STEPS = 400        # 仅为交互流畅;生产是 10000(见模块 docstring)
 
 
 def _to_tensor(pil):
@@ -19,18 +23,22 @@ def _to_tensor(pil):
     return torch.from_numpy(arr).permute(2, 0, 1)
 
 
-def _verdict_md(r, is_def):
-    head = "## 🔴 判定:缺陷" if is_def else "## 🟢 判定:正常"
-    return f"{head}\n\n异常分 **{r.score:.3f}** / 阈值 {LOOP.adapter.threshold:.3f} · 类型:{r.defect_type}"
+def _verdict_md(o):
+    head = "## 🔴 判定:缺陷" if o["is_defect"] else "## 🟢 判定:正常"
+    thr = LOOP.adapter.threshold
+    line = f"{head}\n\n异常分 **{o['score']:.3f}** / 阈值 {thr:.3f} · 类型:{o['defect_type']}"
+    if o["is_defect"] and o.get("boxes"):
+        line += f" · 检测框 {len(o['boxes'])} 个"
+    return line
 
 
 def predict_fn(pil):
     if pil is None:
         return None, "### 请先上传图片"
     t = _to_tensor(pil)
-    r, is_def = LOOP.predict(t.unsqueeze(0))
-    overlay = overlay_heatmap(t, r.anomaly_map) if r.anomaly_map is not None else pil
-    return overlay, _verdict_md(r, is_def)
+    o = LOOP.adapter.locate(t)                      # 生产推理入口(热力图/掩膜/框全在这)
+    overlay = overlay_heatmap(t, o["anomaly_map"]) if o.get("anomaly_map") is not None else pil
+    return overlay, _verdict_md(o)
 
 
 def feedback_fn(pil, actual):
@@ -47,14 +55,15 @@ def main(root):
     global LOOP
     data = load_category(root)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    bb = Backbone(pretrained=True, device=device)
-    LOOP = ActiveLearningLoop(default_adapter(bb), data["train_normal"][:100], data["test_defect"][:30])
+    det = CompetitionLargeDetector(device=device, train_steps=DEMO_STEPS)
+    print("正在做少样本现场迁移(100 正常 + 30 缺陷),首次启动需要几分钟…", flush=True)
+    LOOP = ActiveLearningLoop(det, data["train_normal"][:100], data["test_defect"][:30])
 
     with gr.Blocks(title="AOI 实时质检") as demo:
         gr.Markdown(
             "# 🔍 AOI 实时在线 AI 质检 Demo\n"
-            "纹理(记忆库)+ 结构(位置感知缺件)+ 判别头(监督)三分支融合 · "
-            "少样本现场迁移 · **操作员反馈→在线调整模型参数**"
+            "EfficientAD + DINOv2 双判据检测 · 监督分割头 + SAM 精化定位 · "
+            "VLM 蒸馏的缺陷类型归属 · **操作员反馈 → 在线更新(误检/漏检都走实时快路径)**"
         )
         with gr.Row():
             with gr.Column(scale=1):

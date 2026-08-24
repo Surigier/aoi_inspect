@@ -74,7 +74,7 @@ class CompetitionLargeDetector:
     def __init__(self, device="cuda", aux_size=320, train_steps=10000, seg_eval_hw=(256, 256),
                  compile_infer=False, sam_refine=True, roi_zoom=False, seg_in=512, rams=False,
                  ead_students=2, crop_cascade=False, comp_graph=False, boundary_refine=False,
-                 tta=False, gcad_embed=False, joint_ensemble=True):
+                 tta=False, gcad_embed=False, joint_ensemble=True, use_vlm_type=True):
         # ead_students=2:多种子EAD学生集成(检测分,教师共享)。实测工作类方差收窄~2×、
         # 现场一次fit下限+0.012、均值零代价;fit不计时训练免费,推理+一次学生前向(延时待验)。
         # rams 默认关:RAMS-R残差注意力修正支隔离探针+0.013~0.033(3/4类),但生产全管线实测净平
@@ -91,6 +91,8 @@ class CompetitionLargeDetector:
             _AuxBranch(StructuralADBranch(backbone=bb, grid_size=16), "缺件/逻辑", aux_size),
         ]
         self.aux_size = aux_size
+        self.use_vlm_type = use_vlm_type
+        self.type_head = None       # VLM监督的类型归属头,fit期建;不可用则保持None走_ztype
         self.stats = []
         self.weights = []
         self.threshold = None
@@ -155,12 +157,19 @@ class CompetitionLargeDetector:
     @torch.no_grad()
     def _wrn_feats(self, img):
         """img(3,H,W)[0,1] → WRN50 浅层(1,2)特征 (C,128,128)。
-        先搬 GPU 再下采样(大图 CPU interpolate 慢),再提特征(~8ms)。"""
+        先搬 GPU 再下采样(大图 CPU interpolate 慢),再提特征(~8ms)。
+        单次locate()内缓存:seg_head和VLM类型头都要这份特征,不缓存就是两次前向(+9ms)。
+        缓存在locate()入口显式清空——不靠data_ptr判等(张量释放后地址会被复用,
+        可能撞上假命中),只保证"同一次locate内有效"。"""
+        if getattr(self, "_wrn_cache", None) is not None:
+            return self._wrn_cache
         if img.dim() == 3:
             img = img.unsqueeze(0)
         img = img.to(self._bb_loc.device)
         img = F.interpolate(img, size=(self._seg_in, self._seg_in), mode="bilinear", align_corners=False)
-        return self._bb_loc.extract(img)[0]
+        out = self._bb_loc.extract(img)[0]
+        self._wrn_cache = out
+        return out
 
     @torch.no_grad()
     def _rams_scales(self, img):
@@ -236,6 +245,14 @@ class CompetitionLargeDetector:
             self.seg_head.fit(self._eff(), d_imgs, d_masks, normals[:30])
             self._calibrate_boxes(defects, defect_masks)             # fit标定碎框合并距离
         self._calibrate_pixel(normals)
+        # VLM监督的类型归属头:fit期(不计时)用VLM给缺陷图打5类标签,蒸馏成质心分类器。
+        # 推理期零API/零外网。VLM不可用时fit()返回False,type_head保持None,自动走_ztype启发式。
+        self.type_head = None
+        if defect_masks is not None and self.use_vlm_type:
+            from .type_head import VLMTypeHead
+            th = VLMTypeHead()
+            if th.fit(self, normals, list(defects), list(defect_masks)):
+                self.type_head = th
         self.boundary_refiner = None
         if defect_masks is not None and self.use_boundary_refine:
             from .boundary_refine import BoundaryRefiner
@@ -706,6 +723,7 @@ class CompetitionLargeDetector:
         延时热路径:EAD/DINO判正常且不处于救援灰区→立即返回,不算WRN分割/SAM/crop级联
         (它们只有判缺陷才有意义,正常图是生产大多数,省的是主要延时)。"""
         import numpy as np
+        self._wrn_cache = None                  # 每张图进来先清,保证WRN特征缓存不跨图
         if torch.cuda.is_available() and img.device.type == "cpu":
             img = img.to(self._bb_loc.device)   # 单次H2D上传:下游EAD/DINO/WRN/aux的.to()全变no-op
         res = self.predict(img)
@@ -753,6 +771,13 @@ class CompetitionLargeDetector:
             from .seg_head import merge_boxes
             boxes = map_to_boxes(mask.astype(np.float32), 0.5, min_area_frac=0.0002, close=0)
             res["boxes"] = merge_boxes(boxes, getattr(self, "box_merge_d", 0))
+            # VLM监督的类型头(fit期蒸馏,推理零API)。它要掩膜才能算位置匹配特征,
+            # 所以只能放在掩膜产出之后;不可用时res["defect_type"]保持_ztype的启发式结果。
+            th = getattr(self, "type_head", None)
+            if th is not None and th.ready:
+                t = th.predict(self, img, mask, res.get("_raws"))
+                if t is not None:
+                    res["defect_type"] = t
         else:
             res["mask"] = None
             res["boxes"] = []

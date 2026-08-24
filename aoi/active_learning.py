@@ -1,13 +1,19 @@
 class ActiveLearningLoop:
-    """主动学习闭环:维护正常/缺陷样本集,操作员反馈后重跑少样本适配
-    (记忆库方法无需梯度训练,重建库 + 重标定阈值即完成在线更新)。
+    """主动学习闭环:维护正常/缺陷样本集,操作员反馈后重跑少样本适配。
+
+    **只服务一种适配器契约**——生产的 CompetitionLargeDetector:
+
+        fit_fewshot(normals, defects, defect_masks=None, retrain_ead=True)
+
+    早期版本为了同时兼容旧的纯记忆库适配器,在 _refit 里按参数有无拼 kwargs。那套
+    分支在"两条反馈路都改走快路径"之后就失效了(每次都会传 retrain_ead,旧适配器
+    直接 TypeError),而且它掩盖了一个事实:本闭环的实测结论(快路径耗时1193s→251s、
+    误检反馈快路径边距+0.326优于完整路径+0.269)全部是在 CompetitionLargeDetector
+    上测的,换个适配器这些结论一条都不成立。所以这里不做适配,只认一种契约——
+    交付物里只留一条真实路径。
 
     defect_masks 可选:传入后与 defect_images 一一对应增长,反馈时若带掩膜就一并
-    append,调用 adapter.fit_fewshot(normals, defects, defect_masks=masks)——这样
-    同一个类兼容两种 adapter:旧的纯记忆库(fit_fewshot(normals, defects))和现在
-    生产用的 CompetitionLargeDetector(fit_fewshot(normals, defects, defect_masks=...),
-    训监督分割头/SAM/crop_cascade/component_graph等全部OOF门控子模块)。不传
-    defect_masks 时行为与之前完全一致(向后兼容,原有测试不用改)。"""
+    append,一路带进 fit_fewshot 去训监督分割头/SAM/crop_cascade 等 OOF 门控子模块。"""
 
     def __init__(self, adapter, normal_images, defect_images, defect_masks=None):
         self.adapter = adapter
@@ -17,18 +23,14 @@ class ActiveLearningLoop:
         self._refit()
 
     def _refit(self, retrain_ead=True):
-        """retrain_ead=False:跳过EAD学生重训(见下面feedback()的说明)。只有生产
-        CompetitionLargeDetector支持这个参数,旧的纯记忆库adapter不认——所以只在
-        真的要跳过时才传,默认路径的调用签名和以前一字不差(向后兼容)。"""
-        kw = {}
-        if self.masks is not None:
-            kw["defect_masks"] = self.masks
-        if not retrain_ead:
-            kw["retrain_ead"] = False
-        self.adapter.fit_fewshot(self.normals, self.defects, **kw)
+        """retrain_ead=False:跳过EAD学生重训(依据见下面 feedback() 的说明)。
+        无条件按生产契约调用,不做任何签名探测。"""
+        self.adapter.fit_fewshot(self.normals, self.defects,
+                                 defect_masks=self.masks, retrain_ead=retrain_ead)
 
     def predict(self, image):
-        """image: (1,3,H,W) -> (BranchResult, is_defect)"""
+        """image: (1,3,H,W) -> CompetitionLargeDetector.predict() 的判决字典
+        (score / is_defect / defect_type / _raws)。要像素图和检测框用 adapter.locate()。"""
         return self.adapter.predict(image)
 
     def feedback(self, image, is_defect, mask=None):

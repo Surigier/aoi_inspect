@@ -83,7 +83,6 @@ class VLMTypeHead:
         for x in ref:
             c, g = _shallow_maps(x)
             self._ref_chroma.append(c); self._ref_grad.append(g)
-            det._wrn_cache = None                              # fit期逐张换图,必须清掉locate用的单图缓存
             f = det._wrn_feats(x)                              # (768,128,128)
             deep.append(F.interpolate(f[None], size=(DEEP_G, DEEP_G), mode="area")[0].cpu())
         self._ref_chroma = torch.stack(self._ref_chroma)       # (R,2,SZ,SZ)
@@ -121,7 +120,6 @@ class VLMTypeHead:
         for img, mk, lab in zip(defects, defect_masks, labels):
             if lab is None:                                    # 单张标注失败就跳过这张,不拖垮整体
                 continue
-            det._wrn_cache = None                              # 同上:fit期不能复用上一张图的WRN特征
             X.append(self._feat(det, img, mk)); y.append(lab)
         if not y:
             return False

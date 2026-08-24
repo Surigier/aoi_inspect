@@ -158,18 +158,19 @@ class CompetitionLargeDetector:
     def _wrn_feats(self, img):
         """img(3,H,W)[0,1] → WRN50 浅层(1,2)特征 (C,128,128)。
         先搬 GPU 再下采样(大图 CPU interpolate 慢),再提特征(~8ms)。
-        单次locate()内缓存:seg_head和VLM类型头都要这份特征,不缓存就是两次前向(+9ms)。
-        缓存在locate()入口显式清空——不靠data_ptr判等(张量释放后地址会被复用,
-        可能撞上假命中),只保证"同一次locate内有效"。"""
-        if getattr(self, "_wrn_cache", None) is not None:
-            return self._wrn_cache
+
+        **不要在这里加"单次locate内缓存"。** 曾为了让seg_head和类型头共用一次前向
+        (省9ms)加过一个只在locate()入口清空的缓存,结果是灾难性的:seg_head.fit()
+        会在**fit期**逐张调用本函数,而fit期没有locate()来清缓存——于是30张缺陷图
+        全部拿到第一张的特征,配上各自不同的掩膜去训分割头,训出来的头是垃圾。
+        表现为图级acc几乎不变(不依赖掩膜)但IoU/框命中塌到接近零
+        (phone_battery IoU 0.399→0.033、框命中0.550→0.013)。
+        省的9ms在200ms预算里毫无意义,风险与收益完全不成比例。"""
         if img.dim() == 3:
             img = img.unsqueeze(0)
         img = img.to(self._bb_loc.device)
         img = F.interpolate(img, size=(self._seg_in, self._seg_in), mode="bilinear", align_corners=False)
-        out = self._bb_loc.extract(img)[0]
-        self._wrn_cache = out
-        return out
+        return self._bb_loc.extract(img)[0]
 
     @torch.no_grad()
     def _rams_scales(self, img):
@@ -723,7 +724,6 @@ class CompetitionLargeDetector:
         延时热路径:EAD/DINO判正常且不处于救援灰区→立即返回,不算WRN分割/SAM/crop级联
         (它们只有判缺陷才有意义,正常图是生产大多数,省的是主要延时)。"""
         import numpy as np
-        self._wrn_cache = None                  # 每张图进来先清,保证WRN特征缓存不跨图
         if torch.cuda.is_available() and img.device.type == "cpu":
             img = img.to(self._bb_loc.device)   # 单次H2D上传:下游EAD/DINO/WRN/aux的.to()全变no-op
         res = self.predict(img)

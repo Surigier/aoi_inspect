@@ -30,11 +30,17 @@ CATS = ["phone_battery", "sim_card_set", "pcb",           # 赛题隐藏域直�
 OUT = Path("_logs/scorecard_realiad12.json")
 
 
-def main(cats):
+def main(cats, fresh=False):
+    """fresh=True 强制重算,忽略续跑缓存。
+
+    **续跑缓存必须能被强制绕过**:它曾在一次"验证修复是否生效"的运行里静默重放了
+    修复前的陈旧结果("已有结果,跳过"),导致把"修复无效"当成结论、并据此白查了
+    两轮不存在的"运行间不确定性"。缓存对续跑是好事,对验证是陷阱。"""
     torch.manual_seed(0)
-    print(f"=== Real-IAD {len(cats)}类目成绩单(竞赛口径,无AUROC)===", flush=True)
+    print(f"=== Real-IAD {len(cats)}类目成绩单(竞赛口径,无AUROC)==="
+          + ("  [--fresh 强制重算]" if fresh else ""), flush=True)
     OUT.parent.mkdir(exist_ok=True)
-    done = json.loads(OUT.read_text()) if OUT.exists() else {}
+    done = {} if fresh else (json.loads(OUT.read_text()) if OUT.exists() else {})
     for c in cats:
         if c in done:
             print(f"{c:18s} 已有结果,跳过", flush=True)
@@ -63,4 +69,5 @@ def main(cats):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:] or CATS)
+    args = [a for a in sys.argv[1:] if a != "--fresh"]
+    main(args or CATS, fresh="--fresh" in sys.argv)

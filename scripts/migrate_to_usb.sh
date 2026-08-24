@@ -8,11 +8,15 @@
 # 代码不走U盘走GitHub(仓库干净、~3MB、还是交付物本体)。U盘只带GitHub装不下的:
 # 331MB的DINOv2权重超了GitHub单文件100MB上限,以及数据集。
 #
-# 用法:  bash scripts/migrate_to_usb.sh /media/srj/U盘挂载点
-#        bash scripts/migrate_to_usb.sh /mnt/e --min      # 只带Real-IAD,约2.4G
+# 用法:
+#   U盘:   bash scripts/migrate_to_usb.sh /media/srj/U盘挂载点 [--min]
+#   直连:  bash scripts/migrate_to_usb.sh srj@2070主机:/home/srj/yolo/aoi_inspect [--min]
+#
+# **两台机器网络能通就走直连**,比U盘省一次拷贝,而且rsync断了能续传(--partial)。
+# 目标带冒号自动走ssh(rsync原生支持),不带冒号当本地路径。
 
 set -euo pipefail
-DST="${1:?用法: bash scripts/migrate_to_usb.sh <U盘路径> [--min]}"
+DST="${1:?用法: bash scripts/migrate_to_usb.sh <U盘路径 或 user@host:/远端路径> [--min]}"
 MIN="${2:-}"
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$DST/aoi_payload"
@@ -35,19 +39,30 @@ if [ "$MIN" != "--min" ]; then
   )
 fi
 
+case "$DST" in
+  *:*) OUT="$DST"; REMOTE=1 ;;          # user@host:/path → 直接落到远端仓库根,不套aoi_payload
+  *)   REMOTE=0 ;;
+esac
 echo "源: $SRC"
-echo "目标: $OUT"
+echo "目标: $OUT   $([ "${REMOTE:-0}" = 1 ] && echo '(ssh直连)' || echo '(本地/U盘)')"
 [ "$MIN" = "--min" ] && echo "模式: 精简(只够跑Real-IAD成绩单)" || echo "模式: 完整"
 echo
-mkdir -p "$OUT"
+[ "${REMOTE:-0}" = 0 ] && mkdir -p "$OUT"
 for it in "${ITEMS[@]}"; do
   if [ ! -e "$SRC/$it" ]; then echo "跳过(不存在): $it"; continue; fi
   echo "→ $it  ($(du -sh "$SRC/$it" | cut -f1))"
-  mkdir -p "$OUT/$(dirname "$it")"
-  rsync -a --info=progress2 "$SRC/$it" "$OUT/$(dirname "$it")/"
+  d="$(dirname "$it")"
+  if [ "${REMOTE:-0}" = 1 ]; then
+    rsync -az --partial --info=progress2 \
+          --rsync-path="mkdir -p '${OUT#*:}/$d' && rsync" \
+          "$SRC/$it" "$OUT/$d/"
+  else
+    mkdir -p "$OUT/$d"
+    rsync -a --info=progress2 "$SRC/$it" "$OUT/$d/"
+  fi
 done
 echo
-echo "完成。总计: $(du -sh "$OUT" | cut -f1)"
+[ "${REMOTE:-0}" = 0 ] && echo "完成。总计: $(du -sh "$OUT" | cut -f1)" || echo "完成(已直接落到远端仓库)。"
 cat <<'TIP'
 
 === 到 2070 那台机器上怎么装回去 ===

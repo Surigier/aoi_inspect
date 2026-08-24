@@ -7,7 +7,26 @@
 按图尺寸自动路由:长边≥1024 → 大图混合(全局5分支@320 + 局部ResNet18分块);否则常规 resize。"""
 import argparse
 import csv
+import os
 from pathlib import Path
+
+# ── 离线权重(必须在 import torch/timm 之前)────────────────────────────────
+# WRN50 定位骨干与 DINOv2 图级门的权重是 timm 在**运行时**从 HuggingFace 拉的,
+# models/ 里只带了 EAD 教师和 MobileSAM。评委机器若无外网,会直接抛
+# LocalEntryNotFoundError 起不来——不是精度掉一点,是一行跑不了。
+# (这不是推测:把仓库迁到一台内网机器时真实触发过。)
+#
+# 实测**只设缓存目录不够**:无网时 SSL 错误会直接上抛,缓存里明明有权重也不回落,
+# 还白等 56 秒重试。所以必须同时强制 HF_HUB_OFFLINE。
+# 用 setdefault 而不是直接赋值:有外网、又想跑 --zeroshot(CLIP 权重不在包里)的人
+# 可以用 HF_HUB_OFFLINE=0 覆盖。
+# 权重包由 scripts/pack_offline_weights.py 生成,不进 git(单 blob 264MB,超 GitHub
+# 单文件 100MB 上限),随交付包分发。
+_HF_BUNDLE = Path(__file__).resolve().parent / "models" / "hf_cache"
+if _HF_BUNDLE.is_dir():
+    os.environ.setdefault("HF_HUB_CACHE", str(_HF_BUNDLE))
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
 import torch
 from aoi.backbone import Backbone
 from aoi.ensemble import default_adapter

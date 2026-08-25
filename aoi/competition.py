@@ -41,6 +41,65 @@ def _down(img, size):
     return F.interpolate(img, size=(size, size), mode="bilinear", align_corners=False)
 
 
+def _fit_modes(C, en, dn, kmax=4, seed=0):
+    """把正常图的CLS向量聚成K个模态,每个模态存中心和该模态的(EAD/DINO)分数统计量。
+    K的选法:从2到kmax试,取"模态内分数方差之和"下降最明显的那个;若K=1已经足够
+    (下降不到20%),返回None表示不分模态——**单一产品时必须退回原行为**。"""
+    import numpy as np
+    X = torch.nn.functional.normalize(C.float(), dim=1)
+    base = float(np.var(en) + np.var(dn))
+    best = None
+    for k in range(2, min(kmax, len(X) // 8) + 1):
+        lab = _kmeans(X, k, seed)
+        if min((lab == j).sum() for j in range(k)) < 5:      # 有簇太小 → 不可靠
+            continue
+        wv = sum(float(np.var(en[lab == j]) + np.var(dn[lab == j])) * (lab == j).sum()
+                 for j in range(k)) / len(X)
+        if best is None or wv < best[1]:
+            best = (k, wv, lab)
+    if best is None or best[1] > 0.8 * base:                 # 分模态没带来明显收益 → 不分
+        return None
+    k, _, lab = best
+    modes = []
+    for j in range(k):
+        m = lab == j
+        modes.append(dict(c=X[torch.from_numpy(m)].mean(0),
+                          emu=float(en[m].mean()), esd=float(en[m].std() + 1e-9),
+                          dmu=float(dn[m].mean()), dsd=float(dn[m].std() + 1e-9),
+                          n=int(m.sum())))
+    return modes
+
+
+def _kmeans(X, k, seed=0, iters=30):
+    import numpy as np
+    g = torch.Generator().manual_seed(seed)
+    idx = torch.randperm(len(X), generator=g)[:k]
+    C = X[idx].clone()
+    lab = np.zeros(len(X), dtype=int)
+    for _ in range(iters):
+        d = torch.cdist(X, C)
+        new = d.argmin(1).numpy()
+        if (new == lab).all():
+            break
+        lab = new
+        for j in range(k):
+            if (lab == j).any():
+                C[j] = X[torch.from_numpy(lab == j)].mean(0)
+    return lab
+
+
+def _assign_mode(cls_vec, modes):
+    """测试图归到最近的模态(用DINO的CLS,推理期零增量前向)。"""
+    if len(modes) == 1 or modes[0]["c"] is None:
+        return 0
+    v = torch.nn.functional.normalize(cls_vec.float()[None], dim=1)[0]
+    return int(max(range(len(modes)), key=lambda j: float(v @ modes[j]["c"])))
+
+
+def _mode_z(e, d, m):
+    return max((e - m["emu"]) / m["esd"], (d - m["dmu"]) / m["dsd"])
+
+
 class _EADBranch:
     """EfficientAD 核心(整图卷积),映射到'外观缺陷'(一般异常的默认归类)。"""
     defect_type = "外观缺陷"
@@ -74,7 +133,7 @@ class CompetitionLargeDetector:
     def __init__(self, device="cuda", aux_size=320, train_steps=10000, seg_eval_hw=(256, 256),
                  compile_infer=False, sam_refine=True, roi_zoom=False, seg_in=512, rams=False,
                  ead_students=2, crop_cascade=False, comp_graph=False, boundary_refine=False,
-                 tta=False, gcad_embed=False, joint_ensemble=True, use_vlm_type=True):
+                 tta=False, gcad_embed=False, joint_ensemble=True, use_vlm_type=True, per_mode_gate=False, seg_gate=False):
         # ead_students=2:多种子EAD学生集成(检测分,教师共享)。实测工作类方差收窄~2×、
         # 现场一次fit下限+0.012、均值零代价;fit不计时训练免费,推理+一次学生前向(延时待验)。
         # rams 默认关:RAMS-R残差注意力修正支隔离探针+0.013~0.033(3/4类),但生产全管线实测净平
@@ -92,6 +151,8 @@ class CompetitionLargeDetector:
         ]
         self.aux_size = aux_size
         self.use_vlm_type = use_vlm_type
+        self.seg_gate = seg_gate             # 用分割图当图级判据(见_calibrate_seg_gate),默认关
+        self.per_mode_gate = per_mode_gate   # 正常图分模态标定阈值(见_calibrate_dino_gate),默认关,验证后再开
         self.type_head = None       # VLM监督的类型归属头,fit期建;不可用则保持None走_ztype
         self.stats = []
         self.weights = []
@@ -286,6 +347,9 @@ class CompetitionLargeDetector:
         self._dino = None                                            # DINOv2 图级co-detector(受控)
         if getattr(self, "use_dino_gate", True) and defects:
             self._calibrate_dino_gate(normals, defects)
+        self._seg_gate = None
+        if self.seg_gate and defect_masks is not None and self.seg_head.head is not None:
+            self._calibrate_seg_gate(normals, defects)
         self._embed_ae = None
         if self.gcad_embed and self._dino is not None:
             self._calibrate_gcad_embed(normals, defects)
@@ -446,22 +510,84 @@ class CompetitionLargeDetector:
         ead = self.branches[0]
         gate = DinoGate(device=self._bb_loc.device)
         gate.build(normals[:40])
-        en = np.array([ead.score(n) for n in normals]); dn = np.array([gate.score(n) for n in normals])
-        ed = np.array([ead.score(d) for d in defects]); dd = np.array([gate.score(d) for d in defects])
-        # 全fit标定两门标准化+联合阈值(不再有CV开关决策,永远启用)
-        emu, esd = en.mean(), en.std() + 1e-9
-        dmu, dsd = dn.mean(), dn.std() + 1e-9
-        fz2 = lambda e, d: max((e - emu) / esd, (d - dmu) / dsd)
+        en, dn, cn = [], [], []
+        for n in normals:
+            en.append(ead.score(n)); dn.append(gate.score(n))
+            cn.append(gate.last_cls.detach().cpu())        # score()顺手缓存的CLS,零增量前向
+        ed, dd, cd = [], [], []
+        for d in defects:
+            ed.append(ead.score(d)); dd.append(gate.score(d))
+            cd.append(gate.last_cls.detach().cpu())
+        en = np.array(en); dn = np.array(dn); ed = np.array(ed); dd = np.array(dd)
+
+        # ---- 正常样本的模态划分(per-mode 阈值)----
+        # 为什么需要:此前全体正常图共用一套(均值,方差)。当那100张正常图里混了多个
+        # 产品/型号/批次时,"正常"的分数范围被拉得极宽,z归一化就失去意义——实测混三个
+        # 手机部件类目做fit时,**30张缺陷的分数全部落在正常区间内**(重叠30/30),
+        # 平衡准确率只有0.64,图级判据几乎失效。
+        # 做法:用DINO的CLS把正常图聚成K个模态,每个模态各自统计(均值,方差);推理时
+        # 测试图先归到最近的模态,再用**那个模态**的统计量做z归一化。
+        # **退化干净**:正常图本来就是单一产品时K=1,行为与改动前逐位一致。
+        self._modes = None
+        if self.per_mode_gate and len(normals) >= 30:
+            self._modes = _fit_modes(torch.stack(cn), en, dn)
+        if self._modes is not None:
+            k_n = [_assign_mode(c, self._modes) for c in cn]
+            k_d = [_assign_mode(c, self._modes) for c in cd]
+            zn = [float(_mode_z(en[i], dn[i], self._modes[k_n[i]])) for i in range(len(en))]
+            zd = [float(_mode_z(ed[i], dd[i], self._modes[k_d[i]])) for i in range(len(ed))]
+            print(f"!! per-mode门: 正常图聚出{len(self._modes)}个模态 "
+                  f"{[m['n'] for m in self._modes]}", flush=True)
+        else:
+            emu, esd = en.mean(), en.std() + 1e-9
+            dmu, dsd = dn.mean(), dn.std() + 1e-9
+            self._modes = [dict(c=None, emu=emu, esd=esd, dmu=dmu, dsd=dsd, n=len(en))]
+            zn = [float(max((e - emu) / esd, (d - dmu) / dsd)) for e, d in zip(en, dn)]
+            zd = [float(max((e - emu) / esd, (d - dmu) / dsd)) for e, d in zip(ed, dd)]
+        m0 = self._modes[0]
+        emu, esd, dmu, dsd = m0["emu"], m0["esd"], m0["dmu"], m0["dsd"]
+        fz2 = lambda e, d: max((e - emu) / esd, (d - dmu) / dsd)   # 兼容explain()等只取单套统计量的调用
         self._dino = gate
         self._dino_stats = (emu, esd, dmu, dsd)
         self._dino_fuse = fz2
-        self._dino_thr = FewShotAdapter._calibrate(
-            [float(max((e - emu) / esd, (d - dmu) / dsd)) for e, d in zip(en, dn)],
-            [float(max((e - emu) / esd, (d - dmu) / dsd)) for e, d in zip(ed, dd)])
+        self._dino_thr = FewShotAdapter._calibrate(zn, zd)
         # 注:曾试"病态标定守卫"(阈值漏过半fit缺陷→重标)治cable翻车,实测无效——病态是
         # fit/test漂移(fit缺陷强/test弱),fit侧看不见;守卫触发时反而重标低→pcb图级acc掉0.011。
         # 已撤,守卫类思路对这种"fit侧看不见test漂移"的病理普遍无效(seg_head/component_graph
         # 门控今天也撞了同一堵墙)——真正有效的是"永远融合"这种不依赖fit侧判断的确定性设计。
+
+    def _seg_stat(self, img):
+        """把分割图压成一个图级标量:取前0.1%像素的均值(比单点max稳,比全图均值敏感)。
+        2500²的256²图上0.1%≈65像素,正好是一处小缺陷的量级。"""
+        import numpy as np
+        a = self.segment(img).ravel()
+        k = max(4, int(a.size * 0.001))
+        return float(np.partition(a, -k)[-k:].mean())
+
+    def _calibrate_seg_gate(self, normals, defects):
+        """**用分割图当图级判据**(seg co-detector)。
+
+        为什么加:2500²混合流实测,全局EAD图级分**完全失去区分力**——缺陷分中位5.09
+        反而低于正常分中位5.37,两类重叠100%,任何阈值最好也只能到acc=0.699(=全判正常)。
+        但**同一批数据上分割是好的**(框命中0.359/IoU 0.368)。
+        原因很直接:图级分是全图统计出来的,而缺陷只占2500²面板的~0.1%,信号被稀释没了;
+        分割头是逐像素的,还抓得到。既然像素级有信号而图级没有,就**从分割图里取图级判据**。
+
+        代价:normal图不能再走"判正常立即返回"的早退路径(要先算分割图)。2500²上
+        实测分割本来就在128ms的主路径里,预算200ms,付得起。"""
+        import numpy as np
+        ns = np.array([self._seg_stat(n) for n in normals[:40]])
+        ds = np.array([self._seg_stat(d) for d in defects])
+        mu, sd = ns.mean(), ns.std() + 1e-9
+        zn = [float((x - mu) / sd) for x in ns]
+        zd = [float((x - mu) / sd) for x in ds]
+        thr = FewShotAdapter._calibrate(zn, zd)
+        self._seg_gate = (mu, sd, thr)
+        import os as _os
+        if _os.environ.get("CALIB_DEBUG"):
+            print(f"[seg-gate] 正常 中位={np.median(ns):.4g} max={ns.max():.4g} | "
+                  f"缺陷 中位={np.median(ds):.4g} min={ds.min():.4g} | z阈值={thr:.4g} | "
+                  f"重叠={sum(1 for x in ds if x <= ns.max())}/{len(ds)}", flush=True)
 
     def _calibrate_gcad_embed(self, normals, defects):
         """GCAD-EmbedAE标定(见aoi/gcad_embed.py docstring:已验证净正)。复用DINO门
@@ -833,8 +959,19 @@ class CompetitionLargeDetector:
         score = self.branches[0].score(img)               # 检测分 = EAD 核心(唯一检测层,无条件算)
         is_def = bool(self.threshold is not None and score >= self.threshold)
         if getattr(self, "_dino", None) is not None:      # DINOv2 图级co-detector:平等融合门
-            fused = self._dino_fuse(score, self._dino.score(img))
+            dsc = self._dino.score(img)
+            ms = getattr(self, "_modes", None)
+            if ms and len(ms) > 1:                        # per-mode:先归模态,再用该模态统计量
+                m = ms[_assign_mode(self._dino.last_cls.detach().cpu(), ms)]
+                fused = float(_mode_z(score, dsc, m))
+            else:
+                fused = self._dino_fuse(score, dsc)
             is_def = bool(fused >= self._dino_thr)
+        sg = getattr(self, "_seg_gate", None)
+        if sg is not None:                                # seg co-detector:像素级信号兜住图级
+            mu, sd, sthr = sg
+            if float((self._seg_stat(img) - mu) / sd) >= sthr:
+                is_def = True
         if is_def:
             raws = [score] + self._aux_raws(img)          # 类型归属(3路辅助分支)只在判缺陷时算,省正常图开销
             return {"score": score, "is_defect": True, "defect_type": self._ztype(raws), "_raws": raws}

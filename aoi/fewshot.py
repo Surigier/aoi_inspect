@@ -47,13 +47,32 @@ class FewShotAdapter:
         candidates = sorted(set(normal_scores + defect_scores))
         n_pos = len(defect_scores)
         n_neg = len(normal_scores)
+        # CALIB=plain:按**普通准确率**标定(赛题评的就是这个),自动吃到fit集的先验。
+        # 为什么要改:平衡准确率把缺陷与正常等权,而真实测试流里正常图占绝大多数——
+        # 三份独立实验显示同一个平衡准确率准则朝**两个相反方向**出错:
+        #   2500²赛场级(100正常:30缺陷) 阈值偏低 → 误报80.2%,调对阈值 +0.272 acc
+        #   混类原生单图(同上)          阈值偏低 → 误报25.7%,调对阈值 +0.108 acc
+        #   真手机屏(20正常:30缺陷)     阈值偏高 → 漏检54%
+        # 普通准确率天然按fit集的正常/缺陷比例加权:正常多则抬阈值少误报,
+        # 缺陷多则压阈值少漏检——一个准则同时对症两个方向。
+        import os as _os
+        plain = _os.environ.get("CALIB", "bal") == "plain"
         best_t, best_bal = candidates[0], -1.0
         for t in candidates:
-            tpr = sum(s >= t for s in defect_scores) / n_pos
-            tnr = sum(s < t for s in normal_scores) / n_neg
-            bal = (tpr + tnr) / 2.0
+            tp = sum(s >= t for s in defect_scores)
+            tn = sum(s < t for s in normal_scores)
+            bal = ((tp + tn) / (n_pos + n_neg)) if plain else \
+                  ((tp / n_pos) + (tn / n_neg)) / 2.0
             if bal >= best_bal:
                 best_bal, best_t = bal, t
+        import os as _os
+        if _os.environ.get("CALIB_DEBUG"):
+            _n = sorted(normal_scores); _d = sorted(defect_scores)
+            _bl = [x for x in normal_scores if x < best_t]
+            print(f"[calib] best_bal={best_bal:.4f} best_t={best_t:.6g} | "
+                  f"正常 min={_n[0]:.6g} max={_n[-1]:.6g} | 缺陷 min={_d[0]:.6g} max={_d[-1]:.6g} | "
+                  f"n_below={max(_bl) if _bl else None} | "
+                  f"重叠={sum(1 for x in _d if x <= _n[-1])}/{len(_d)}", flush=True)
         below = [s for s in normal_scores if s < best_t]
         if not below:
             return best_t

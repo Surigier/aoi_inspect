@@ -31,7 +31,9 @@ from scripts.run_stitch_report import (_stitch, _overlay, _b64, build_html, HW,
                                        BIG, TILE)
 from scripts.run_scorecard import gt_boxes, box_hit
 
-CATS = ["phone_battery", "sim_card_set", "pcb"]      # 三个字面意义上的手机部件
+import os as _os
+# 默认三个手机部件混跑;EXAM_CATS 可指定单类目,用来分离"混类"与"拼接稀释"两个因素
+CATS = _os.environ.get("EXAM_CATS", "phone_battery,sim_card_set,pcb").split(",")
 RI = Path("data/_dl/Real-IAD"); RJ = Path("data/_dl/realiad_jsons/realiad_jsons_sv")
 N_FIT_NORM, N_FIT_DEF = 100, 30                       # 赛题协议
 DEF_RATIO = 0.3                                       # 测试流里含缺陷板的比例(产线现实:缺陷是少数)
@@ -46,6 +48,7 @@ def load_pool():
              [R / x["image_path"] for x in d["test"] if x["anomaly_class"] == "OK"]
         ng = [(R / x["image_path"], R / x["mask_path"])
               for x in d["test"] if x["anomaly_class"] != "OK"]
+        random.Random(0).shuffle(ok); random.Random(1).shuffle(ng)   # SHUFFLE_FIX 见run_exam2500
         pool[c] = (ok, ng)
         print(f"  {c}: 正常{len(ok)}张 缺陷{len(ng)}张", flush=True)
     return pool
@@ -65,19 +68,42 @@ def _take(pool, cat, kind, k=4):
     return out
 
 
+# STITCH=0(默认):**原生单图**,不拼接——精度必须在原生分辨率上测。
+#   Real-IAD原图256²、缺陷占0.406%;放大到1250²是纯插值(不增信息、只把缺陷糊开),
+#   再拼成2500²占比又稀释4倍到~0.1%,全局图级分必然被淹没(实测acc掉到0.300)。
+#   那是被人为制造出来的难题,不是我们方法的真实水平。
+# STITCH=1:拼接2500²,**只用于延时/形状压测**,不做精度叙事(同铁律#4对AD2的处理)。
+STITCH = _os.environ.get("EXAM_STITCH", "0") == "1"
+
+
+def _one(ip, mp=None):
+    im = Image.open(ip)
+    a = np.asarray(im.convert("RGB"), dtype=np.float32) / 255.0
+    t = torch.from_numpy(a).permute(2, 0, 1)
+    if mp is None:
+        return t, np.zeros(im.size[::-1], np.uint8)
+    return t, (np.array(Image.open(mp).convert("L")) > 0).astype(np.uint8)
+
+
 def _norm_panel(pool, cat, rng=None):
-    return _stitch([(Image.open(p), None) for p in _take(pool, cat, "ok")])
+    ps = _take(pool, cat, "ok", 4 if STITCH else 1)
+    if STITCH:
+        return _stitch([(Image.open(p), None) for p in ps])
+    return _one(ps[0])
 
 
 def _def_panel(pool, cat, rng=None):
-    items = []
-    for ip, mp in _take(pool, cat, "ng"):
-        mk = (np.array(Image.open(mp).convert("L")) > 0).astype(np.uint8)
-        items.append((Image.open(ip), mk))
-    return _stitch(items)
+    ps = _take(pool, cat, "ng", 4 if STITCH else 1)
+    if STITCH:
+        items = []
+        for ip, mp in ps:
+            mk = (np.array(Image.open(mp).convert("L")) > 0).astype(np.uint8)
+            items.append((Image.open(ip), mk))
+        return _stitch(items)
+    return _one(*ps[0])
 
 
-def main(n_test=1000, seed=0):
+def main(n_test=1000, seed=0, per_mode=False, seg_gate=False):
     torch.manual_seed(seed)
     rng = random.Random(seed)
     print("=== 模拟考:一次fit + 一条混合测试流(严格按赛题)===", flush=True)
@@ -90,9 +116,10 @@ def main(n_test=1000, seed=0):
     for i in range(N_FIT_DEF):
         fit_def.append((_def_panel(pool, CATS[i % len(CATS)], rng), CATS[i % len(CATS)]))
     print(f"fit输入: 正常板{len(fit_norm)} + 缺陷板{len(fit_def)}"
-          f"(跨{len(CATS)}类均摊,每块2500²=同类4张拼)", flush=True)
+          f"(跨{len(CATS)}类均摊," + ("每块2500²=同类4张拼)" if STITCH else "原生单图,不拼接)"), flush=True)
 
-    det = CompetitionLargeDetector()
+    det = CompetitionLargeDetector(per_mode_gate=per_mode, seg_gate=seg_gate)
+    print(f"per_mode_gate={per_mode}  seg_gate={seg_gate}", flush=True)
     t0 = time.time()
     det.fit_fewshot([b for b, _ in fit_norm], [b for (b, _), _ in fit_def],
                     defect_masks=[m for (_, m), _ in fit_def])
@@ -101,21 +128,22 @@ def main(n_test=1000, seed=0):
     print(f"fit完成 {fit_sec:.0f}s  阈值={thr:.4f}", flush=True)
 
     # ---- 测试流:n_test 张,缺陷占 DEF_RATIO,混合打乱 ----
+    # 测试流**必须惰性拼接**:每块2500²×3通道float32 = 75MB,1000块预先拼好就是75GB,
+    # 直接把系统内存打爆(实测被内核OOM杀掉,anon-rss 30GB / 总内存31GB)。
+    # 这里只先决定"第几张是什么类目、是缺陷还是正常",真正的图在循环里现拼现用完就丢。
     n_def = int(n_test * DEF_RATIO)
-    stream = []
-    for i in range(n_def):
-        c = CATS[i % len(CATS)]
-        stream.append((_def_panel(pool, c, rng), True, c))
-    for i in range(n_test - n_def):
-        c = CATS[i % len(CATS)]
-        stream.append((_norm_panel(pool, c, rng), False, c))
-    rng.shuffle(stream)          # 只打乱顺序(模拟混合流),取图本身是固定的
-    print(f"测试流: {len(stream)}张(缺陷{n_def} + 正常{n_test-n_def},已混合打乱)", flush=True)
+    plan = [(CATS[i % len(CATS)], True) for i in range(n_def)] + \
+           [(CATS[i % len(CATS)], False) for i in range(n_test - n_def)]
+    rng.shuffle(plan)            # 只打乱顺序(模拟混合流),取图本身是固定的
+    print(f"测试流: {len(plan)}张(缺陷{n_def} + 正常{n_test-n_def},已混合打乱,惰性拼接)", flush=True)
 
     nok = tp = fn = fp = tn = 0
     ious, hits, lats, rows = [], [], [], []
-    for idx, ((big, gt), is_def, cat) in enumerate(stream):
+    scores, labels = [], []                      # 供阈值扫描复用,免去重新fit
+    for idx, (cat, is_def) in enumerate(plan):
+        big, gt = _def_panel(pool, cat) if is_def else _norm_panel(pool, cat)
         t1 = time.time(); o = det.locate(big); ms = (time.time() - t1) * 1000; lats.append(ms)
+        scores.append(float(o["score"])); labels.append(bool(is_def))
         pred = bool(o["is_defect"]); nok += (pred == is_def)
         if is_def and pred: tp += 1; cls, verdict = "ok", "✅ 检出"
         elif is_def: fn += 1; cls, verdict = "miss", "❌ 漏检"
@@ -140,10 +168,32 @@ def main(n_test=1000, seed=0):
             rows.append(dict(img=_b64(im), name=f"测试 #{idx:04d} · {cat}", cls=cls, verdict=verdict,
                              line1=f'真实={"缺陷" if is_def else "正常"} · 判定={"缺陷" if pred else "正常"} · 类型={o["defect_type"]}',
                              line2=f'异常分={o["score"]:.4f} / 阈值={thr:.4f} · 框命中={hit:.2f} · IoU={iou:.3f} · {ms:.0f}ms'))
+        del big, gt                                   # 用完立刻释放,峰值内存只占一张板
         if (idx + 1) % 100 == 0:
-            print(f"  已测 {idx+1}/{len(stream)}  当前acc={nok/(idx+1):.3f}", flush=True)
+            print(f"  已测 {idx+1}/{len(plan)}  当前acc={nok/(idx+1):.3f}", flush=True)
 
-    n = len(stream)
+    # ---- 阈值扫描:同一次fit的分数复用,几秒钟就能看清"阈值到底值多少分" ----
+    # 关键:阈值改动不需要重新fit(1小时),分数是固定的,只是切的位置不同。
+    sc = np.array(scores); lb = np.array(labels, dtype=bool)
+    cands = np.unique(np.concatenate([sc, [thr]]))
+    accs = np.array([(((sc >= t) == lb).mean()) for t in cands])
+    bi = int(np.argmax(accs))
+    cur_acc = ((sc >= thr) == lb).mean()
+    print(f"\n=== 阈值扫描(同一次fit,{len(cands)}个候选)===", flush=True)
+    print(f"  当前标定阈值 {thr:.6g} → acc={cur_acc:.3f}  "
+          f"(召回{((sc>=thr)&lb).sum()/max(lb.sum(),1):.1%} 误报{((sc>=thr)&~lb).sum()/max((~lb).sum(),1):.1%})",
+          flush=True)
+    print(f"  最优阈值     {cands[bi]:.6g} → acc={accs[bi]:.3f}  "
+          f"(召回{((sc>=cands[bi])&lb).sum()/max(lb.sum(),1):.1%} "
+          f"误报{((sc>=cands[bi])&~lb).sum()/max((~lb).sum(),1):.1%})", flush=True)
+    print(f"  **阈值标定的损失 = {accs[bi]-cur_acc:+.3f} acc**  ← 这是纯靠改阈值就能拿回来的分",
+          flush=True)
+    print(f"  分数分布:正常 中位={np.median(sc[~lb]):.6g} p99={np.percentile(sc[~lb],99):.6g} | "
+          f"缺陷 中位={np.median(sc[lb]):.6g} p1={np.percentile(sc[lb],1):.6g}", flush=True)
+    print(f"  两类重叠度:{((sc[lb]<=sc[~lb].max())).mean():.1%} 的缺陷分落在正常图分数区间内",
+          flush=True)
+
+    n = len(plan)
     summary = dict(n=n, acc=f"{nok/n:.3f}", recall=f"{tp/max(tp+fn,1):.1%}",
                    fpr=f"{fp/max(fp+tn,1):.1%}", hit=f"{np.mean(hits):.3f}",
                    iou=f"{np.mean(ious):.3f}", thr=f"{thr:.4f}",
@@ -166,7 +216,8 @@ def main(n_test=1000, seed=0):
                f'<b>30</b> 块缺陷板,跨 <b>{"/".join(CATS)}</b> 三个手机部件类目均摊,'
                f'每块 2500²(同类4张拼)。耗时 <b>{fit_sec:.0f}s</b>,标定阈值 <b>{thr:.4f}</b>。'
                f'下面是示例板,缺陷板绿框为人工标注。')
-    out = Path("_logs/exam_report.html")
+    tag = ("_permode" if per_mode else "") + ("_seggate" if seg_gate else "")
+    out = Path(f"_logs/exam_report{tag}.html")
     out.write_text(build_html("AOI 模拟考 · 2500²混合流(phone_battery/sim_card_set/pcb)",
                               fit_rows, rows, summary, fitinfo), encoding="utf-8")
     print(f"\n=== 模拟考结果({n}张混合流)===", flush=True)
@@ -179,4 +230,6 @@ def main(n_test=1000, seed=0):
 
 
 if __name__ == "__main__":
-    main(int(sys.argv[1]) if len(sys.argv) > 1 else 1000)
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    main(int(args[0]) if args else 1000, per_mode="--per-mode" in sys.argv,
+         seg_gate="--seg-gate" in sys.argv)

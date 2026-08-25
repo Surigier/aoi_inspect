@@ -46,6 +46,30 @@ def _load_images(d, size):
     return [_load_img(p, size) for p in _img_files(d)]
 
 
+def _scaled_boxes(o, path):
+    """把locate()给的框(掩膜坐标系,通常256²)线性还原到原图像素坐标。
+    原图尺寸从**文件本身**读(peek_size只读文件头不解码),不能用load_fast后的张量——
+    那个已经被缩放过(长边上限1152)。"""
+    bs = o.get("boxes") or []
+    mk = o.get("mask")
+    if not bs or mk is None:
+        return []
+    mh, mw = mk.shape[:2]
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            W0, H0 = im.size
+    except Exception:
+        return [f"{b[0]},{b[1]},{b[2]},{b[3]}" for b in bs]
+    sx, sy = W0 / max(mw, 1), H0 / max(mh, 1)
+    out = []
+    for b in bs:
+        x0, y0, x1, y1 = int(round(b[0] * sx)), int(round(b[1] * sy)), \
+                         int(round(b[2] * sx)), int(round(b[3] * sy))
+        out.append(f"{max(0,x0)},{max(0,y0)},{min(W0,x1)},{min(H0,y1)}")
+    return out
+
+
 def _decide_large(normal_dir):
     """看首张正常图长边,≥阈值则走大图分块路径。"""
     files = _img_files(normal_dir)
@@ -155,7 +179,11 @@ def _run_large(args, device):
                         img_next[q] = pool.submit(load_fast, q)
                         break
                 o = det.locate(img)
-                boxes = ";".join(f"{b[0]},{b[1]},{b[2]},{b[3]}" for b in o["boxes"])
+                # 框必须还原到**原图坐标系**再交付。locate()内部的掩膜固定在
+                # seg_eval_hw(256²)上,框坐标也就在[0,256)——而评委喂进来的是2500²原图,
+                # 直接输出等于把坐标缩小了约9.77倍,和原图GT算IoU会几乎全部落空。
+                # (内部成绩单不会暴露这个问题:那边预测掩膜和GT掩膜都缩到256再比,口径自洽。)
+                boxes = ";".join(_scaled_boxes(o, p))
                 rows.append([p.name, "image", int(o["is_defect"]), round(o["score"], 4),
                              o["defect_type"], boxes])
     for p in all_files:

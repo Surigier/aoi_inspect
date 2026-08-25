@@ -3,6 +3,9 @@ import torch
 from .types import BranchResult
 
 
+GAP_RATIO = 10.0     # 空隙超过这个倍数才认为是病态,才下移阈值
+
+
 class FewShotAdapter:
     """实现官方协议入口:用 100 正常 + 30 缺陷做迁移(建库 + 标定阈值)。"""
 
@@ -20,9 +23,27 @@ class FewShotAdapter:
 
     @staticmethod
     def _calibrate(normal_scores: List[float], defect_scores: List[float]) -> float:
-        """选**平衡准确率**(TPR+TNR)/2 最高的阈值。
-        正常多、缺陷少时,最大化原始准确率会偏向"不报警"→漏检;平衡准确率消除该偏向,
-        兼顾召回(AOI 早期拦截看重不漏)。并列时取更大阈值(更少误报)。"""
+        """选**平衡准确率**(TPR+TNR)/2 最高的阈值,再**把阈值从缺陷侧挪回空隙中间**。
+
+        为什么要挪(实测,不是理论洁癖):候选阈值只来自**观测到的分数**。当两类分数
+        之间存在大空隙时,空隙里一个候选都没有,阈值只能贴到缺陷侧的端点——也就是
+        **30张fit缺陷图里分数最低的那张**。于是测试集里任何比"这30张中最弱的一张"
+        还弱的缺陷,全部漏掉。
+
+        真手机屏实测(scripts/diag_phone_detect.py):正常分0~3.35、缺陷分1.7亿~6.3亿,
+        **两类零重叠**,阈值取3.35就能零误报100%召回;而标定出来的阈值是4.23亿
+        (=fit缺陷最低分),直接切在缺陷分布中间 → **召回只有46%**。缺陷越小漏得越狠:
+        最小25%那档召回仅4%,最大25%那档84%。
+
+        错在**把阈值锚定在30张缺陷上,而不是100张正常图上**。正常图是有代表性的
+        (赛题就给100张),30张缺陷只是缺陷总体的小样本、必然不含最弱的那些——
+        锚在缺陷侧等于系统性保证漏检。
+
+        挪的做法:找到best_t后,取"低于best_t的最高正常分"n_below,在(n_below, best_t)
+        这段空隙里取中点。**在fit数据上可证明不会更差**:t只要仍大于n_below,TNR完全
+        不变;t下移只会让更多缺陷越线,TPR不降反升。分数跨数量级时用几何中点,
+        含0或负数时退回算术中点。空隙不存在(两类重叠)时n_below就紧贴best_t,
+        中点≈best_t,**对分布重叠的类目零影响**。"""
         candidates = sorted(set(normal_scores + defect_scores))
         n_pos = len(defect_scores)
         n_neg = len(normal_scores)
@@ -33,7 +54,18 @@ class FewShotAdapter:
             bal = (tpr + tnr) / 2.0
             if bal >= best_bal:
                 best_bal, best_t = bal, t
-        return best_t
+        below = [s for s in normal_scores if s < best_t]
+        if not below:
+            return best_t
+        n_below = max(below)
+        if n_below >= best_t:
+            return best_t
+        # 只在空隙"大到病态"时才下移。无条件下移会普遍抬高误报:实测第一版让手机屏
+        # 召回46%→100%,但phone_battery图级acc 0.912→0.800。倍数门槛能干净分开两种
+        # 情况——手机屏的空隙是1.26亿倍,正常类目通常只有2~3倍(不触发,行为与原来一致)。
+        if n_below <= 0 or best_t / n_below < GAP_RATIO:
+            return best_t
+        return float((n_below * best_t) ** 0.5)              # 跨数量级时几何中点更居中
 
     def predict(self, image: torch.Tensor) -> Tuple[BranchResult, bool]:
         r = self.branch.infer(image)

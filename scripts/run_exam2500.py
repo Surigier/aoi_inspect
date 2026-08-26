@@ -65,8 +65,28 @@ def _take(pool, cat, kind, k=4):
     return out
 
 
+SINGLE = os.environ.get("EXAM_SINGLE", "0") == "1"
+
+
+def _single(pool, cat, is_def):
+    """**一图一物**:直接用一张原生1024²的图,不拼接。
+    2500²拼接的任务(延时/形状压测)已完成:110~138ms/预算200ms,过关。
+    精度不该再在拼接台架上测——那个台架是"4个不同物件+黑背景+缝隙",而赛题的2500²
+    是**一个产品**的高分辨率图。EAD/DINO为"一图一物"设计,喂4物件+大片黑背景会让
+    图级统计量失效(实测误报80%),那是台架造出来的,不是产品缺陷。"""
+    it = _take(pool, cat, "ng" if is_def else "ok", 1)[0]
+    ip, mp = it if is_def else (it, None)
+    im = Image.open(ip).convert("RGB")
+    a = torch.from_numpy(np.asarray(im, dtype=np.float32) / 255.0).permute(2, 0, 1)
+    if mp is None:
+        return a, np.zeros(im.size[::-1], np.uint8)
+    return a, (np.array(Image.open(mp).convert("L")) > 0).astype(np.uint8)
+
+
 def _panel(pool, cat, is_def):
     """4块原生1024²贴进2500²画布。**不缩放**,只平移。"""
+    if SINGLE:
+        return _single(pool, cat, is_def)
     big = torch.zeros(3, BIG, BIG)
     gt = np.zeros((BIG, BIG), np.uint8)
     items = _take(pool, cat, "ng" if is_def else "ok")
@@ -98,7 +118,8 @@ def main(n_test=1000, seg_in=None, seg_gate=False, per_mode=False):
 
     fit_n = [_panel(pool, CATS[i % len(CATS)], False)[0] for i in range(100)]
     fd = [_panel(pool, CATS[i % len(CATS)], True) for i in range(30)]
-    print(f"fit: 100块正常板 + 30块缺陷板(2500²画布,内含4块原生1024²)", flush=True)
+    print(f"fit: 100张正常 + 30张缺陷 ("
+          + ("**一图一物**,原生1024²,不拼接" if SINGLE else "2500²画布,内含4块原生1024²") + ")", flush=True)
     t0 = time.time()
     det.fit_fewshot(fit_n, [b for b, _ in fd], defect_masks=[m for _, m in fd])
     print(f"fit完成 {time.time()-t0:.0f}s 阈值={det.decision_threshold():.4f}", flush=True)
@@ -139,7 +160,8 @@ def main(n_test=1000, seg_in=None, seg_gate=False, per_mode=False):
     thr = det.decision_threshold()
     cands = np.unique(sc); accs = np.array([(((sc >= t) == lb).mean()) for t in cands])
     bi = int(np.argmax(accs))
-    print(f"\n=== 赛场级模拟考(2500²画布 + 原生1024²,{n}张混合流)===", flush=True)
+    print(f"\n=== 模拟考(" + ("一图一物 原生1024²" if SINGLE else "2500²画布+原生1024²")
+          + f",{n}张混合流)===", flush=True)
     print(f"图级acc={nok/n:.3f} (TP{tp}/FN{fn}/FP{fp}/TN{tn}) 召回={tp/max(tp+fn,1):.1%} 误报={fp/max(fp+tn,1):.1%}",
           flush=True)
     print(f"框命中@0.5={np.mean(hits):.3f}  含漏检IoU={np.mean(ious):.3f}", flush=True)

@@ -77,10 +77,27 @@ def _decide_large(normal_dir):
 
 
 def _run_zeroshot(args, device):
-    """无样本入口(赛题"少样本或无样本"):无需 normal/defect,纯 CLIP 判异常。"""
-    from aoi.clip_encoder import CLIPEncoder
+    """无样本入口(赛题"少样本或无样本"):无需 normal/defect,纯 CLIP 判异常。
+
+    **离线可用性**:本路径依赖 CLIP 权重(约571MB),**未打进默认离线包**——赛题会提供
+    100正常+30缺陷,少样本才是评分路径,为一个可选路径让交付包翻近三倍不划算。
+    无外网且需要本路径时,在联网机器上执行:
+        python scripts/pack_offline_weights.py --with-clip
+    主路径(少样本,submit.py 不加 --zeroshot)所需权重**已全部打进离线包**,无外网可直接运行。"""
     from aoi.branches.zeroshot_clip import ZeroShotAdapter
-    adapter = ZeroShotAdapter(CLIPEncoder(device=device), class_name=args.class_name)
+    try:
+        from aoi.clip_encoder import CLIPEncoder
+        enc = CLIPEncoder(device=device)
+    except Exception as e:
+        raise SystemExit(
+            "\n[无样本路径不可用] 加载 CLIP 权重失败:%s\n"
+            "  原因:CLIP 权重(~571MB)未包含在默认离线包中,当前机器又无法访问外网。\n"
+            "  解法一(推荐):改用少样本路径——赛题提供的 100 张正常图 + 30 张缺陷图\n"
+            "               python submit.py --normal <正常目录> --defect <缺陷目录> --test <测试目录>\n"
+            "               该路径所需权重已全部离线打包,无外网可直接运行。\n"
+            "  解法二:在联网机器上执行 python scripts/pack_offline_weights.py --with-clip\n"
+            "         然后把 models/hf_cache/ 一并拷贝到本机。\n" % type(e).__name__)
+    adapter = ZeroShotAdapter(enc, class_name=args.class_name)
     adapter.fit_fewshot()
     rows = []
     for p in sorted(Path(args.test).iterdir()):

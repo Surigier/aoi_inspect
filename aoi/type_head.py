@@ -162,8 +162,14 @@ class VLMTypeHead:
             return None
         try:
             f = self._feat(det, img, mask, raws)
+            rule = self.RULE_NAMES[int(np.argmax(f))]
             if getattr(self, "rule_mode", False):
-                return self.RULE_NAMES[int(np.argmax(f))]      # 离线规则模式
+                return rule                                    # 离线规则模式
+            # 【已判负,勿再加】曾试"rule指向质心表达不了的类型时采信rule"来救那三个0%的类:
+            # 5类目混合实测 常见外观缺陷 67.6%→19.6%、合计 48.2%→19.4%,
+            # 而三个0%的类**一个都没救回来**。原因:规则特征的argmax经常指向"尺寸偏差"
+            # (该类不在质心类别里)→ 触发兜底 → 把本该正确的"常见外观缺陷"覆盖掉;
+            # 而真正的尺寸偏差图,规则特征又抓不到。**净负29个百分点。**
             z = (f - self.fmu) / self.fsd
             d = ((self.centroids - z) ** 2).sum(1)
             return self.classes[int(np.argmin(d))]

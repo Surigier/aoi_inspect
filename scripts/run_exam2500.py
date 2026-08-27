@@ -31,7 +31,26 @@ from scripts.run_scorecard import gt_boxes, box_hit
 BIG = 2500
 TILE = 1024                       # **原生尺寸,不缩放**
 POS = [(0, 0), (1276, 0), (0, 1276), (1276, 1276)]     # 4块1024²放进2500²,留缝不重叠
-CATS = os.environ.get("EXAM2500_CATS", "hazelnut,cable,carpet").split(",")
+CATS = os.environ.get("EXAM2500_CATS", "hazelnut,cable,carpet,pill,metal_nut").split(",")
+
+# MVTec缺陷目录名 → 赛题5类。**只映射语义明确的**,含糊的(combined/contamination/
+# metal_contamination/thread/print/faulty_imprint)不计入类型评分,避免用可争议的
+# 标签制造假精度。这套映射让模拟考首次覆盖到"尺寸偏差"和"逻辑错误"两类——
+# 此前从未有数据可验。
+TYPE_MAP = {
+    # 常见外观缺陷:材料被破坏(裂/割/孔/划/戳)
+    "crack": "常见外观缺陷", "cut": "常见外观缺陷", "hole": "常见外观缺陷",
+    "scratch": "常见外观缺陷", "poke_insulation": "常见外观缺陷",
+    "cut_inner_insulation": "常见外观缺陷", "cut_outer_insulation": "常见外观缺陷",
+    # 色彩变化
+    "color": "色彩变化",
+    # 缺件少件
+    "missing_cable": "缺件少件", "missing_wire": "缺件少件",
+    # 逻辑错误:件都在但位置/朝向/顺序/搭配不对
+    "cable_swap": "逻辑错误", "flip": "逻辑错误", "pill_type": "逻辑错误",
+    # 尺寸偏差:件在也没坏,但形变/尺寸不对
+    "bent": "尺寸偏差", "bent_wire": "尺寸偏差",
+}
 GT = Path("data/_dl/_gt_stage/mvtech_anomaly_detection")
 HW = (256, 256)
 _CUR = {}
@@ -46,7 +65,7 @@ def pool_of(cat):
             for f in sorted(sub.glob("*.png")):
                 m = GT / cat / "ground_truth" / sub.name / (f.stem + "_mask.png")
                 if m.exists():
-                    ng.append((str(f), str(m)))
+                    ng.append((str(f), str(m), sub.name))    # 带上目录名=缺陷类型GT
     # SHUFFLE_FIX:**固定种子打乱**,不是按字母序取。
     # MVTec的缺陷按类型分目录、目录名字母序排列,顺序取会让fit只见到前几种类型、
     # test全是没见过的类型(实测cable: fit=bent_wire/cable_swap/combined,
@@ -90,7 +109,10 @@ def _single(pool, cat, is_def, phase="fit"):
     是**一个产品**的高分辨率图。EAD/DINO为"一图一物"设计,喂4物件+大片黑背景会让
     图级统计量失效(实测误报80%),那是台架造出来的,不是产品缺陷。"""
     it = _take(pool, cat, "ng" if is_def else "ok", 1, phase)[0]
-    ip, mp = it if is_def else (it, None)
+    if is_def:
+        ip, mp = it[0], it[1]
+    else:
+        ip, mp = it, None
     im = Image.open(ip).convert("RGB")
     a = torch.from_numpy(np.asarray(im, dtype=np.float32) / 255.0).permute(2, 0, 1)
     if mp is None:
@@ -106,7 +128,7 @@ def _panel(pool, cat, is_def, phase="fit"):
     gt = np.zeros((BIG, BIG), np.uint8)
     items = _take(pool, cat, "ng" if is_def else "ok", 4, phase)
     for k, it in enumerate(items):
-        ip, mp = it if is_def else (it, None)
+        ip, mp = (it[0], it[1]) if is_def else (it, None)
         im = Image.open(ip).convert("RGB")
         if im.size != (TILE, TILE):
             im = im.resize((TILE, TILE), Image.BILINEAR)
@@ -146,14 +168,22 @@ def main(n_test=1000, seg_in=None, seg_gate=False, per_mode=False, dino_seg=Fals
     rng.shuffle(plan)
     import torch.nn.functional as F
     nok = tp = fn = fp = tn = 0; ious = []; hits = []; lats = []; sc = []; lb = []
+    import collections
+    ty_ok = collections.Counter(); ty_n = collections.Counter()
     for idx, (cat, is_def) in enumerate(plan):
+        _cur_before = _CUR.get(((cat, "ng"), "t"), 0) if is_def else 0
         big, gt = _panel(pool, cat, is_def, "test")
+        ty_gt = None
+        if is_def:
+            lst = pool[cat][1]; base = _FITUSED.get((cat, "ng"), 0)
+            avail = lst[base:] or lst
+            ty_gt = TYPE_MAP.get(avail[_cur_before % len(avail)][2])
         t1 = time.time(); o = det.locate(big); lats.append((time.time() - t1) * 1000)
         # 扫描必须用**与判决同口径**的分:o["score"]是原始EAD分,而判决走的是
         # DINO融合后的z分,两者尺度差几个数量级(实测"当前阈值23140 vs 最优2.2"就是
         # 拿EAD原始分比融合z阈值比出来的,那几行数字作废)。frame_score()与
         # decision_threshold()是配对的同口径接口。
-        sc.append(float(det.frame_score(img))); lb.append(is_def)
+        sc.append(float(det.frame_score(big))); lb.append(is_def)
         pred = bool(o["is_defect"]); nok += (pred == is_def)
         if is_def and pred: tp += 1
         elif is_def: fn += 1
@@ -171,6 +201,9 @@ def main(n_test=1000, seg_in=None, seg_gate=False, per_mode=False, dino_seg=Fals
                 TP = int((p_ & g_).sum()); FP2 = int((p_ & ~g_).sum()); FN2 = int((~p_ & g_).sum())
                 ious.append(TP / max(TP + FP2 + FN2, 1))
                 h = box_hit(o["boxes"], gt_boxes(gtr)); hits.append(h if h is not None else 0.0)
+        if ty_gt is not None and o["is_defect"]:
+            ty_n[ty_gt] += 1
+            ty_ok[ty_gt] += (o["defect_type"] == ty_gt)
         del big, gt
         if (idx + 1) % 200 == 0:
             print(f"  已测 {idx+1}/{len(plan)} acc={nok/(idx+1):.3f}", flush=True)
@@ -188,6 +221,13 @@ def main(n_test=1000, seg_in=None, seg_gate=False, per_mode=False, dino_seg=Fals
     print(f"阈值扫描: 当前{thr:.4g}→acc={((sc>=thr)==lb).mean():.3f} | "
           f"最优{cands[bi]:.4g}→acc={accs[bi]:.3f} | 损失={accs[bi]-((sc>=thr)==lb).mean():+.3f}", flush=True)
     print(f"两类重叠: {(sc[lb]<=sc[~lb].max()).mean():.1%}", flush=True)
+    if ty_n:
+        tot_ok = sum(ty_ok.values()); tot_n = sum(ty_n.values())
+        print(f"\n=== 缺陷类型归属(语义明确的{tot_n}张,含糊类型不计入)===", flush=True)
+        for t in ["常见外观缺陷", "色彩变化", "缺件少件", "逻辑错误", "尺寸偏差"]:
+            if ty_n[t]:
+                print(f"  {t:8s} {ty_ok[t]:4d}/{ty_n[t]:4d} = {ty_ok[t]/ty_n[t]:.1%}", flush=True)
+        print(f"  **合计    {tot_ok}/{tot_n} = {tot_ok/max(tot_n,1):.1%}**", flush=True)
     print("EXAM2500 OK", flush=True)
 
 

@@ -60,7 +60,9 @@ def box_hit(pred_boxes, gtbs, thr=0.5):
 
 
 def evaluate(name, normals, fit_i, fit_m, test_defs, test_goods):
-    det = CompetitionLargeDetector()                       # 全量train_steps=10000
+    import os as _os
+    _kw = {"dino_seg": True} if _os.environ.get("DINO_SEG") == "1" else {}
+    det = CompetitionLargeDetector(**_kw)                  # 全量train_steps=10000
     det.fit_fewshot(normals, fit_i, defect_masks=fit_m)
     # 图级二值 + 定位
     n_img_ok = 0; total = 0

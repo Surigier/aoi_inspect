@@ -57,24 +57,39 @@ def pool_of(cat):
     return ok, ng
 
 
-def _take(pool, cat, kind, k=4):
+_FITUSED = {}          # (cat,kind) -> fit阶段用掉的张数,test只在这之后的范围里循环
+
+
+def _take(pool, cat, kind, k=4, phase="fit"):
+    """fit按顺序取;**test只在fit没用过的那部分里循环**——否则会泄漏。
+    实测:三类目缺陷池共251张,fit要30、test要300,总需330>251 → 不隔离的话
+    test会绕回去重复用到fit那30张,召回和IoU都被抬高。正常图池1021张够用(需800),
+    本来就不重叠。"""
     key = (cat, kind); lst = pool[cat][0 if kind == "ok" else 1]
-    i = _CUR.get(key, 0)
-    out = [lst[(i + j) % len(lst)] for j in range(k)]
-    _CUR[key] = (i + k) % len(lst)
+    if phase == "fit":
+        i = _CUR.get(key, 0)
+        out = [lst[(i + j) % len(lst)] for j in range(k)]
+        _CUR[key] = i + k
+        _FITUSED[key] = _CUR[key]
+        return out
+    base = _FITUSED.get(key, 0)                      # fit用掉的边界
+    avail = lst[base:] or lst                        # fit之后的部分
+    i = _CUR.get((key, "t"), 0)
+    out = [avail[(i + j) % len(avail)] for j in range(k)]
+    _CUR[(key, "t")] = i + k
     return out
 
 
 SINGLE = os.environ.get("EXAM_SINGLE", "0") == "1"
 
 
-def _single(pool, cat, is_def):
+def _single(pool, cat, is_def, phase="fit"):
     """**一图一物**:直接用一张原生1024²的图,不拼接。
     2500²拼接的任务(延时/形状压测)已完成:110~138ms/预算200ms,过关。
     精度不该再在拼接台架上测——那个台架是"4个不同物件+黑背景+缝隙",而赛题的2500²
     是**一个产品**的高分辨率图。EAD/DINO为"一图一物"设计,喂4物件+大片黑背景会让
     图级统计量失效(实测误报80%),那是台架造出来的,不是产品缺陷。"""
-    it = _take(pool, cat, "ng" if is_def else "ok", 1)[0]
+    it = _take(pool, cat, "ng" if is_def else "ok", 1, phase)[0]
     ip, mp = it if is_def else (it, None)
     im = Image.open(ip).convert("RGB")
     a = torch.from_numpy(np.asarray(im, dtype=np.float32) / 255.0).permute(2, 0, 1)
@@ -83,13 +98,13 @@ def _single(pool, cat, is_def):
     return a, (np.array(Image.open(mp).convert("L")) > 0).astype(np.uint8)
 
 
-def _panel(pool, cat, is_def):
+def _panel(pool, cat, is_def, phase="fit"):
     """4块原生1024²贴进2500²画布。**不缩放**,只平移。"""
     if SINGLE:
-        return _single(pool, cat, is_def)
+        return _single(pool, cat, is_def, phase)
     big = torch.zeros(3, BIG, BIG)
     gt = np.zeros((BIG, BIG), np.uint8)
-    items = _take(pool, cat, "ng" if is_def else "ok")
+    items = _take(pool, cat, "ng" if is_def else "ok", 4, phase)
     for k, it in enumerate(items):
         ip, mp = it if is_def else (it, None)
         im = Image.open(ip).convert("RGB")
@@ -104,17 +119,17 @@ def _panel(pool, cat, is_def):
     return big, gt
 
 
-def main(n_test=1000, seg_in=None, seg_gate=False, per_mode=False):
+def main(n_test=1000, seg_in=None, seg_gate=False, per_mode=False, dino_seg=False):
     torch.manual_seed(0); rng = random.Random(0)
     pool = {c: pool_of(c) for c in CATS}
     for c in CATS:
         print(f"  {c}: 正常{len(pool[c][0])} 缺陷{len(pool[c][1])} (原生{Image.open(pool[c][0][0]).size})",
               flush=True)
-    kw = dict(seg_gate=seg_gate, per_mode_gate=per_mode)
+    kw = dict(seg_gate=seg_gate, per_mode_gate=per_mode, dino_seg=dino_seg)
     if seg_in:
         kw["seg_in"] = seg_in
     det = CompetitionLargeDetector(**kw)
-    print(f"配置: seg_in={seg_in or 512} seg_gate={seg_gate} per_mode={per_mode}", flush=True)
+    print(f"配置: seg_in={seg_in or 512} seg_gate={seg_gate} per_mode={per_mode} dino_seg={dino_seg}", flush=True)
 
     fit_n = [_panel(pool, CATS[i % len(CATS)], False)[0] for i in range(100)]
     fd = [_panel(pool, CATS[i % len(CATS)], True) for i in range(30)]
@@ -132,9 +147,13 @@ def main(n_test=1000, seg_in=None, seg_gate=False, per_mode=False):
     import torch.nn.functional as F
     nok = tp = fn = fp = tn = 0; ious = []; hits = []; lats = []; sc = []; lb = []
     for idx, (cat, is_def) in enumerate(plan):
-        big, gt = _panel(pool, cat, is_def)
+        big, gt = _panel(pool, cat, is_def, "test")
         t1 = time.time(); o = det.locate(big); lats.append((time.time() - t1) * 1000)
-        sc.append(float(o["score"])); lb.append(is_def)
+        # 扫描必须用**与判决同口径**的分:o["score"]是原始EAD分,而判决走的是
+        # DINO融合后的z分,两者尺度差几个数量级(实测"当前阈值23140 vs 最优2.2"就是
+        # 拿EAD原始分比融合z阈值比出来的,那几行数字作废)。frame_score()与
+        # decision_threshold()是配对的同口径接口。
+        sc.append(float(det.frame_score(img))); lb.append(is_def)
         pred = bool(o["is_defect"]); nok += (pred == is_def)
         if is_def and pred: tp += 1
         elif is_def: fn += 1
@@ -178,4 +197,5 @@ if __name__ == "__main__":
     if "--seg-in" in sys.argv:
         si = int(sys.argv[sys.argv.index("--seg-in") + 1])
     main(int(a[0]) if a else 1000, seg_in=si,
-         seg_gate="--seg-gate" in sys.argv, per_mode="--per-mode" in sys.argv)
+         seg_gate="--seg-gate" in sys.argv, per_mode="--per-mode" in sys.argv,
+         dino_seg="--dino-seg" in sys.argv)

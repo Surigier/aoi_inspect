@@ -133,7 +133,7 @@ class CompetitionLargeDetector:
     def __init__(self, device="cuda", aux_size=320, train_steps=10000, seg_eval_hw=(256, 256),
                  compile_infer=False, sam_refine=True, roi_zoom=False, seg_in=512, rams=False,
                  ead_students=2, crop_cascade=False, comp_graph=False, boundary_refine=False,
-                 tta=False, gcad_embed=False, joint_ensemble=True, use_vlm_type=True, per_mode_gate=False, seg_gate=False):
+                 tta=False, gcad_embed=False, joint_ensemble=True, use_vlm_type=True, per_mode_gate=False, seg_gate=False, dino_seg=False):
         # ead_students=2:多种子EAD学生集成(检测分,教师共享)。实测工作类方差收窄~2×、
         # 现场一次fit下限+0.012、均值零代价;fit不计时训练免费,推理+一次学生前向(延时待验)。
         # rams 默认关:RAMS-R残差注意力修正支隔离探针+0.013~0.033(3/4类),但生产全管线实测净平
@@ -151,6 +151,8 @@ class CompetitionLargeDetector:
         ]
         self.aux_size = aux_size
         self.use_vlm_type = use_vlm_type
+        self._dino_feat = None               # dino_seg专用的独立DINO提取器(见_wrn_dino_feats)
+        self.dino_seg = dino_seg             # 分割头吃WRN⊕DINO拼接特征(见_wrn_dino_feats),默认关
         self.seg_gate = seg_gate             # 用分割图当图级判据(见_calibrate_seg_gate),默认关
         self.per_mode_gate = per_mode_gate   # 正常图分模态标定阈值(见_calibrate_dino_gate),默认关,验证后再开
         self.type_head = None       # VLM监督的类型归属头,fit期建;不可用则保持None走_ztype
@@ -172,7 +174,8 @@ class CompetitionLargeDetector:
         # 用户已明确降优先级);排除pcb后5类median=+0.006/min=+0.001全正。**零成本**:
         # 推理结构完全不变(还是同一个_Ensemble)、零延时增量、不碰骨干。
         # 验证脚本seghead_tuning/probe_joint_ensemble.py。
-        self.seg_head = SupervisedSegHead(device=dev, extractor=self._wrn_feats,
+        self.seg_head = SupervisedSegHead(device=dev,
+                                          extractor=(self._wrn_dino_feats if dino_seg else self._wrn_feats),
                                           rams_extractor=self._rams_scales if rams else None,
                                           joint_ensemble=joint_ensemble)
         self.seg_eval_hw = seg_eval_hw
@@ -232,6 +235,43 @@ class CompetitionLargeDetector:
         img = img.to(self._bb_loc.device)
         img = F.interpolate(img, size=(self._seg_in, self._seg_in), mode="bilinear", align_corners=False)
         return self._bb_loc.extract(img)[0]
+
+    @torch.no_grad()
+    def _wrn_dino_feats(self, img):
+        """WRN浅层(1,2) ⊕ DINOv2 patch特征,拼成分割头的输入。
+
+        动机(文献+我们自己的数据同时指向):
+          - Dinomaly(CVPR2025)在多类别异常检测上把DINOv2做成SOTA,结论是基础模型
+            特征才是多类别鲁棒性的关键;
+          - 我们自己的标定数据也这么说——三产品混合迁移时,EAD/WRN侧的可分性
+            best_bal=0.638,而DINO侧是0.897。
+        而分割头一直只吃WRN浅层。DINO的patch特征在图级门那步**本来就算了**
+        (dino_gate._patches),只是没缓存;这里复用缓存 → **推理零增量前向**。
+
+        DINO是518²输入、patch 14 → 37²网格;上采样到WRN的128²格后按通道拼接。
+        DINO门未启用时静默退回纯WRN(不改变原行为)。"""
+        f = self._wrn_feats(img)                              # (768,128,128)
+        # **必须用独立的特征提取器,不能依赖 self._dino**:
+        # fit_fewshot 里 seg_head.fit() 发生在 _calibrate_dino_gate() **之前**,
+        # 那时 self._dino 还是 None → 训练时只拿到768通道,推理时却是1152 →
+        # 和 fit 期存下的 mu/sd 对不上,直接 RuntimeError(1152 vs 768)。
+        # 独立实例保证 fit/推理两边通道数一致。DINO门存在时优先复用它已缓存的
+        # patch(零增量前向);不存在时用自己的实例算。
+        g = getattr(self, "_dino", None)
+        if g is None:
+            if getattr(self, "_dino_feat", None) is None:
+                from .dino_gate import DinoGate
+                self._dino_feat = DinoGate(device=self._bb_loc.device)
+            g = self._dino_feat
+        pg = getattr(g, "last_patch_grid", None)
+        if pg is None:                                        # 本图还没跑过DINO → 跑一次
+            g._patches(img)
+            pg = getattr(g, "last_patch_grid", None)
+            if pg is None:
+                return f
+        d = F.interpolate(pg[None].to(f.device), size=f.shape[-2:],
+                          mode="bilinear", align_corners=False)[0]
+        return torch.cat([f, d], dim=0)
 
     @torch.no_grad()
     def _rams_scales(self, img):
@@ -582,6 +622,12 @@ class CompetitionLargeDetector:
         zn = [float((x - mu) / sd) for x in ns]
         zd = [float((x - mu) / sd) for x in ds]
         thr = FewShotAdapter._calibrate(zn, zd)
+        # SEG_GATE_STRICT:把阈值锚在"fit正常图的最大值"上(fit上零误报),而不是
+        # 平衡准确率点。实测平衡准确率标定让误报从4.3%涨到12.9%、图级acc掉0.042;
+        # 保守阈值应能保住大部分召回增益(92%→98%)而少付误报代价。
+        import os as _os
+        if _os.environ.get("SEG_GATE_STRICT") == "1":
+            thr = max(thr, max(zn) + 1e-6)
         self._seg_gate = (mu, sd, thr)
         import os as _os
         if _os.environ.get("CALIB_DEBUG"):

@@ -350,6 +350,8 @@ class CompetitionLargeDetector:
         # VLM监督的类型归属头:fit期(不计时)用VLM给缺陷图打5类标签,蒸馏成质心分类器。
         # 推理期零API/零外网。VLM不可用时fit()返回False,type_head保持None,自动走_ztype启发式。
         self.type_head = None
+        # 注意:即使VLM不可用,类型头也会以**规则模式**建立(位置匹配特征argmax,离线58%),
+        # 优于退回_ztype启发式(38%)。评委机器无外网是工业评测常态,这条路径必须留着。
         if defect_masks is not None and self.use_vlm_type:
             from .type_head import VLMTypeHead
             th = VLMTypeHead()

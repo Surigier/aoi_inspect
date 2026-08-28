@@ -172,6 +172,13 @@ def main(n_test=1000, seg_in=None, seg_gate=False, per_mode=False, dino_seg=Fals
            [(CATS[i % len(CATS)], False) for i in range(n_test - n_def)]
     rng.shuffle(plan)
     import torch.nn.functional as F
+    # 预热:首批locate含SAM懒加载/cuDNN自动调优等一次性开销,不预热会污染延时统计
+    for _c, _d in plan[:5]:
+        det.locate(_panel(pool, _c, _d, "test")[0])
+    _CUR.clear(); _FITUSED.update(_FITUSED)          # 预热用掉的游标复位,不影响正式取图
+    for _c in CATS:
+        _CUR[((_c, "ok"), "t")] = 0; _CUR[((_c, "ng"), "t")] = 0
+
     nok = tp = fn = fp = tn = 0; ious = []; hits = []; lats = []; sc = []; lb = []
     import collections
     ty_ok = collections.Counter(); ty_n = collections.Counter()
@@ -226,6 +233,21 @@ def main(n_test=1000, seg_in=None, seg_gate=False, per_mode=False, dino_seg=Fals
     print(f"阈值扫描: 当前{thr:.4g}→acc={((sc>=thr)==lb).mean():.3f} | "
           f"最优{cands[bi]:.4g}→acc={accs[bi]:.3f} | 损失={accs[bi]-((sc>=thr)==lb).mean():+.3f}", flush=True)
     print(f"两类重叠: {(sc[lb]<=sc[~lb].max()).mean():.1%}", flush=True)
+    pr = getattr(det, "prof", None)
+    if pr:
+        print(f"\n=== 逐段耗时(ms,只统计走满管线的图)===", flush=True)
+        for k in sorted(pr):
+            v = np.array(pr[k])
+            if k.startswith("0_"):
+                print(f"  {k:24s} 早退 {len(v)} 张", flush=True); continue
+            print(f"  {k:24s} n={len(v):4d} 中位={np.median(v):7.1f} p90={np.percentile(v,90):7.1f} "
+                  f"最大={v.max():7.1f}", flush=True)
+        full = [k for k in pr if not k.startswith("0_")]
+        if full:
+            _m = min(len(pr[k]) for k in full)          # 不要用n:外层n是测试总张数
+            tot = np.sum([np.array(pr[k][:_m]) for k in full], axis=0)
+            print(f"  {'合计(满管线)':24s} n={_m:4d} 中位={np.median(tot):7.1f} p90={np.percentile(tot,90):7.1f} "
+                  f"最大={tot.max():7.1f}", flush=True)
     if ty_n:
         tot_ok = sum(ty_ok.values()); tot_n = sum(ty_n.values())
         print(f"\n=== 缺陷类型归属(语义明确的{tot_n}张,含糊类型不计入)===", flush=True)

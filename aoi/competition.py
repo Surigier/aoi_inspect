@@ -495,10 +495,10 @@ class CompetitionLargeDetector:
                 tiled.max_pixels = mp
                 self.lat_trimmed.append(f"max_pixels={mp//1000}k")
                 self.lat_probe_ms = probe()
-        if self.lat_probe_ms > budget and self.sam is not None:
-            self.sam = None                                          # ③弃SAM(5/5域实测reject_all,无证实正贡献)
-            self.lat_trimmed.append("sam")
-            self.lat_probe_ms = probe()
+        # ③【SAM已移出可裁剪清单,勿再加回】逐段计时实测 SAM精化中位 **0.1ms**
+        # (逐区域OOF门控已短路),砍它**省不到任何时间**;而没有SAM收紧掩膜,
+        # 掩膜面积变大 → 类型头的参考特征池化开销随面积上涨(实测17.8ms→89.4ms)。
+        # 砍SAM不但没省时间,反而让下游更慢——纯亏。
         # ④【DINO门已移出可裁剪清单,勿再加回】
         # 原逻辑:超真硬线时弃DINO门。但这笔交易**永远不划算**——弃它省的延时很少,
         # 精度代价却是-0.6量级(cable实锤 0.811→0.171)。而裁剪决策本身建立在一次
@@ -904,14 +904,35 @@ class CompetitionLargeDetector:
             amap = (amap + amap2) / 2.0
         return amap
 
+    def _pf(self, stage, t0):
+        """逐段计时(LOCATE_PROFILE=1 才启用)。GPU是异步的,必须synchronize才能测准,
+        所以只在剖析模式下开——正常推理路径零开销。"""
+        import time as _t
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self.prof.setdefault(stage, []).append((_t.perf_counter() - t0) * 1000)
+        return _t.perf_counter()
+
     def locate(self, img):
         """完整定位输出:图级分(EAD)+ 判决 + 类型 + 像素图 + 检测框。
         延时热路径:EAD/DINO判正常且不处于救援灰区→立即返回,不算WRN分割/SAM/crop级联
         (它们只有判缺陷才有意义,正常图是生产大多数,省的是主要延时)。"""
         import numpy as np
+        import os as _os, time as _time
+        _prof = _os.environ.get("LOCATE_PROFILE") == "1"
+        if _prof:
+            if not hasattr(self, "prof"):
+                self.prof = {}
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _t = _time.perf_counter()
         if torch.cuda.is_available() and img.device.type == "cpu":
             img = img.to(self._bb_loc.device)   # 单次H2D上传:下游EAD/DINO/WRN/aux的.to()全变no-op
+        if _prof:
+            _t = self._pf("1_上传", _t)
         res = self.predict(img)
+        if _prof:
+            _t = self._pf("2_图级判决(EAD+DINO)", _t)
         # 受控补检v6:EAD判正常但处于自适应灰区(score≥g×阈值,g由fit B半联合验证选定)
         # 且seg信号超线→翻正。g与线在fit上按"联合翻正条件零误翻"标定,守不住则整体禁用。
         g = getattr(self, "rescue_gray", None)
@@ -927,8 +948,12 @@ class CompetitionLargeDetector:
                         and self._embed_score(img) >= self._embed_thr)
         if not res["is_defect"] and not rescue_zone and not gcad_trigger:
             res["anomaly_map"] = None; res["mask"] = None; res["boxes"] = []
+            if _prof:
+                self.prof.setdefault("0_早退", []).append(1)
             return res
         amap = self.segment(img)
+        if _prof:
+            _t = self._pf("3_分割头", _t)
         thr = self.pix_thr if self.pix_thr is not None else float(amap.mean() + 3 * amap.std())
         res["anomaly_map"] = amap
         if rescue_zone and float(amap.max()) >= self.rescue_seg_thr:
@@ -947,6 +972,8 @@ class CompetitionLargeDetector:
                 mask = self._zoom_refine(img if img.dim() == 3 else img[0], mask, thr)  # 原生裁块重分割
             if self.sam is not None:
                 mask = self.sam.refine(img if img.dim() == 3 else img[0], mask, amap=amap)  # SAM受控精化(逐区域OOF)
+                if _prof:
+                    _t = self._pf("4_SAM精化", _t)
             if self.crop_cascade is not None:
                 mask = self.crop_cascade.refine(self, img if img.dim() == 3 else img[0], mask, mask.shape)  # 独立crop-head补微小缺陷
             if self.comp_graph is not None:
@@ -956,6 +983,8 @@ class CompetitionLargeDetector:
             from .seg_head import merge_boxes
             boxes = map_to_boxes(mask.astype(np.float32), 0.5, min_area_frac=0.0002, close=0)
             res["boxes"] = merge_boxes(boxes, getattr(self, "box_merge_d", 0))
+            if _prof:
+                _t = self._pf("5_出框", _t)
             # VLM监督的类型头(fit期蒸馏,推理零API)。它要掩膜才能算位置匹配特征,
             # 所以只能放在掩膜产出之后;不可用时res["defect_type"]保持_ztype的启发式结果。
             th = getattr(self, "type_head", None)
@@ -963,6 +992,8 @@ class CompetitionLargeDetector:
                 t = th.predict(self, img, mask, res.get("_raws"))
                 if t is not None:
                     res["defect_type"] = t
+                if _prof:
+                    _t = self._pf("6_类型头", _t)
         else:
             res["mask"] = None
             res["boxes"] = []

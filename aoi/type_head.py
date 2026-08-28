@@ -48,11 +48,30 @@ def _shallow_maps(img):
     return lab[1:3].contiguous(), grad.contiguous()
 
 
-def _mask_at(mask, sz):
-    """掩膜重采样到sz²布尔图;全空时退回全图(宁可信号弱,不要除零)。"""
+MAX_MASK_PX = 2048          # 掩膜内参与池化的像素上限(见_mask_at)
+
+
+def _mask_at(mask, sz, cap=None):
+    """掩膜重采样到sz²布尔图;全空时退回全图(宁可信号弱,不要除零)。
+
+    **cap:掩膜像素上限**。参考特征池化 `self._ref_deep[:, :, m]` 的开销与掩膜面积
+    **成正比**——(30张,768通道,像素数)的中间张量,掩膜大时会炸。
+    逐段计时实测:掩膜大的那轮类型头中位 **89.4ms**(占满管线35%,比图级判决还贵),
+    掩膜紧的那轮只要 17.8ms。
+    做法:超过上限就均匀抽样到上限。类型判别用的是掩膜内特征的**均值**,
+    2048个像素估均值已经足够稳(标准误~1/√2048),多取纯属浪费。"""
     m = F.interpolate(torch.from_numpy(mask.astype(np.float32))[None, None],
                       size=(sz, sz), mode="area")[0, 0] > 0.02
-    return m if m.any() else torch.ones(sz, sz, dtype=torch.bool)
+    if not m.any():
+        return torch.ones(sz, sz, dtype=torch.bool)
+    if cap:
+        idx = m.flatten().nonzero(as_tuple=True)[0]
+        if len(idx) > cap:
+            sel = idx[torch.linspace(0, len(idx) - 1, cap).long()]
+            m = torch.zeros(sz * sz, dtype=torch.bool)
+            m[sel] = True
+            m = m.view(sz, sz)
+    return m
 
 
 def _z_vec(q, R):
@@ -92,8 +111,8 @@ class VLMTypeHead:
 
     def _feat(self, det, img, mask, raws=None):
         """4维位置匹配特征。参考图特征全部走fit期缓存,推理只多一次浅层计算。"""
-        m_s = _mask_at(mask, SZ)
-        m_d = _mask_at(mask, DEEP_G)
+        m_s = _mask_at(mask, SZ, MAX_MASK_PX)
+        m_d = _mask_at(mask, DEEP_G)          # 32²=1024像素,本来就在上限内
         chroma, grad = _shallow_maps(img)
         q_c = chroma[:, m_s].mean(1)
         q_g = float(grad[m_s].mean())

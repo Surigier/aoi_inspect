@@ -152,6 +152,7 @@ class CompetitionLargeDetector:
         self.aux_size = aux_size
         self.use_vlm_type = use_vlm_type
         self._dino_feat = None               # dino_seg专用的独立DINO提取器(见_wrn_dino_feats)
+        self._wrn_cache_on = False; self._wrn_cache = None   # 见 _wrn_feats:作用域限定在locate内
         self.dino_seg = dino_seg             # 分割头吃WRN⊕DINO拼接特征(见_wrn_dino_feats),默认关
         self.seg_gate = seg_gate             # 用分割图当图级判据(见_calibrate_seg_gate),默认关
         self.per_mode_gate = per_mode_gate   # 正常图分模态标定阈值(见_calibrate_dino_gate),默认关,验证后再开
@@ -223,18 +224,32 @@ class CompetitionLargeDetector:
         """img(3,H,W)[0,1] → WRN50 浅层(1,2)特征 (C,128,128)。
         先搬 GPU 再下采样(大图 CPU interpolate 慢),再提特征(~8ms)。
 
-        **不要在这里加"单次locate内缓存"。** 曾为了让seg_head和类型头共用一次前向
-        (省9ms)加过一个只在locate()入口清空的缓存,结果是灾难性的:seg_head.fit()
-        会在**fit期**逐张调用本函数,而fit期没有locate()来清缓存——于是30张缺陷图
-        全部拿到第一张的特征,配上各自不同的掩膜去训分割头,训出来的头是垃圾。
-        表现为图级acc几乎不变(不依赖掩膜)但IoU/框命中塌到接近零
-        (phone_battery IoU 0.399→0.033、框命中0.550→0.013)。
-        省的9ms在200ms预算里毫无意义,风险与收益完全不成比例。"""
-        if img.dim() == 3:
-            img = img.unsqueeze(0)
-        img = img.to(self._bb_loc.device)
-        img = F.interpolate(img, size=(self._seg_in, self._seg_in), mode="bilinear", align_corners=False)
-        return self._bb_loc.extract(img)[0]
+        **缓存有严格作用域:只在 locate() 内生效**(`_wrn_cache_on` 在 locate 入口开、
+        finally 里关)。逐段计时实测:分割头 39.7ms、类型头 87.3ms,而**类型头里那次
+        WRN前向与分割头刚算过的是同一份** —— 同一张图的骨干特征被算了两次。
+
+        历史教训(别再整个删掉):早先加过"只在locate入口清空"的缓存,结果
+        seg_head.fit() 在**fit期**逐张调用本函数,而fit期不进locate()、缓存永不清空,
+        30张缺陷图全部拿到第一张的特征却配各自不同的掩膜去训练,定位直接崩
+        (phone_battery 含漏检IoU 0.399→0.033、框命中0.550→0.013)。
+        **当时的修法是整个删掉缓存,正确的修法是给它加作用域**——fit期开关为False,
+        自然不命中;推理期同一张图内命中,省掉一次完整WRN前向。"""
+        # 缓存**必须按张量身份命中**,不能盲取。血的教训:曾写成"开关打开就返回缓存",
+        # 而 _wrn_feats_diff 会在同一次 locate 内先后传入**测试图和参考图**——参考图
+        # 命中了测试图的缓存 → f - fr = f - f = 全零 → 分割头输入全是零 →
+        # 定位归零(实测 框命中0.0000/IoU 0.0006)。
+        # 用 (data_ptr, shape) 做键:同一次调用里两张图同时存活,地址必不相同,不会误命中。
+        key = (img.data_ptr(), tuple(img.shape))
+        if getattr(self, "_wrn_cache_on", False) and self._wrn_cache is not None \
+                and self._wrn_cache[0] == key:
+            return self._wrn_cache[1]
+        x = img.unsqueeze(0) if img.dim() == 3 else img
+        x = x.to(self._bb_loc.device)
+        x = F.interpolate(x, size=(self._seg_in, self._seg_in), mode="bilinear", align_corners=False)
+        out = self._bb_loc.extract(x)[0]
+        if getattr(self, "_wrn_cache_on", False):
+            self._wrn_cache = (key, out)
+        return out
 
     @torch.no_grad()
     def _wrn_dino_feats(self, img):
@@ -263,9 +278,13 @@ class CompetitionLargeDetector:
                 from .dino_gate import DinoGate
                 self._dino_feat = DinoGate(device=self._bb_loc.device)
             g = self._dino_feat
+        # **按图身份校验**,不能只看"有没有缓存"——否则会拿到上一张图的patch。
+        # (与WRN特征缓存同一类错误:第一版按状态盲取,导致参考图命中测试图的缓存、
+        #  f-fr=全零、定位归零。缓存必须按输入身份命中。)
+        key = (img.data_ptr(), tuple(img.shape)) if hasattr(img, "data_ptr") else None
         pg = getattr(g, "last_patch_grid", None)
-        if pg is None:                                        # 本图还没跑过DINO → 跑一次
-            g._patches(img)
+        if pg is None or getattr(g, "last_key", None) != key:
+            g._patches(img)                                   # 本图没跑过DINO(或缓存是别的图)
             pg = getattr(g, "last_patch_grid", None)
             if pg is None:
                 return f
@@ -783,7 +802,12 @@ class CompetitionLargeDetector:
         """模板差分特征:concat[feat(test), feat(test)-feat(ECC对齐最近邻正常参考)]。"""
         f = self._wrn_feats(img)
         ref = self._ref_bank.aligned_ref(img if img.dim() == 3 else img[0])
-        fr = self._wrn_feats(ref)
+        _on = getattr(self, "_wrn_cache_on", False)
+        self._wrn_cache_on = False        # 双保险:参考图是另一张图,绝不能碰测试图的缓存
+        try:
+            fr = self._wrn_feats(ref)
+        finally:
+            self._wrn_cache_on = _on
         return torch.cat([f, f - fr], dim=0)
 
     def _calibrate_boxes(self, defects, defect_masks):
@@ -916,7 +940,19 @@ class CompetitionLargeDetector:
     def locate(self, img):
         """完整定位输出:图级分(EAD)+ 判决 + 类型 + 像素图 + 检测框。
         延时热路径:EAD/DINO判正常且不处于救援灰区→立即返回,不算WRN分割/SAM/crop级联
-        (它们只有判缺陷才有意义,正常图是生产大多数,省的是主要延时)。"""
+        (它们只有判缺陷才有意义,正常图是生产大多数,省的是主要延时)。
+
+        外壳只负责给WRN特征缓存划定作用域:入口开、finally关(异常路径也保证关闭)。
+        fit期不走这里,所以缓存绝不会跨图污染训练——见 _wrn_feats 的说明。"""
+        self._wrn_cache_on = True
+        self._wrn_cache = None
+        try:
+            return self._locate_inner(img)
+        finally:
+            self._wrn_cache_on = False
+            self._wrn_cache = None
+
+    def _locate_inner(self, img):
         import numpy as np
         import os as _os, time as _time
         _prof = _os.environ.get("LOCATE_PROFILE") == "1"

@@ -38,7 +38,8 @@ class DinoGate:
         self.bank = None                                     # bank 模式
         self.pca_mean = None; self.subspace = None           # subspace 模式
         self.last_cls = None
-        self.last_patch_grid = None                          # (C,g,g) patch网格,供分割头复用(零增量前向)                                 # 上次_patches()顺手缓存的CLS token(GCAD-EmbedAE复用,零增量前向)
+        self.last_patch_grid = None                          # (C,g,g) patch网格,供分割头复用(零增量前向)
+        self.last_key = None                                 # 上面那份缓存属于哪张图(见_patches)                                 # 上次_patches()顺手缓存的CLS token(GCAD-EmbedAE复用,零增量前向)
 
     @torch.no_grad()
     def _patches(self, img):
@@ -51,6 +52,9 @@ class DinoGate:
         pt = t[:, self.m.num_prefix_tokens:, :][0].float()
         g = int(pt.shape[0] ** 0.5)
         self.last_patch_grid = pt.T.reshape(pt.shape[1], g, g) if g * g == pt.shape[0] else None
+        # **必须记录这份缓存属于哪张图**。否则调用方拿到的可能是上一张图的patch——
+        # 与WRN特征缓存踩过的是同一类错误(缓存按"有没有"取,而不是按"是不是这张图"取)。
+        self.last_key = (img.data_ptr(), tuple(img.shape)) if hasattr(img, "data_ptr") else None
         return pt
 
     def build(self, normals):

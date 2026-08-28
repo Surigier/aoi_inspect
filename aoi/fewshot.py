@@ -44,6 +44,23 @@ class FewShotAdapter:
         不变;t下移只会让更多缺陷越线,TPR不降反升。分数跨数量级时用几何中点,
         含0或负数时退回算术中点。空隙不存在(两类重叠)时n_below就紧贴best_t,
         中点≈best_t,**对分布重叠的类目零影响**。"""
+        # ── CALIB_Q:把阈值锚定在**正常图分位数**上(默认关,>0 启用)──────────────
+        # 为什么:原标定在"100正常+30缺陷"上找平衡准确率最优点,阈值必然落在某个观测
+        # 分数上,而30张缺陷是小样本——抽到弱的阈值就低(误报涨)、抽到强的就高(漏检涨)。
+        # 三种子实测:图级acc 在 0.669~0.913 摆动、误报率 7.7%~30.9%(差4倍),
+        # **方差直接来自那30张的抽样**。而赛场上我们不控制评委给哪30张。
+        # 分位数标定只依赖100张正常图(样本多、有代表性),误报率被 (1-q) 直接控住,
+        # 与缺陷抽样解耦。保底:若该阈值连一半fit缺陷都拦不住,说明分位取得过高,
+        # 下调到fit缺陷的中位数,避免走到"永不报警"的极端。
+        import os as _os
+        _q = float(_os.environ.get("CALIB_Q", "0"))
+        if _q > 0 and len(normal_scores) >= 20:
+            import numpy as _np
+            t = float(_np.quantile(_np.asarray(normal_scores, float), _q))
+            if defect_scores and sum(s >= t for s in defect_scores) < len(defect_scores) * 0.5:
+                t = min(t, float(_np.median(_np.asarray(defect_scores, float))))
+            return t
+
         candidates = sorted(set(normal_scores + defect_scores))
         n_pos = len(defect_scores)
         n_neg = len(normal_scores)

@@ -470,12 +470,20 @@ class CompetitionLargeDetector:
                 self._dino_thr = dthr
             return ms
 
+        def probe():
+            """**取3次中位数**,不用单次。单次探针受GPU热状态/瞬时负载影响很大,
+            而裁剪是个一次性的、不可逆的结构决策——用噪声测量去做这种决策,
+            会让同样的代码和数据在不同时刻得出完全不同的模型。
+            三种子实测:图级acc 在 0.669~0.913 之间摆动,正是这个机制在跳。"""
+            import statistics
+            return statistics.median([timed() for _ in range(3)])
+
         self.lat_trimmed = []
-        self.lat_probe_ms = timed()
+        self.lat_probe_ms = probe()
         if self.lat_probe_ms > budget and getattr(ead, "pairs", None) and len(ead.pairs) > 1:
             ead.pairs = ead.pairs[:1]                                # ①弃第二学生
             self.lat_trimmed.append("student2")
-            self.lat_probe_ms = timed()
+            self.lat_probe_ms = probe()
         # ②EAD面积预算降档(方形2500²的主开销;image-area是EAD唯一随图涨的GPU成本,
         #   WRN/SAM/DINO均定尺寸)。1.4M→1.1M→0.9M,每档~-20%EAD耗时,Pareto扫描证实
         #   对纯定位IoU零影响——白拿,排在DINO之前砍。
@@ -486,19 +494,22 @@ class CompetitionLargeDetector:
             if getattr(tiled, "max_pixels", 0) > mp:
                 tiled.max_pixels = mp
                 self.lat_trimmed.append(f"max_pixels={mp//1000}k")
-                self.lat_probe_ms = timed()
+                self.lat_probe_ms = probe()
         if self.lat_probe_ms > budget and self.sam is not None:
             self.sam = None                                          # ③弃SAM(5/5域实测reject_all,无证实正贡献)
             self.lat_trimmed.append("sam")
-            self.lat_probe_ms = timed()
-        if self.lat_probe_ms > hard and getattr(self, "_dino", None) is not None:
-            self._dino = None                                        # ④超真硬线才弃DINO门(cable实锤:
-            self.lat_trimmed.append("dino_gate")                     #   弃它代价可达-0.6+,放到最后才动)
-            self.lat_probe_ms = timed()
+            self.lat_probe_ms = probe()
+        # ④【DINO门已移出可裁剪清单,勿再加回】
+        # 原逻辑:超真硬线时弃DINO门。但这笔交易**永远不划算**——弃它省的延时很少,
+        # 精度代价却是-0.6量级(cable实锤 0.811→0.171)。而裁剪决策本身建立在一次
+        # 噪声探针上,等于"用一次不可靠的测量,去赌掉整个图级判决能力"。
+        # 实测后果:三种子下图级acc 0.669~0.913 剧烈摆动,而延时预算其实一直很宽裕
+        # (中位82ms / 预算200ms)。宁可延时略超(检测时间按比例扣分),
+        # 也不该让准确率崩掉。
         if self.lat_probe_ms > hard and getattr(tiled, "max_pixels", 0) > 700_000:
             tiled.max_pixels = 700_000                               # ⑤最深档(仍超真硬线时)
             self.lat_trimmed.append("max_pixels=700k")
-            self.lat_probe_ms = timed()
+            self.lat_probe_ms = probe()
 
     def _calibrate_rescue(self, normals, defects):
         """受控补检标定(榨干30张图级标签):EAD判正常时,监督信号超'fit零误翻线'才翻正。

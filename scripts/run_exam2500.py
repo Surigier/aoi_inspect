@@ -28,6 +28,7 @@ from PIL import Image
 from aoi.competition import CompetitionLargeDetector
 from scripts.run_scorecard import gt_boxes, box_hit
 
+SEED = int(os.environ.get("EXAM_SEED", "0"))   # 种子贯通:数据抽样+训练,用于多次重复估噪声带
 BIG = 2500
 TILE = 1024                       # **原生尺寸,不缩放**
 POS = [(0, 0), (1276, 0), (0, 1276), (1276, 1276)]     # 4块1024²放进2500²,留缝不重叠
@@ -72,7 +73,7 @@ def pool_of(cat):
     # test=missing_cable/missing_wire/poke_insulation),等于拿A/B/C标阈值去测D/E/F。
     # 这解释了"fit上重叠3/30、test上重叠98.9%"。赛题的30张缺陷是与测试集同分布采样的。
     # 打乱用固定种子 → 依然完全可复现,只是消掉字母序聚类这个人为偏置。
-    random.Random(0).shuffle(ok); random.Random(1).shuffle(ng)
+    random.Random(SEED).shuffle(ok); random.Random(SEED + 1000).shuffle(ng)
     return ok, ng
 
 
@@ -142,7 +143,8 @@ def _panel(pool, cat, is_def, phase="fit"):
 
 
 def main(n_test=1000, seg_in=None, seg_gate=False, per_mode=False, dino_seg=False):
-    torch.manual_seed(0); rng = random.Random(0)
+    torch.manual_seed(SEED); rng = random.Random(SEED)
+    _CUR.clear(); _FITUSED.clear()                 # 每个种子从干净游标开始
     pool = {c: pool_of(c) for c in CATS}
     for c in CATS:
         print(f"  {c}: 正常{len(pool[c][0])} 缺陷{len(pool[c][1])} (原生{Image.open(pool[c][0][0]).size})",
@@ -160,6 +162,9 @@ def main(n_test=1000, seg_in=None, seg_gate=False, per_mode=False, dino_seg=Fals
     t0 = time.time()
     det.fit_fewshot(fit_n, [b for b, _ in fd], defect_masks=[m for _, m in fd])
     print(f"fit完成 {time.time()-t0:.0f}s 阈值={det.decision_threshold():.4f}", flush=True)
+    print(f"!! 延时自适应裁剪={getattr(det,'lat_trimmed',None)} 探针={getattr(det,'lat_probe_ms',None)} "
+          f"DINO门={'在' if getattr(det,'_dino',None) is not None else '**已被砍**'} "
+          f"SAM={'在' if det.sam is not None else '已砍'}", flush=True)
     del fit_n, fd
 
     n_def = int(n_test * 0.3)
@@ -228,6 +233,13 @@ def main(n_test=1000, seg_in=None, seg_gate=False, per_mode=False, dino_seg=Fals
             if ty_n[t]:
                 print(f"  {t:8s} {ty_ok[t]:4d}/{ty_n[t]:4d} = {ty_ok[t]/ty_n[t]:.1%}", flush=True)
         print(f"  **合计    {tot_ok}/{tot_n} = {tot_ok/max(tot_n,1):.1%}**", flush=True)
+    print(f"RESULT seed={SEED} acc={nok/n:.4f} recall={tp/max(tp+fn,1):.4f} "
+          f"fpr={fp/max(fp+tn,1):.4f} hit={np.mean(hits):.4f} iou={np.mean(ious):.4f} "
+          f"lat_med={np.median(lats):.1f} lat_p90={np.percentile(lats,90):.1f} "
+          f"type={tot_ok/max(tot_n,1):.4f}" if ty_n else
+          f"RESULT seed={SEED} acc={nok/n:.4f} recall={tp/max(tp+fn,1):.4f} "
+          f"fpr={fp/max(fp+tn,1):.4f} hit={np.mean(hits):.4f} iou={np.mean(ious):.4f} "
+          f"lat_med={np.median(lats):.1f} lat_p90={np.percentile(lats,90):.1f}", flush=True)
     print("EXAM2500 OK", flush=True)
 
 

@@ -58,7 +58,8 @@ def _mask(lab):
 
 
 def main(n_test_def=1000, **kw):
-    torch.manual_seed(0)
+    SEED = int(os.environ.get("EXAM_SEED", "0"))
+    torch.manual_seed(SEED)
     goods = sorted(glob.glob("data/msd_good/good/*.png"))
     defs = []
     for s in ("train", "val", "test"):
@@ -66,7 +67,7 @@ def main(n_test_def=1000, **kw):
             lab = f.replace("/images/", "/labels/").rsplit(".", 1)[0] + ".txt"
             if os.path.exists(lab) and os.path.getsize(lab) > 0:
                 defs.append((f, lab))
-    random.Random(1).shuffle(defs)                     # 固定种子打乱:避免按目录顺序造成类型偏置
+    random.Random(SEED + 1).shuffle(defs)                     # 固定种子打乱:避免按目录顺序造成类型偏置
     print(f"正常{len(goods)}张(→{N_FIT_NORM}fit/{N_TEST_NORM}test) 缺陷{len(defs)}张", flush=True)
 
     fit_n = [_img(p) for p in goods[:N_FIT_NORM]]
@@ -79,10 +80,13 @@ def main(n_test_def=1000, **kw):
     t0 = time.time()
     det.fit_fewshot(fit_n, [i for i, _ in fit_d], defect_masks=[m for _, m in fit_d])
     print(f"fit完成 {time.time()-t0:.0f}s 阈值={det.decision_threshold():.4f}", flush=True)
+    print(f"!! 延时自适应裁剪={getattr(det,'lat_trimmed',None)} 探针={getattr(det,'lat_probe_ms',None)} "
+          f"DINO门={'在' if getattr(det,'_dino',None) is not None else '**已被砍**'} "
+          f"SAM={'在' if det.sam is not None else '已砍'}", flush=True)
 
     # 测试流:**全部fit没见过的缺陷图** + 5张留出正常图(仅作弱参考,不并入主指标)
     stream = [(d, True) for d in test_d] + [((None, None), False)] * N_TEST_NORM
-    random.Random(2).shuffle(stream)
+    random.Random(SEED + 2).shuffle(stream)
     tp = fn = fp = tn = 0; hits = []; ious = []; lats = []; sc = []; lb = []
     ni = 0
     for item, is_def in stream:
@@ -124,6 +128,9 @@ def main(n_test_def=1000, **kw):
     print(f"\n[弱参考] 留出正常图 {fp+tn} 张 → 误判 {fp} 张。", flush=True)
     print(f"  **不作为指标**:这20张正常图是20个不同手机型号(已看图确认),", flush=True)
     print(f"  没有一致的『正常』类可建模,拿没见过的机型测必然报异常——是数据结构问题,不是方法问题。", flush=True)
+    print(f"RESULT seed={SEED} recall={tp/max(nd,1):.4f} hit={hh.mean():.4f} "
+          f"iou={ii.mean():.4f} hit_det={hh[hh>0].mean() if (hh>0).any() else 0:.4f} "
+          f"lat_med={np.median(lats):.1f}", flush=True)
     print("PHONE_EXAM OK", flush=True)
 
 

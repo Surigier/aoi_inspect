@@ -39,7 +39,11 @@ LARGE_THRESHOLD = 1024          # 长边 ≥ 此值 → 走大图分块路径(�
 
 
 def _img_files(d):
-    return [p for p in sorted(Path(d).iterdir()) if p.suffix in IMG_EXT]
+    """列目录里的图像文件。排除 *_mask.* —— 使用文档允许掩膜与缺陷图同目录同名放置,
+    掩膜是标注不是样本;不排除的话30张二值掩膜会被当缺陷图混进fit,污染阈值标定与
+    分割头(考官机模拟第三轮实锤:缺陷数 30→60)。"""
+    return [p for p in sorted(Path(d).iterdir())
+            if p.suffix in IMG_EXT and not p.stem.endswith("_mask")]
 
 
 def _load_images(d, size):

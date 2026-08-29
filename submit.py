@@ -4,7 +4,7 @@
 
 对未知产品:用 normal/(~100 正常)+ defect/(~30 缺陷)现场迁移(fit_fewshot,无梯度训练),
 再对 test/ 下每个**图片或视频**输出判决。视频走逐帧+时序平滑+事件聚合(早期拦截)。
-按图尺寸自动路由:长边≥1024 → 大图混合(全局5分支@320 + 局部ResNet18分块);否则常规 resize。"""
+少样本一律走生产检测器(原生分辨率,含定位框输出);--zeroshot 走独立CLIP路径。"""
 import argparse
 import csv
 import os
@@ -237,13 +237,18 @@ def main():
     else:
         if not args.normal or not args.defect:
             raise SystemExit("少样本模式需 --normal 与 --defect;或加 --zeroshot 走无样本")
-        large = args.mode == "large" or (args.mode == "auto" and _decide_large(args.normal))
-        if large:
-            print("路由:大图混合(全局5分支@320 + 局部ResNet18分块)", flush=True)
-            rows, thr = _run_large(args, device)
-        else:
-            print("路由:常规(resize 5分支ensemble)", flush=True)
+        # 少样本一律走生产检测器(CompetitionLargeDetector),不再按图尺寸路由。
+        # 依据(2026-08-29考官机模拟实锤):Real-IAD 256²小图被旧路由送进遗留的
+        # "resize 5分支"路径,输出boxes列**全空**——赛题定位分直接归零;而生产检测器
+        # 本来就是在256²原生图上跑出全部成绩单的(12类目均值acc=0.817),对小图
+        # 既是精度最优也是唯一有定位输出的路径。_run_small保留仅作历史参照,
+        # 只有显式 --mode small 才会进(不建议)。
+        if args.mode == "small":
+            print("路由:遗留small路径(仅显式指定;无定位框输出,不建议)", flush=True)
             rows, thr = _run_small(args, Backbone(pretrained=True, device=device))
+        else:
+            print("路由:生产检测器(EAD+DINO门+监督分割+SAM+类型头,原生分辨率)", flush=True)
+            rows, thr = _run_large(args, device)
 
     with open(args.out, "w", newline="") as f:
         w = csv.writer(f)

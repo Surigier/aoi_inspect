@@ -81,20 +81,21 @@ def main(out="exam_data"):
             shutil.copy(RI / c / x["image_path"], root / "defect" / f"d{di:03d}.png")
             m = np.array(Image.open(RI / c / x["mask_path"]).convert("L")) > 0
             Image.fromarray((m * 255).astype(np.uint8)).save(root / "mask" / f"d{di:03d}.png"); di += 1
-    pb = phone_best_defects(7 + 15)
+    pb = phone_best_defects(7 + 45)
     for f, m, _ in pb[:7]:
         Image.open(f).save(root / "defect" / f"d{di:03d}.png")
         Image.fromarray((m * 255).astype(np.uint8)).save(root / "mask" / f"d{di:03d}.png"); di += 1
 
-    # 测试流 300:缺陷 90(25/25/25 Real-IAD + 15 phone_best),正常 210(70/70/70)
+    # 测试流 1000(赛题量级):缺陷 300(85/85/85 Real-IAD + 45 phone_best),
+    # 正常 700(234/233/233,取自测试OK,与fit正常图零重叠)
     rows, pool = [], []
-    for c, quota in zip(cats, (25, 25, 25)):
+    for c, quota in zip(cats, (85, 85, 85)):
         for x in picked[c][1][30:30 + quota]:          # 避开fit缺陷
             pool.append((RI / c / x["image_path"], "缺陷"))
-    for f, _, _ in pb[7:22]:
+    for f, _, _ in pb[7:52]:
         pool.append((f, "缺陷"))
-    for c in cats:
-        for x in picked[c][2][:70]:
+    for c, quota in zip(cats, (234, 233, 233)):
+        for x in picked[c][2][:quota]:
             pool.append((RI / c / x["image_path"], "正常"))
     RNG.shuffle(pool)
     for i, (src, truth) in enumerate(pool):

@@ -154,6 +154,16 @@ def do_fit_files(nfiles, dfiles, mfiles):
 
 
 def _fit_core(imgs, dimg, dmsk, product):
+    # 重复fit的显存泄漏修复:每次fit新建一整套模型(EAD+DINOv2+WRN+SAM+类型头),
+    # 旧检测器被STATE替换后PyTorch缓存分配器不还显存——实测几轮fit后7.9/8.2GB打满,
+    # WSL2下CUDA溢出到Windows共享内存,locate从~90ms劣化到~890ms(10倍)。
+    # 必须先显式释放旧模型再建新的。
+    if STATE["det"] is not None:
+        STATE.update(det=None, loop=None)
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     det = CompetitionLargeDetector()
     t0 = time.time()
     # 用 ActiveLearningLoop 承载:它维护样本集,操作员反馈时可增量重拟合

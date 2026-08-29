@@ -25,7 +25,7 @@ os.environ.setdefault("HF_HUB_CACHE", str(Path(__file__).resolve().parent.parent
 from aoi.competition import CompetitionLargeDetector          # noqa: E402
 from aoi.active_learning import ActiveLearningLoop             # noqa: E402
 
-ROOT = Path("demo_data")
+ROOT = Path(".")
 STATE = {"det": None, "loop": None, "product": None, "fit_sec": 0}
 
 
@@ -40,7 +40,10 @@ def _mask(p, hw=(256, 256)):
 
 
 def products():
-    return sorted([d.name for d in ROOT.iterdir() if d.is_dir()]) if ROOT.exists() else []
+    """只列出符合协议结构(含 normal/ 子目录)的产品目录,不暴露其他文件。"""
+    if not ROOT.exists():
+        return []
+    return sorted([d.name for d in ROOT.iterdir() if d.is_dir() and (d / "normal").is_dir()])
 
 
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
@@ -297,8 +300,8 @@ def build():
         gr.Markdown("# 🔍 可自学习的 AOI 实时在线 AI 质检")
         with gr.Tab("① 迁移学习(不计时)"):
             with gr.Row():
-                root_tb = gr.Textbox(str(ROOT), label="数据根目录(可自选:下含 <产品>/normal|defect|mask|test)",
-                                     scale=3)
+                root_tb = gr.Textbox("", placeholder="输入数据根目录(下含 <产品>/normal|defect|mask|test)",
+                                     label="数据根目录", scale=3)
                 btn_root = gr.Button("应用目录", scale=1)
             with gr.Row():
                 prod = gr.Dropdown(ps, value=(ps[0] if ps else None), label="选择产品")
@@ -435,7 +438,7 @@ def build():
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=7860)
-    ap.add_argument("--root", default="demo_data")
+    ap.add_argument("--root", default=".")
     a = ap.parse_args()
     ROOT = Path(a.root)
     build().launch(server_name="0.0.0.0", server_port=a.port, share=False, show_api=False)

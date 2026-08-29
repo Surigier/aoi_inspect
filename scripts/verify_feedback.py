@@ -1,10 +1,13 @@
 """实测验证:操作员反馈是否**真的动态改变了模型参数**,以及漏检是否被救回。
 
 赛题原文要求"动态调整模型参数"。仅靠读代码说"会重训"是不够的,这里做端到端实测:
-  1) 用29张缺陷fit(留1张不给),在测试集里找一张**被漏检**的图
-  2) 记录:监督分割头的权重指纹、判决阈值、DINO门阈值、像素阈值
+  1) 用29张缺陷fit,在**留出**测试集里找一张被漏检的图
+  2) 记录反馈前基线:权重指纹/各标定量 + 留出缺陷召回 + **留出正常图误报率**
   3) 操作员反馈那张漏检图(带掩膜)
-  4) 复查:权重是否真的变了、那张图是否被救回、其余样本有没有被带崩
+  4) 复查:权重变了没、那张图救回了没、**召回和误报各自动了多少**
+
+**为什么必须有留出正常图**:救一张漏检最省事的办法就是把阈值压低,代价全部转嫁到
+误报上。只报"救回了"而不报误报涨了多少,是在自欺。零回退纪律要求两边一起看。
 
 用法:PYTHONPATH=. python scripts/verify_feedback.py [类目=cable]
 """
@@ -62,6 +65,7 @@ def main(cat="cable"):
                     df.append((str(f), str(m)))
     random.Random(0).shuffle(df)
     fit_d, test_d = df[:29], df[29:60]
+    ho_n = sorted(glob.glob(str(root / "test/good/*.png")))      # 留出正常图,量误报
 
     print(f"[1/4] 初始迁移学习:{cat} 正常{len(ns)} + 缺陷{len(fit_d)}", flush=True)
     det = CompetitionLargeDetector()
@@ -70,6 +74,16 @@ def main(cat="cable"):
                               defect_masks=[mask_of(m) for _, m in fit_d])
     before = fingerprint(det)
     print(f"      反馈前:{before}", flush=True)
+
+    def evaluate(tag):
+        """留出集上的召回 + 误报率。反馈前后各跑一次,才谈得上'有没有变好'。"""
+        rec = [det.locate(load(p))["is_defect"] for p, _ in test_d]
+        fp = [det.locate(load(p))["is_defect"] for p in ho_n]
+        print(f"      [{tag}] 留出缺陷召回 {sum(rec)}/{len(rec)}={sum(rec)/len(rec):.1%}"
+              f" | 留出正常误报 {sum(fp)}/{len(fp)}={sum(fp)/len(fp):.1%}", flush=True)
+        return sum(rec) / len(rec), sum(fp) / len(fp)
+
+    base_rec, base_fp = evaluate("反馈前基线")
 
     print("[2/4] 在测试集里找一张被漏检的缺陷图", flush=True)
     missed = None
@@ -101,12 +115,19 @@ def main(cat="cable"):
         print(f"  {k:14s} {mark}   {before[k]} → {after[k]}", flush=True)
     o = det.locate(missed[2])
     print(f"\n=== 该漏检样本是否被救回 ===", flush=True)
+    # o["score"]是EAD原始分,和decision_threshold()(融合z空间)不同空间,
+    # 并排打印会误导——显示分改用与阈值同口径的frame_score。
     print(f"  反馈后判定:{'✅ 检出' if o['is_defect'] else '❌ 仍漏检'} "
-          f"(异常分{o['score']:.4f} / 阈值{det.decision_threshold():.4f})", flush=True)
-    rest = [x for x in test_d if x[0] != missed[0]][:20]
-    det_n = sum(1 for p, _ in rest if det.locate(load(p))["is_defect"])
-    print(f"\n=== 其余{len(rest)}张缺陷有没有被带崩 ===", flush=True)
-    print(f"  反馈后检出 {det_n}/{len(rest)} = {det_n/max(len(rest),1):.1%}", flush=True)
+          f"(融合分{det.frame_score(missed[2]):.4f} / 阈值{det.decision_threshold():.4f})", flush=True)
+    print(f"\n=== 留出集:召回和误报各自动了多少 ===", flush=True)
+    new_rec, new_fp = evaluate("反馈后")
+    print(f"  召回   {base_rec:.1%} → {new_rec:.1%}  ({new_rec-base_rec:+.1%})", flush=True)
+    print(f"  误报   {base_fp:.1%} → {new_fp:.1%}  ({new_fp-base_fp:+.1%})", flush=True)
+    if getattr(det, "_fb_unsat", None):
+        print(f"  ⚠️ 约束不可满足:{det._fb_unsat}", flush=True)
+    ok = (new_rec >= base_rec) and (new_fp - base_fp <= 0.05)
+    print(f"\n判定:{'✅ 反馈净正(召回不退且误报涨幅≤5pp)' if ok else '❌ 反馈判负,按零回退纪律应回退'}",
+          flush=True)
     print("VERIFY_FEEDBACK OK", flush=True)
 
 

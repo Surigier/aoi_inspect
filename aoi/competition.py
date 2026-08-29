@@ -153,6 +153,9 @@ class CompetitionLargeDetector:
         self.use_vlm_type = use_vlm_type
         self._dino_feat = None               # dino_seg专用的独立DINO提取器(见_wrn_dino_feats)
         self._wrn_cache_on = False; self._wrn_cache = None   # 见 _wrn_feats:作用域限定在locate内
+        # 操作员反馈样本(见 _calibrate_dino_gate 末尾的硬约束):这些图是**人亲口标的**,
+        # 不能和另外130张fit样本平权投票,否则1票在130票里等于没投。
+        self._fb_defects = []; self._fb_normals = []; self._fb_unsat = None
         self.dino_seg = dino_seg             # 分割头吃WRN⊕DINO拼接特征(见_wrn_dino_feats),默认关
         self.seg_gate = seg_gate             # 用分割图当图级判据(见_calibrate_seg_gate),默认关
         self.per_mode_gate = per_mode_gate   # 正常图分模态标定阈值(见_calibrate_dino_gate),默认关,验证后再开
@@ -623,10 +626,81 @@ class CompetitionLargeDetector:
         self._dino_stats = (emu, esd, dmu, dsd)
         self._dino_fuse = fz2
         self._dino_thr = FewShotAdapter._calibrate(zn, zd)
+        self._apply_feedback_constraint(ead, gate, zn)
         # 注:曾试"病态标定守卫"(阈值漏过半fit缺陷→重标)治cable翻车,实测无效——病态是
         # fit/test漂移(fit缺陷强/test弱),fit侧看不见;守卫触发时反而重标低→pcb图级acc掉0.011。
         # 已撤,守卫类思路对这种"fit侧看不见test漂移"的病理普遍无效(seg_head/component_graph
         # 门控今天也撞了同一堵墙)——真正有效的是"永远融合"这种不依赖fit侧判断的确定性设计。
+
+    #: 反馈硬约束最多允许把 fit 正常图的误报率推到这个绝对上限。
+    #: 取10%的依据:生产实测误报率12.2%,若允许反馈把fit侧推到与之同量级,等于
+    #: 把"救一张漏检"的代价放大到整条产线。10%是"还能救回大多数单点漏检、又不至于
+    #: 让误报翻倍"的位置;超过它就宁可不救,并把不可满足如实告诉操作员。
+    FB_FP_CAP = 0.10
+
+    def _apply_feedback_constraint(self, ead, gate, zn):
+        """**操作员反馈的硬约束**:人亲口标过的样本,必须判对。
+
+        为什么要有:图级判决走的是 self._dino_thr,而它由 _calibrate(zn, zd) 在
+        100张正常+30张缺陷上按平衡准确率选点。操作员反馈一张漏检,只是往那130票里
+        加了1票——实测(scripts/verify_feedback.py, cable)阈值从 1.69098 变成
+        1.69098,**小数点后五位都没动**,那张图反馈后依然漏检。分割头权重确实重训了
+        (指纹 4f1d5f3d150d → 4ffabf2aee95),但操作员看到的"这张是不是缺陷"没变。
+        赛题要求的是"操作员反馈→动态调整",不是"调了但judgement不变"。
+
+        做法:把反馈样本从"投票"升格为"约束"。
+          - 报过漏检的图 → 阈值必须 ≤ 它们的最低分(让它们全部过线)
+          - 报过误检的图 → 阈值必须 > 它们的最高分(让它们全部不过线)
+        两条约束都用 fit 正常图的误报率上限 FB_FP_CAP 兜底:**宁可救不回,也不让
+        单张反馈把整条产线的误报推上去**。约束不可满足(比如两类反馈样本的分数区间
+        交叉、或救它要付超过10%误报)时,退回平衡阈值,并把不可满足的样本记在
+        self._fb_unsat 里——界面据此如实告诉操作员"这张图与正常样本在当前特征下
+        不可分",而不是假装修好了。"""
+        import numpy as np
+        self._fb_unsat = None
+        if not self._fb_defects and not self._fb_normals:
+            return
+
+        def _z(im):
+            e = ead.score(im); d = gate.score(im)
+            k = _assign_mode(gate.last_cls.detach().cpu(), self._modes)
+            return float(_mode_z(e, d, self._modes[k]))
+
+        zd_fb = [_z(x) for x in self._fb_defects]
+        zn_fb = [_z(x) for x in self._fb_normals]
+        zn = np.asarray(zn, dtype=float)
+        base = float(self._dino_thr)
+
+        lo = float(np.quantile(zn, 1.0 - self.FB_FP_CAP))   # 阈值不得低于此,否则误报超上限
+        want_dn = min(zd_fb) - 1e-6 if zd_fb else None       # 漏检反馈要求阈值降到这
+        want_up = max(zn_fb) + 1e-6 if zn_fb else None       # 误检反馈要求阈值升到这
+
+        thr, unsat = base, []
+        if want_dn is not None:
+            if want_dn < lo:
+                # **救不回就一动不动**。第一版在这里仍把阈值压到lo("尽力而为"),
+                # 实测判负(scripts/verify_feedback.py, cable):fit口径只从7%涨到10%,
+                # 留出正常图误报却 6.9%→24.1%(+17.2pp),召回+0,那张图照样漏——
+                # fit正常图参与过标定、分布偏紧,fit口径的10%严重低估真实误报。
+                # 付出17个点误报、换回0张召回,这钱不能花。
+                unsat.append(f"{len(zd_fb)}张漏检反馈中最低分{min(zd_fb):.4g}低于误报上限"
+                             f"对应的阈值{lo:.4g},救它要付>{self.FB_FP_CAP:.0%}误报,"
+                             f"阈值维持不动")
+            else:
+                thr = min(thr, want_dn)
+        if want_up is not None:
+            if want_dn is not None and want_up >= want_dn:
+                unsat.append(f"误检反馈最高分{max(zn_fb):.4g} ≥ 漏检反馈最低分"
+                             f"{min(zd_fb):.4g},两类反馈样本在当前特征下不可分")
+            else:
+                thr = max(thr, want_up)
+        self._dino_thr = thr
+        self._fb_unsat = unsat or None
+        print(f"!! 反馈硬约束: 阈值 {base:.5g} → {thr:.5g} "
+              f"(漏检反馈{len(zd_fb)}张/误检反馈{len(zn_fb)}张, "
+              f"fit正常图误报 {float((zn > base).mean()):.1%} → "
+              f"{float((zn > thr).mean()):.1%})"
+              + (f" ⚠️{unsat[0]}" if unsat else ""), flush=True)
 
     def _seg_stat(self, img):
         """把分割图压成一个图级标量:取前0.1%像素的均值(比单点max稳,比全图均值敏感)。

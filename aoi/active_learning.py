@@ -74,6 +74,10 @@ class ActiveLearningLoop:
             except Exception:
                 diag = None
         self.last_diagnosis = diag
+        # 登记为**硬约束样本**(见 competition._apply_feedback_constraint):
+        # 只进样本集的话,1张在130张里投不出票——实测阈值纹丝不动、那张图依然漏检。
+        fb = self.adapter._fb_defects if is_defect else self.adapter._fb_normals
+        fb.append(image)
         if is_defect:
             self.defects.append(image)
             if self.masks is not None:

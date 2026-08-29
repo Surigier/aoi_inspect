@@ -42,9 +42,14 @@ def products():
     return sorted([d.name for d in ROOT.iterdir() if d.is_dir()]) if ROOT.exists() else []
 
 
+IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
+
+
 def files_of(product, sub):
     d = ROOT / product / sub
-    return sorted([p.name for p in d.glob("*.png")]) if d.exists() else []
+    if not d.exists():
+        return []
+    return sorted([p.name for p in d.iterdir() if p.suffix.lower() in IMG_EXTS])
 
 
 def _seg_fp(det):
@@ -116,6 +121,12 @@ def do_fit(product, n_norm, n_def, progress=None):
         return "请先选择产品"
     ns = files_of(product, "normal")[:int(n_norm)]
     ds = files_of(product, "defect")[:int(n_def)]
+    if not ns or not ds:
+        return f"### ⚠️ 目录不完整:normal {len(ns)} 张 / defect {len(ds)} 张,两者都不能为空"
+    missing = [f for f in ds if not (ROOT / product / "mask" / f).exists()]
+    if missing:
+        return (f"### ⚠️ {len(missing)} 张缺陷图缺少同名掩膜(mask/ 目录):"
+                f"{missing[:5]}{'...' if len(missing) > 5 else ''}")
     imgs = [_load(ROOT / product / "normal" / f) for f in ns]
     dimg = [_load(ROOT / product / "defect" / f) for f in ds]
     dmsk = [_mask(ROOT / product / "mask" / f) for f in ds]
@@ -146,18 +157,24 @@ def _answers(product):
         return {r[0]: r[1] for r in list(csv.reader(f))[1:]}
 
 
-def run_test(files, progress=None):
+def run_test(files, uploads=None, progress=None):
     det, product = STATE["det"], STATE["product"]
     if det is None:
         return [], None, "### ⚠️ 请先在 ① 完成迁移学习"
-    if not files:
-        return [], None, "### 请勾选待检文件"
+    todo = [(f, ROOT / product / "test" / f) for f in (files or [])]
+    # 自选文件:操作员上传任意图片(现场抓拍等),无对照答案,只出判定不计准确率
+    for u in (uploads or []):
+        up = Path(getattr(u, "name", u))
+        if up.suffix.lower() in IMG_EXTS:
+            todo.append((up.name, up))
+    if not todo:
+        return [], None, "### 请勾选待检文件或上传图片"
     ans = _answers(product)
     gal, rows = [], []
     tp = fn = fp = tn = 0
     lats = []
-    for f in files:
-        img = _load(ROOT / product / "test" / f)
+    for f, path in todo:
+        img = _load(path)
         t0 = time.time(); o = det.locate(img); ms = (time.time() - t0) * 1000
         lats.append(ms)
         truth = ans.get(f, "?")
@@ -170,12 +187,13 @@ def run_test(files, progress=None):
         gal.append((render(img, o, ms=ms), f"{f} {mark}"))
         rows.append([f, truth, pred, o["defect_type"], f"{o['score']:.3f}",
                      len(o.get("boxes") or []), f"{ms:.0f}", mark])
-    n = len(files)
-    md = (f"### 检测完成 · {n} 张\n"
+    n = len(todo)
+    n_ans = tp + fn + fp + tn          # 只有带对照答案的图才计入准确率,上传的自选图不稀释
+    md = (f"### 检测完成 · {n} 张(其中 {n_ans} 张有对照答案)\n"
           f"| | 值 |\n|---|---|\n"
           f"| 检出(TP) | {tp} |\n| 漏检(FN) | {fn} |\n"
           f"| 误报(FP) | {fp} |\n| 正常正确(TN) | {tn} |\n"
-          f"| **图级准确率** | **{(tp+tn)/max(n,1):.1%}** |\n"
+          f"| **图级准确率** | **{(tp+tn)/max(n_ans,1):.1%}** |\n"
           f"| 召回 | {tp/max(tp+fn,1):.1%} |\n"
           f"| 误报率 | {fp/max(fp+tn,1):.1%} |\n"
           f"| 延时 中位/p90 | {np.median(lats):.0f} / {np.percentile(lats,90):.0f} ms(预算200ms) |\n")
@@ -233,6 +251,10 @@ def build():
         gr.Markdown("# 🔍 可自学习的 AOI 实时在线 AI 质检")
         with gr.Tab("① 迁移学习(不计时)"):
             with gr.Row():
+                root_tb = gr.Textbox(str(ROOT), label="数据根目录(可自选:下含 <产品>/normal|defect|mask|test)",
+                                     scale=3)
+                btn_root = gr.Button("应用目录", scale=1)
+            with gr.Row():
                 prod = gr.Dropdown(ps, value=(ps[0] if ps else None), label="选择产品")
                 nn = gr.Number(100, label="正常图张数", precision=0)
                 nd = gr.Number(30, label="缺陷图张数", precision=0)
@@ -242,11 +264,23 @@ def build():
                 g2 = gr.Gallery(label="缺陷样本 + 人工标注(绿框)", columns=6, height=200)
             btn_fit = gr.Button("开始迁移学习", variant="primary")
             fit_out = gr.Markdown()
+            def _set_root(path):
+                global ROOT
+                d = Path(path).expanduser()
+                if not d.is_dir():
+                    return gr.update(), f"### ⚠️ 目录不存在:{d}"
+                ROOT = d
+                new_ps = products()
+                return gr.update(choices=new_ps, value=(new_ps[0] if new_ps else None)), \
+                       f"已切换到 `{d}`,找到 {len(new_ps)} 个产品目录"
+            btn_root.click(_set_root, root_tb, [prod, info])
             prod.change(preview_fit, prod, [g1, g2, info])
             app.load(preview_fit, prod, [g1, g2, info])
             btn_fit.click(do_fit, [prod, nn, nd], fit_out)
         with gr.Tab("② 在线检测(计时)"):
             tf = gr.CheckboxGroup([], label="勾选待检文件(来自 test/ 混合流)")
+            up = gr.File(label="或上传自选图片(现场抓拍等,可多张;无对照答案,不计入准确率)",
+                         file_count="multiple", file_types=["image"])
             with gr.Row():
                 btn_all = gr.Button("全选"); btn_run = gr.Button("开始检测", variant="primary")
             res_md = gr.Markdown()
@@ -264,7 +298,7 @@ def build():
             prod.change(_refresh, prod, [tf, one])
             app.load(_refresh, prod, [tf, one])
             btn_all.click(lambda p: gr.update(value=files_of(p, "test")), prod, tf)
-            btn_run.click(run_test, tf, [gal, tbl, res_md])
+            btn_run.click(run_test, [tf, up], [gal, tbl, res_md])
             btn_ex.click(explain_one, one, ex_md)
         with gr.Tab("③ 操作员反馈(自学习)"):
             gr.Markdown(
@@ -273,27 +307,34 @@ def build():
                 "在 ② 里看到判错的图 → 在这里选中它、标出真实情况 → 提交反馈。系统会:\n"
                 "1. **用 VLM 当场说出这是什么缺陷**(不是 z 分,是人话)\n"
                 "2. **把样本并入训练集并重训监督分割头**(真正改模型参数,不只是调阈值)\n"
-                "3. 重标判决阈值 / DINO门 / 像素阈值 / 缺陷类型质心\n\n"
+                "3. 重标判决阈值 / DINO门 / 像素阈值 / 缺陷类型质心\n"
+                "4. 反馈样本作为**硬约束**参与阈值标定;若救回它要付出超过10%的误报"
+                "(留出实测这种情况付+17.2pp误报换0召回),系统会**如实告知救不回**,"
+                "而不是牺牲整条产线\n\n"
                 "> 漏检反馈跳过 EAD 学生重训——学生只在正常图上训,新增的是缺陷图,"
                 "重训纯属浪费。实测单轮 **1193s → 251s**,这是『实时』能成立的关键。")
             with gr.Row():
                 fb_file = gr.Dropdown([], label="选择判错的图(来自 test/)")
+                fb_up = gr.File(label="或上传判错的自选图片", file_count="single", file_types=["image"])
                 fb_truth = gr.Radio(["缺陷(漏检了)", "正常(误报了)"], value="缺陷(漏检了)",
                                     label="操作员判定的真实情况")
             fb_btn = gr.Button("提交反馈 → 自学习", variant="primary")
             fb_img = gr.Image(label="反馈样本")
             fb_md = gr.Markdown()
 
-            def _do_fb(fname, truth):
+            def _do_fb(fname, upfile, truth):
                 loop, product = STATE["loop"], STATE["product"]
                 if loop is None:
                     return None, "### ⚠️ 请先在 ① 完成迁移学习"
-                if not fname:
-                    return None, "### 请选择一张图"
-                img = _load(ROOT / product / "test" / fname)
+                if upfile is not None:                        # 上传的自选图优先
+                    img = _load(getattr(upfile, "name", upfile))
+                elif fname:
+                    img = _load(ROOT / product / "test" / fname)
+                else:
+                    return None, "### 请选择一张图或上传图片"
                 is_def = truth.startswith("缺陷")
                 det = STATE["det"]
-                before = (float(det.threshold), _seg_fp(det))
+                before = (float(det.decision_threshold()), _seg_fp(det))
                 mk = None
                 if is_def:                       # 漏检反馈:用当前预测掩膜当标注(现场没有GT)
                     o = det.locate(img)
@@ -305,7 +346,7 @@ def build():
                 n_n, n_d = loop.feedback(img, is_defect=is_def, mask=mk)
                 sec = time.time() - t0
                 diag = getattr(loop, "last_diagnosis", None)
-                after = (float(det.threshold), _seg_fp(det))
+                after = (float(det.decision_threshold()), _seg_fp(det))
                 o2 = det.locate(img)
                 md = [f"### ✅ 反馈已生效({sec:.0f}s)",
                       f"- 样本库:正常 {n_n} / 缺陷 {n_d}"]
@@ -315,16 +356,21 @@ def build():
                     md.append("- VLM 诊断不可用(无外网/无key)→ 仅记录样本,不影响自学习")
                 md += ["", "#### 模型参数变化(证明是真的在改模型,不是只调阈值)",
                        "| 项 | 反馈前 | 反馈后 | |", "|---|---|---|---|",
-                       f"| 判决阈值 | {before[0]:.4f} | {after[0]:.4f} | "
+                       f"| 图级判决阈值 | {before[0]:.4f} | {after[0]:.4f} | "
                        f"{'✅变了' if before[0]!=after[0] else '未变'} |",
                        f"| 分割头权重指纹 | `{before[1]}` | `{after[1]}` | "
                        f"{'✅重训了' if before[1]!=after[1] else '未变'} |",
                        "", f"#### 该样本反馈后的判定:"
                            f"{'🔴 缺陷' if o2['is_defect'] else '🟢 正常'} "
-                           f"(异常分 {o2['score']:.4f} / 阈值 {det.decision_threshold():.4f})"]
+                           f"(融合分 {det.frame_score(img):.4f} / 阈值 {det.decision_threshold():.4f})"]
+                # **救不回就说救不回**:硬约束受"fit正常图误报率≤10%"兜底,压不下去时
+                # 不能让界面显示得像修好了——操作员据此才知道该补样本还是换角度拍。
+                for u in (getattr(det, "_fb_unsat", None) or []):
+                    md.append(f"\n> ⚠️ **该反馈无法完全满足**:{u}。系统已保住误报率上限,"
+                              f"未强行压低阈值。建议补几张同类缺陷样本后重新迁移。")
                 return render(img, o2), "\n".join(md)
 
-            fb_btn.click(_do_fb, [fb_file, fb_truth], [fb_img, fb_md])
+            fb_btn.click(_do_fb, [fb_file, fb_up, fb_truth], [fb_img, fb_md])
             prod.change(lambda p: gr.update(choices=files_of(p, "test")), prod, fb_file)
             app.load(lambda p: gr.update(choices=files_of(p, "test")), prod, fb_file)
 

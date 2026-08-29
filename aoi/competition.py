@@ -156,6 +156,7 @@ class CompetitionLargeDetector:
         # 操作员反馈样本(见 _calibrate_dino_gate 末尾的硬约束):这些图是**人亲口标的**,
         # 不能和另外130张fit样本平权投票,否则1票在130票里等于没投。
         self._fb_defects = []; self._fb_normals = []; self._fb_unsat = None
+        self._fb_frozen = None
         self.dino_seg = dino_seg             # 分割头吃WRN⊕DINO拼接特征(见_wrn_dino_feats),默认关
         self.seg_gate = seg_gate             # 用分割图当图级判据(见_calibrate_seg_gate),默认关
         self.per_mode_gate = per_mode_gate   # 正常图分模态标定阈值(见_calibrate_dino_gate),默认关,验证后再开
@@ -345,6 +346,17 @@ class CompetitionLargeDetector:
         才允许**——EAD学生只在正常图上训,缺陷图只参与阈值标定,所以操作员反馈漏检
         (新增缺陷图)时重训学生纯属浪费。用于ActiveLearningLoop的增量反馈,见
         aoi/active_learning.py。"""
+        # 反馈快路径同时**冻结图级判决阈值**:两轮留出实测(scripts/verify_feedback.py,
+        # cable),往130张标定集里加1张反馈样本重投票,平衡准确率最优点会在near-tie
+        # 候选间跳变——第一轮一动不动(1.691→1.691),第二轮同机制跳了0.35
+        # (2.006→1.660),留出误报+15.5pp换召回+3.2pp,净负。单样本对重投票的影响
+        # 是随机的,而fit侧只显示4%误报、留出实际20.7%(fit/test漂移,老病)。
+        # 所以反馈期图级阈值只走 _apply_feedback_constraint 这一条确定性通道;
+        # z空间可比性恰好由retrain_ead=False保证(EAD学生未动、正常图同一批)。
+        # 离线完整重训(retrain_ead=True)不冻结,照常重标。
+        self._fb_frozen = None
+        if not retrain_ead and self.threshold is not None:
+            self._fb_frozen = (float(self.threshold), getattr(self, "_dino_thr", None))
         self.stats = []
         for i, b in enumerate(self.branches):
             if i == 0:
@@ -360,6 +372,8 @@ class CompetitionLargeDetector:
         ns = [ead.score(x) for x in normals]
         ds = [ead.score(d) for d in defects]
         self.threshold = FewShotAdapter._calibrate(ns, ds)    # 阈值标在 EAD 分上
+        if self._fb_frozen is not None:
+            self.threshold = self._fb_frozen[0]               # 反馈期冻结,见方法开头
         if defect_masks is not None:
             d_imgs, d_masks = list(defects), list(defect_masks)
             if self.roi_zoom:
@@ -626,6 +640,8 @@ class CompetitionLargeDetector:
         self._dino_stats = (emu, esd, dmu, dsd)
         self._dino_fuse = fz2
         self._dino_thr = FewShotAdapter._calibrate(zn, zd)
+        if getattr(self, "_fb_frozen", None) is not None and self._fb_frozen[1] is not None:
+            self._dino_thr = self._fb_frozen[1]               # 反馈期冻结,见fit_fewshot开头
         self._apply_feedback_constraint(ead, gate, zn)
         # 注:曾试"病态标定守卫"(阈值漏过半fit缺陷→重标)治cable翻车,实测无效——病态是
         # fit/test漂移(fit缺陷强/test弱),fit侧看不见;守卫触发时反而重标低→pcb图级acc掉0.011。

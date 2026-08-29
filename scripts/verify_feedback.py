@@ -51,6 +51,9 @@ def fingerprint(det):
         "类型头就绪": bool(getattr(det.type_head, "ready", False)),
         "灰区救援": (None if getattr(det, "rescue_gray", None) is None else
                  (float(det.rescue_gray), round(float(det.rescue_seg_thr), 4))),
+        "延时裁剪": list(getattr(det, "lat_trimmed", [])),
+        "max_pixels": getattr(det.branches[0].det, "max_pixels", None),
+        "EAD学生数": len(getattr(det.branches[0].det.det, "pairs", []) or []),
     }
 
 

@@ -431,7 +431,15 @@ class CompetitionLargeDetector:
         self._embed_ae = None
         if self.gcad_embed and self._dino is not None:
             self._calibrate_gcad_embed(normals, defects)
-        self._calibrate_latency(normals)                             # 延时预算自适应(评委真机自测自裁)
+        if self._fb_frozen is None:                                  # 延时预算自适应(评委真机自测自裁)
+            self._calibrate_latency(normals)
+        # 反馈快路径跳过延时标定:裁剪是**破坏性且不可逆**的结构决策(ead.pairs=[:1]
+        # 永久丢弃第二学生、max_pixels只降不升),而它排在DINO门标定**之后**——refit里
+        # 一旦触发(反馈重训分割头→掩膜变大→类型头开销随面积涨→探针变慢,fb5实测像素
+        # 阈值2.89→2.57正是这个方向),EAD分数尺度整体漂移,冻结的阈值就指向错误位置。
+        # fb5双口径插桩实锤:阈值/学生权重/DINO库全部未变的前提下,**纯图级门**的留出
+        # 误报 8.6%→25.9%(旁路净贡献0%)——分数变了,而能在refit里改分数的只剩这里。
+        # 延时包络在初始fit已于同一台机器standing,反馈期重探只有风险没有收益。
         return self.threshold
 
     def _calibrate_latency(self, normals):

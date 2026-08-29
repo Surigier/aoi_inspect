@@ -433,6 +433,12 @@ class CompetitionLargeDetector:
             self._calibrate_gcad_embed(normals, defects)
         if self._fb_frozen is None:                                  # 延时预算自适应(评委真机自测自裁)
             self._calibrate_latency(normals)
+        # fit结束释放训练期峰值缓存。WSL2实测(4060L 8GB):单次fit后缓存池驻留7.9/8.2GB,
+        # 其中训练峰值溢出到Windows共享内存的"慢页"被推理原样复用——每个卷积走PCIe,
+        # locate从~90ms劣化到~800ms(连正常图早退路径都733ms)。原生Linux不溢出(会OOM),
+        # 但释放后推理在真显存重新分配对任何机器都无害,且给6GB的2060留出余量。
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         # 反馈快路径跳过延时标定:裁剪是**破坏性且不可逆**的结构决策(ead.pairs=[:1]
         # 永久丢弃第二学生、max_pixels只降不升),而它排在DINO门标定**之后**——refit里
         # 一旦触发(反馈重训分割头→掩膜变大→类型头开销随面积涨→探针变慢,fb5实测像素

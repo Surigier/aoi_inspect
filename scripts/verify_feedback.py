@@ -49,6 +49,8 @@ def fingerprint(det):
         "DINO门阈值": round(float(det._dino_thr), 6) if getattr(det, "_dino_thr", None) is not None else None,
         "像素阈值": round(float(det.pix_thr), 6) if det.pix_thr is not None else None,
         "类型头就绪": bool(getattr(det.type_head, "ready", False)),
+        "灰区救援": (None if getattr(det, "rescue_gray", None) is None else
+                 (float(det.rescue_gray), round(float(det.rescue_seg_thr), 4))),
     }
 
 
@@ -76,12 +78,23 @@ def main(cat="cable"):
     print(f"      反馈前:{before}", flush=True)
 
     def evaluate(tag):
-        """留出集上的召回 + 误报率。反馈前后各跑一次,才谈得上'有没有变好'。"""
-        rec = [det.locate(load(p))["is_defect"] for p, _ in test_d]
-        fp = [det.locate(load(p))["is_defect"] for p in ho_n]
-        print(f"      [{tag}] 留出缺陷召回 {sum(rec)}/{len(rec)}={sum(rec)/len(rec):.1%}"
-              f" | 留出正常误报 {sum(fp)}/{len(fp)}={sum(fp)/len(fp):.1%}", flush=True)
-        return sum(rec) / len(rec), sum(fp) / len(fp)
+        """留出集上的召回+误报,**双口径**:纯图级门(frame_score vs decision_threshold,
+        不含救援/GCAD旁路) vs locate完整链路。两者的差=旁路的贡献——第三轮验证里
+        阈值全冻结、误报仍+17pp,必须定位是哪条旁路在漏。"""
+        def both(img):
+            o = det.locate(img)["is_defect"]
+            g = bool(det.frame_score(img) >= det.decision_threshold())
+            return o, g
+        rec_l = rec_g = fp_l = fp_g = 0
+        for pth, _ in test_d:
+            o, g = both(load(pth)); rec_l += o; rec_g += g
+        for pth in ho_n:
+            o, g = both(load(pth)); fp_l += o; fp_g += g
+        nd_, nn_ = len(test_d), len(ho_n)
+        print(f"      [{tag}] locate口径: 召回 {rec_l}/{nd_}={rec_l/nd_:.1%} 误报 {fp_l}/{nn_}={fp_l/nn_:.1%}"
+              f" | 纯门口径: 召回 {rec_g/nd_:.1%} 误报 {fp_g/nn_:.1%}"
+              f" | 旁路净贡献: 召回+{(rec_l-rec_g)/nd_:.1%} 误报+{(fp_l-fp_g)/nn_:.1%}", flush=True)
+        return rec_l / nd_, fp_l / nn_
 
     base_rec, base_fp = evaluate("反馈前基线")
 

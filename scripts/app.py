@@ -14,6 +14,7 @@ import os
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image, ImageDraw
@@ -102,7 +103,6 @@ def preview_fit(product, n_show=6):
         img = _load(ip)
         gb = []
         if mp.exists():
-            import cv2
             m = (np.array(Image.open(mp).convert("L")) > 0).astype(np.uint8)
             nn, _, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
             gb = [(x, y, x + w, y + h) for x, y, w, h, a in
@@ -130,6 +130,30 @@ def do_fit(product, n_norm, n_def, progress=None):
     imgs = [_load(ROOT / product / "normal" / f) for f in ns]
     dimg = [_load(ROOT / product / "defect" / f) for f in ds]
     dmsk = [_mask(ROOT / product / "mask" / f) for f in ds]
+    return _fit_core(imgs, dimg, dmsk, product)
+
+
+def do_fit_files(nfiles, dfiles, mfiles):
+    """自选文件版迁移学习:三组文件由系统文件框选(不依赖目录结构)。
+    掩膜按**文件名(不含扩展名)**与缺陷图一一配对。"""
+    def _paths(fs):
+        return [Path(getattr(u, "name", u)) for u in (fs or [])
+                if Path(getattr(u, "name", u)).suffix.lower() in IMG_EXTS]
+    np_, dp_, mp_ = _paths(nfiles), _paths(dfiles), _paths(mfiles)
+    if not np_ or not dp_:
+        return f"### ⚠️ 正常图 {len(np_)} 张 / 缺陷图 {len(dp_)} 张,两组都不能为空"
+    mmap = {m.stem: m for m in mp_}
+    missing = [d.name for d in dp_ if d.stem not in mmap]
+    if missing:
+        return (f"### ⚠️ {len(missing)} 张缺陷图找不到同名掩膜:"
+                f"{missing[:5]}{'...' if len(missing) > 5 else ''}")
+    imgs = [_load(x) for x in np_]
+    dimg = [_load(x) for x in dp_]
+    dmsk = [_mask(mmap[d.stem]) for d in dp_]
+    return _fit_core(imgs, dimg, dmsk, "自选文件")
+
+
+def _fit_core(imgs, dimg, dmsk, product):
     det = CompetitionLargeDetector()
     t0 = time.time()
     # 用 ActiveLearningLoop 承载:它维护样本集,操作员反馈时可增量重拟合
@@ -138,7 +162,7 @@ def do_fit(product, n_norm, n_def, progress=None):
     STATE.update(det=det, loop=loop, product=product, fit_sec=sec)
     th = getattr(det.type_head, "ready", False)
     return (f"### ✅ 迁移学习完成\n"
-            f"- 产品:**{product}** · 正常 {len(ns)} 张 + 缺陷 {len(ds)} 张\n"
+            f"- 产品:**{product}** · 正常 {len(imgs)} 张 + 缺陷 {len(dimg)} 张\n"
             f"- 耗时 **{sec:.0f}s**(赛题此阶段不计时)\n"
             f"- 判决阈值:`{det.decision_threshold():.4f}`\n"
             f"- 监督分割头:{'已训(用掩膜)' if det.seg_head.head is not None else '未训'}\n"
@@ -274,6 +298,15 @@ def build():
                 g1 = gr.Gallery(label="正常样本(建立基准)", columns=6, height=200)
                 g2 = gr.Gallery(label="缺陷样本 + 人工标注(绿框)", columns=6, height=200)
             btn_fit = gr.Button("开始迁移学习", variant="primary")
+            with gr.Accordion("方式二:不用目录结构,直接系统文件框选三组图", open=False):
+                with gr.Row():
+                    up_n = gr.File(label="正常图(可框选多张)", file_count="multiple",
+                                   file_types=["image"])
+                    up_d = gr.File(label="缺陷图(多张)", file_count="multiple",
+                                   file_types=["image"])
+                    up_m = gr.File(label="缺陷掩膜(与缺陷图同名)", file_count="multiple",
+                                   file_types=["image"])
+                btn_fit2 = gr.Button("用选中的文件开始迁移学习")
             fit_out = gr.Markdown()
             def _set_root(path):
                 global ROOT
@@ -288,6 +321,7 @@ def build():
             prod.change(preview_fit, prod, [g1, g2, info])
             app.load(preview_fit, prod, [g1, g2, info])
             btn_fit.click(do_fit, [prod, nn, nd], fit_out)
+            btn_fit2.click(do_fit_files, [up_n, up_d, up_m], fit_out)
         with gr.Tab("② 在线检测(计时)"):
             fe = gr.FileExplorer(root_dir=str(ROOT), glob="**/*.png", file_count="multiple",
                                  label="像资源管理器一样点开目录、鼠标勾选图片(test/ 是混合测试流)",

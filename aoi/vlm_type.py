@@ -8,7 +8,8 @@
 降级路径(必须):VLM不可用(无key/无网/超时/返回不可解析)时返回None,调用方自动
 退回原有的启发式类型归属,只是精度低一些,**绝不能让整个检测崩掉**。
 
-key从环境变量读(DASHSCOPE_API_KEY),不写进代码库——本仓库将来要打包交给评委。
+key默认内置(leon 2026-08-29拍板:评委就用他的key,开箱即用不需任何配置);
+环境变量 DASHSCOPE_API_KEY 可覆盖。赛后应到DashScope控制台轮换此key。
 """
 import base64
 import io
@@ -18,6 +19,9 @@ import urllib.error
 import urllib.request
 
 import numpy as np
+
+#: 内置默认key(见模块docstring;env可覆盖;赛后轮换)
+_DEFAULT_KEY = "sk-627310a74e454dea99340f3cc40002f3"
 
 # 赛题原文的5类缺陷(顺序即分类器的类别顺序)
 TYPES = ["尺寸偏差", "缺件少件", "逻辑错误", "色彩变化", "常见外观缺陷"]
@@ -148,7 +152,7 @@ def diagnose_defect(img, mask, normal_ref=None, api_key=None, timeout=30):
         if png is None:
             return None, None
         ref_png = _crop_at(normal_ref, box) if (normal_ref is not None and box) else None
-        api_key = api_key or os.environ.get("DASHSCOPE_API_KEY")
+        api_key = api_key or os.environ.get("DASHSCOPE_API_KEY") or _DEFAULT_KEY or _DEFAULT_KEY
         if not api_key:
             return None, None
         def _img(b):
@@ -179,7 +183,7 @@ def label_defect_types(images, masks, api_key=None, verbose=True, normal_ref=Non
     全部失败(或无key)时返回None,调用方须降级到启发式。
     normal_ref:一张正常参考图(3,H,W)。传了就走双图对比模式——对
     缺件少件/尺寸偏差/逻辑错误这三类是决定性的(它们本质上是比较出来的)。"""
-    api_key = api_key or os.environ.get("DASHSCOPE_API_KEY")
+    api_key = api_key or os.environ.get("DASHSCOPE_API_KEY") or _DEFAULT_KEY
     if not api_key:
         if verbose:
             print("!! VLM类型标注:未设置DASHSCOPE_API_KEY,降级到启发式类型归属", flush=True)

@@ -292,7 +292,8 @@ CPU < 2s:实测 4.4s,瓶颈单点在 EfficientAD 教师 @1152 整图卷积(占 9
 def build():
     import gradio as gr
     ps = products()
-    with gr.Blocks(title="AOI 实时在线 AI 质检") as app:
+    with gr.Blocks(title="AOI 实时在线 AI 质检",
+                   css="footer {display: none !important;}") as app:
         gr.Markdown("# 🔍 可自学习的 AOI 实时在线 AI 质检")
         with gr.Tab("① 迁移学习(不计时)"):
             with gr.Row():
@@ -437,4 +438,4 @@ if __name__ == "__main__":
     ap.add_argument("--root", default="demo_data")
     a = ap.parse_args()
     ROOT = Path(a.root)
-    build().launch(server_name="0.0.0.0", server_port=a.port, share=False)
+    build().launch(server_name="0.0.0.0", server_port=a.port, share=False, show_api=False)

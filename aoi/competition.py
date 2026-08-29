@@ -1019,6 +1019,28 @@ class CompetitionLargeDetector:
             from .seg_head import merge_boxes
             boxes = map_to_boxes(mask.astype(np.float32), 0.5, min_area_frac=0.0002, close=0)
             res["boxes"] = merge_boxes(boxes, getattr(self, "box_merge_d", 0))
+            if not res["boxes"]:
+                # **判了缺陷就必须给出位置**。掩膜阈值化后可能一个像素都不超线(尤其
+                # 灰区救援/边界样本),此时输出 is_defect=1 却给空框——赛题明确要求
+                # 画出缺陷框,声明缺陷却答不出位置是不完整的答案。
+                # 退回:取异常图响应最高的那一小撮像素的外接框(至少给出最可疑区域)。
+                # 取最高响应处的**最大连通域**外接框,不能直接用top-k的外接框——
+                # top-k像素会被噪声散布到全图,外接框撑到接近整图,和不给框一样没用
+                # (实测:256²图上top-32的外接框是(4,56,241,241))。
+                import cv2 as _cv2
+                hi = (amap >= np.percentile(amap, 99.9)).astype(np.uint8)
+                n_, _, st_, _ = _cv2.connectedComponentsWithStats(hi, connectivity=8)
+                if n_ > 1:
+                    j = 1 + int(np.argmax(st_[1:, _cv2.CC_STAT_AREA]))
+                    x, y, w, h = st_[j, :4]
+                    res["boxes"] = [(int(x), int(y), int(x + w), int(y + h),
+                                     float(amap[y:y + h, x:x + w].max()))]
+                else:                                      # 极端兜底:最高点周围一个小窗
+                    yy, xx = np.unravel_index(int(np.argmax(amap)), amap.shape)
+                    r = max(2, min(amap.shape) // 32)
+                    res["boxes"] = [(int(max(0, xx - r)), int(max(0, yy - r)),
+                                     int(min(amap.shape[1], xx + r)), int(min(amap.shape[0], yy + r)),
+                                     float(amap.max()))]
             if _prof:
                 _t = self._pf("5_出框", _t)
             # VLM监督的类型头(fit期蒸馏,推理零API)。它要掩膜才能算位置匹配特征,

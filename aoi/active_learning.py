@@ -36,7 +36,8 @@ class ActiveLearningLoop:
     def feedback(self, image, is_defect, mask=None):
         """image: (3,H,W) 单图;is_defect=操作员判定的真实标签;mask 仅在
         is_defect=True 且本loop启用了掩膜追踪时使用(缺陷图掩膜,提升定位精度)。
-        返回更新后的 (正常集大小, 缺陷集大小)。
+        返回更新后的 (正常集大小, 缺陷集大小)。反馈缺陷且带掩膜时,VLM 的即时诊断
+        (现象一句话 + 类别)会放在 `self.last_diagnosis`,供界面直接展示给操作员。
 
         **实时性**:赛题原文要求"当系统**误检或漏检**时,操作员可提供**实时**反馈"——
         "实时"修饰的是两者,所以两条路都跳过EAD学生重训(retrain_ead=False),其余标定
@@ -58,6 +59,21 @@ class ActiveLearningLoop:
 
         学生权重的陈旧性由离线完整重训兜底(fit_fewshot默认retrain_ead=True),不占用
         操作员的实时交互路径。"""
+        diag = None
+        if is_defect and mask is not None:
+            # **反馈时的即时诊断**(冷路径,不计时):用VLM说出"这是什么缺陷",
+            # 而不是只把样本塞进集合。赛题要求"操作员反馈→系统可回溯检测逻辑",
+            # 而 explain() 回溯的是模型内部分数链路(给开发者看),操作员需要的是
+            # 一句人话。VLM不可用时静默返回None,只记录样本,不影响任何已有行为。
+            try:
+                from .vlm_type import diagnose_defect
+                ref = self.normals[0] if self.normals else None
+                phen, typ = diagnose_defect(image, mask, normal_ref=ref)
+                if phen:
+                    diag = {"现象": phen, "类型": typ}
+            except Exception:
+                diag = None
+        self.last_diagnosis = diag
         if is_defect:
             self.defects.append(image)
             if self.masks is not None:

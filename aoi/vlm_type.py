@@ -122,6 +122,58 @@ def _ask(png_bytes, api_key, timeout=30, ref_png=None):
     return None
 
 
+_PROMPT_DIAG = (
+    "你是工业AOI质检专家。给你两张图:**第一张是同一产品的正常参考图**,"
+    "**第二张是待判图**(红框标出操作员反馈的缺陷位置)。\n"
+    "请对比两张图,用**一句话(40字以内)**说明红框处相对正常参考发生了什么物理变化,"
+    "然后另起一行给出类别名(只写类别名本身)。类别只能是以下之一:\n"
+    + "\n".join(f"- {t}" for t in TYPES) +
+    "\n\n输出格式严格如下,不要多余内容:\n现象:<一句话>\n类别:<类别名>"
+)
+
+
+def diagnose_defect(img, mask, normal_ref=None, api_key=None, timeout=30):
+    """**操作员反馈时的即时诊断**:说出"这是什么缺陷",而不是只给一个类别名。
+
+    为什么需要:赛题要求"操作员反馈 → 系统可回溯检测逻辑"。`explain()` 回溯的是
+    模型内部的分数链路(z分/阈值/各门是否触发)——那是给开发者看的;**操作员看不懂**。
+    他想知道的是"这到底是什么缺陷"。本函数用自然语言回答这一句,并同时给出类别标签,
+    标签直接进类型头的训练集,形成闭环。
+
+    只在**反馈路径**(冷路径,不计时)调用,不碰推理热路径。
+    任何异常都吞掉,返回 (None, None) → 调用方降级为"仅记录样本,不给诊断"。
+    """
+    try:
+        png, box = _crop_with_box(img, mask)
+        if png is None:
+            return None, None
+        ref_png = _crop_at(normal_ref, box) if (normal_ref is not None and box) else None
+        api_key = api_key or os.environ.get("DASHSCOPE_API_KEY")
+        if not api_key:
+            return None, None
+        def _img(b):
+            return {"type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{base64.b64encode(b).decode()}"}}
+        content = ([_img(ref_png)] if ref_png else []) + [_img(png),
+                                                          {"type": "text", "text": _PROMPT_DIAG}]
+        body = {"model": _MODEL, "messages": [{"role": "user", "content": content}],
+                "max_tokens": 128, "temperature": 0.0}
+        req = urllib.request.Request(
+            _ENDPOINT, data=json.dumps(body).encode(),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            txt = json.loads(r.read())["choices"][0]["message"]["content"]
+        phen = None
+        for line in txt.splitlines():
+            line = line.strip()
+            if line.startswith("现象"):
+                phen = line.split(":", 1)[-1].split(":", 1)[-1].strip()
+        typ = next((t for t in TYPES if t in txt), None)
+        return phen or txt.strip()[:60], typ
+    except Exception:
+        return None, None
+
+
 def label_defect_types(images, masks, api_key=None, verbose=True, normal_ref=None):
     """给fit阶段的缺陷图打类型标签。返回 list[str|None],长度同images;
     全部失败(或无key)时返回None,调用方须降级到启发式。

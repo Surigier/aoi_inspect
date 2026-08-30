@@ -110,6 +110,13 @@ def table(headers, rows, col_widths=None, note=None):
     return t
 
 
+def figure(path, caption, width_cm=15.5):
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.add_run().add_picture(path, width=Cm(width_cm))
+    para(caption, size=9.5, italic=True, align=WD_ALIGN_PARAGRAPH.CENTER, space_after=10)
+
+
 def ref_item(text):
     p = doc.add_paragraph()
     p.paragraph_format.space_after = Pt(4)
@@ -409,6 +416,10 @@ table(
     ],
     note="表1 系统四层架构的职责划分。",
 )
+figure("docs/delivery/架构图.png",
+       "图1 系统总体架构。四层依次为检测层、定位层、归因层（三者构成推理主路径，"
+       "判正常立即早退）与反馈层（独立分支，仅在操作员提交反馈时触发）。图中标注了"
+       "各模块对应的创新点编号（见表A）与关键实测数据，具体机制见3.2–3.5节。")
 
 heading("3.2 检测层：受控平等融合的双判据检测", level=2)
 body(

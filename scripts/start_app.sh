@@ -2,6 +2,7 @@
 # Web演示台启动器:pidfile管理,不做任何模式匹配杀进程(pkill/pgrep -f自匹配已累计坑8次)。
 # 本机(4060L WSL)环境损伤会在导入阶段随机炸,起不来就多试几轮。
 cd "$(dirname "$0")/.."
+mkdir -p _logs   # _logs/被gitignore(实验日志目录),全新解压的交付包里不存在,需现建
 PIDF=_logs/app.pid
 [ -f "$PIDF" ] && kill -9 "$(cat "$PIDF")" 2>/dev/null
 sleep 1

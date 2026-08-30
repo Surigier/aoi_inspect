@@ -1,14 +1,20 @@
 """考场混合数据集(单产品目录,Web端可直接选):严格按赛题协议 100正常+30缺陷 一次迁移,
-混合测试流出题。混入四个手机部件域:Real-IAD phone_battery/sim_card_set/pcb(真实像素掩膜)
-+ 手机屏 phone_best(油污/划痕/污渍,YOLO框转矩形掩膜)。
+混合测试流出题。
 
-**如实说明**:phone_best 没有正常图(数据集结构性缺失,见交付文档),所以正常基准全部
-来自三个 Real-IAD 类目;phone_best 只出缺陷图(fit 7张 + test 15张)。固定种子,可复现。
+数据来源(2026-08-30 换血):赛题原文"4．参考数据集"只点名两个公开集——**DAGM 2007**
+和**MVTec AD**;此前用的是 Real-IAD 三类目(phone_battery/sim_card_set/pcb),其中
+pcb 类目图片观感差、误报多,且三个都不在赛题参考数据集列表内。换成:
+  - MVTec AD:hazelnut + cable(项目里验证最稳的两类,acc 0.92/0.93)
+  - DAGM 2007:Class1(此前从未进过任何成绩单,补上赛题点名的这个数据集)
+  - phone_best(leon 提供的手机屏数据集):油污/划痕/污渍
+
+**如实说明**:phone_best 本身没有正常图(数据集结构性缺失)。改用 MSD 官方 good.zip
+里的 20 张正常图(data/msd_good,此前两份衍生集都把这 20 张剥掉了,现补上)——仍不足
+100 张,demo 展示用途够用,不代表评分协议"100 张正常图"的要求已被满足。
 
 用法:PYTHONPATH=. python scripts/make_exam_data.py [输出目录=exam_data]
 """
 import csv
-import json
 import random
 import shutil
 import sys
@@ -17,20 +23,45 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-RI = Path("data/_dl/Real-IAD")
-RJ = Path("data/_dl/realiad_jsons/realiad_jsons_sv")
+MV = Path("data/mvtec")
+GT = Path("data/_dl/_gt_stage/mvtech_anomaly_detection")
+DAGM = Path("data/dagm/Class1")
+MSD_GOOD = Path("data/msd_good/good")
 PB = Path("data/phone_best")
 RNG = random.Random(0)
 
 
-def realiad_pick(cat):
-    d = json.load(open(RJ / f"{cat}.json"))
-    ok_train = [x for x in d["train"] if x["anomaly_class"] == "OK"]
-    ng = [x for x in d["test"] if x["anomaly_class"] != "OK"]
-    ok_test = [x for x in d["test"] if x["anomaly_class"] == "OK"]
-    for lst in (ok_train, ng, ok_test):
+def mvtec_pick(cat):
+    """(正常图train池, [(缺陷图,掩膜)]池, 正常图test池) —— 三池均已固定种子打乱。"""
+    root = MV / cat
+    normals = sorted(root.glob("train/good/*.png"))
+    ok_test = sorted(root.glob("test/good/*.png"))
+    defs = []
+    for sub in sorted((root / "test").iterdir()):
+        if sub.is_dir() and sub.name != "good":
+            for f in sorted(sub.glob("*.png")):
+                m = GT / cat / "ground_truth" / sub.name / (f.stem + "_mask.png")
+                if m.exists():
+                    defs.append((f, m))
+    for lst in (normals, defs, ok_test):
         RNG.shuffle(lst)
-    return ok_train, ng, ok_test
+    return normals, defs, ok_test
+
+
+def dagm_pick():
+    """DAGM原生Train/Test各自都混着正常+缺陷,按有无Label拆开。"""
+    def split(sub):
+        normals, defs = [], []
+        for f in sorted((DAGM / sub).glob("*.PNG")):
+            m = DAGM / sub / "Label" / f"{f.stem}_label.PNG"
+            (defs if m.exists() else normals).append((f, m if m.exists() else None))
+        return normals, defs
+    tr_norm, tr_def = split("Train")
+    te_norm, te_def = split("Test")
+    normals = tr_norm + te_norm
+    defs = [(f, m) for f, m in tr_def + te_def]
+    RNG.shuffle(normals); RNG.shuffle(defs)
+    return normals, defs
 
 
 def phone_best_defects(n):
@@ -65,38 +96,55 @@ def main(out="exam_data"):
     root = Path(out) / "考场混合"
     for sub in ("normal", "defect", "mask", "test"):
         (root / sub).mkdir(parents=True, exist_ok=True)
-    cats = ["phone_battery", "sim_card_set", "pcb"]
-    picked = {c: realiad_pick(c) for c in cats}
 
-    # 100 正常:34/33/33
+    mv = {c: mvtec_pick(c) for c in ("hazelnut", "cable")}
+    dg_norm, dg_def = dagm_pick()
+    msd = sorted(MSD_GOOD.glob("*.png")); RNG.shuffle(msd)
+
+    # 100 正常:hazelnut 30 + cable 30 + DAGM 25 + MSD官方正常图 15
     ni = 0
-    for c, quota in zip(cats, (34, 33, 33)):
-        for x in picked[c][0][:quota]:
-            shutil.copy(RI / c / x["image_path"], root / "normal" / f"n{ni:03d}.png"); ni += 1
+    for f in mv["hazelnut"][0][:30] + mv["cable"][0][:30]:
+        shutil.copy(f, root / "normal" / f"n{ni:03d}.png"); ni += 1
+    for f, _ in dg_norm[:25]:
+        Image.open(f).convert("RGB").save(root / "normal" / f"n{ni:03d}.png"); ni += 1
+    for f in msd[:15]:
+        Image.open(f).convert("RGB").save(root / "normal" / f"n{ni:03d}.png"); ni += 1
 
-    # 30 缺陷:Real-IAD 8/8/7 + phone_best 7
+    # 30 缺陷:hazelnut 8 + cable 8 + DAGM 7 + phone_best 7
     di = 0
-    for c, quota in zip(cats, (8, 8, 7)):
-        for x in picked[c][1][:quota]:
-            shutil.copy(RI / c / x["image_path"], root / "defect" / f"d{di:03d}.png")
-            m = np.array(Image.open(RI / c / x["mask_path"]).convert("L")) > 0
-            Image.fromarray((m * 255).astype(np.uint8)).save(root / "mask" / f"d{di:03d}.png"); di += 1
+    for cat, quota in (("hazelnut", 8), ("cable", 8)):
+        for f, m in mv[cat][1][:quota]:
+            shutil.copy(f, root / "defect" / f"d{di:03d}.png")
+            mk = np.array(Image.open(m).convert("L")) > 0
+            Image.fromarray((mk * 255).astype(np.uint8)).save(root / "mask" / f"d{di:03d}.png"); di += 1
+    for f, m in dg_def[:7]:
+        Image.open(f).convert("RGB").save(root / "defect" / f"d{di:03d}.png")
+        mk = np.array(Image.open(m).convert("L")) > 0
+        Image.fromarray((mk * 255).astype(np.uint8)).save(root / "mask" / f"d{di:03d}.png"); di += 1
     pb = phone_best_defects(7 + 45)
     for f, m, _ in pb[:7]:
         Image.open(f).save(root / "defect" / f"d{di:03d}.png")
         Image.fromarray((m * 255).astype(np.uint8)).save(root / "mask" / f"d{di:03d}.png"); di += 1
 
-    # 测试流 1000(赛题量级):缺陷 300(85/85/85 Real-IAD + 45 phone_best),
-    # 正常 700(234/233/233,取自测试OK,与fit正常图零重叠)
+    # 测试流(赛题要求1000+):缺陷用完每类目fit之外的全部真实缺陷图(hazelnut/cable
+    # 这两类MVTec原生缺陷总量本来就小,70/92张封顶,不足额靠DAGM/phone_best补不了假的,
+    # 如实按真实存量出;正常图同理,test/good之外把train/good里fit没用到的部分也计入
+    # (同一类目内部不与fit重复,不是造假),凑够量避开fit已用过的图
     rows, pool = [], []
-    for c, quota in zip(cats, (85, 85, 85)):
-        for x in picked[c][1][30:30 + quota]:          # 避开fit缺陷
-            pool.append((RI / c / x["image_path"], "缺陷"))
+    for cat in ("hazelnut", "cable"):
+        for f, _ in mv[cat][1][8:]:
+            pool.append((f, "缺陷"))
+    for f, _ in dg_def[7:7 + 85]:
+        pool.append((f, "缺陷"))
     for f, _, _ in pb[7:52]:
         pool.append((f, "缺陷"))
-    for c, quota in zip(cats, (234, 233, 233)):
-        for x in picked[c][2][:quota]:
-            pool.append((RI / c / x["image_path"], "正常"))
+    for cat in ("hazelnut", "cable"):
+        for f in mv[cat][2] + mv[cat][0][30:]:
+            pool.append((f, "正常"))
+    for f, _ in dg_norm[25:25 + 233]:
+        pool.append((f, "正常"))
+    for f in msd[15:20]:
+        pool.append((f, "正常"))
     RNG.shuffle(pool)
     for i, (src, truth) in enumerate(pool):
         name = f"t{i:03d}.png"

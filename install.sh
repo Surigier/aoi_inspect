@@ -2,6 +2,7 @@
 # 一键安装(考官机器) —— 在解压后的交付目录内执行:bash install.sh
 set -e
 cd "$(dirname "$0")"
+mkdir -p _logs
 echo "== ① Python依赖 =="
 # 整体安装失败时(常见原因:某个包所在的镜像临时抽风,与依赖内容无关)逐包重试,
 # 跳过装不上的——requirements.txt里标"缺→回退/静默降级"的包本来就是可选加速项,
@@ -25,6 +26,7 @@ echo "== ② 离线权重自检(评委机器可无外网) =="
 HF_HUB_OFFLINE=1 PYTHONPATH=. python3 scripts/pack_offline_weights.py --verify
 echo "== ③ 单元测试 =="
 HF_HUB_OFFLINE=1 PYTHONPATH=. python3 -m pytest -q -p no:warnings
+python3 -c "import sys; print(sys.executable)" > _logs/python_bin.txt 2>/dev/null || true
 echo ""
 echo "✅ 安装完成。使用方式见 docs/delivery/使用说明.md"
 echo "   评测入口: python3 submit.py --normal <正常图目录> --defect <缺陷图目录> --test <测试目录> --out result.csv"

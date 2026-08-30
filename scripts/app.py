@@ -49,6 +49,14 @@ def products():
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
 
 
+def _test_dir(product):
+    """当前产品的test/绝对路径,供FileExplorer限定浏览范围——不能让它露出整个
+    数据根目录,否则normal/defect/mask全跟test/混在同一棵树里(实测:考场混合
+    数据集里能翻到掩膜图片,这不是exam_data专属问题,是根目录设置本身的bug)。"""
+    d = ROOT / product / "test" if product else ROOT
+    return str(d if d.is_dir() else ROOT)
+
+
 def files_of(product, sub):
     d = ROOT / product / sub
     if not d.exists():
@@ -329,15 +337,16 @@ def build():
                     return gr.update(), f"### ⚠️ 目录不存在:{d}"
                 ROOT = d
                 new_ps = products()
-                return (gr.update(choices=new_ps, value=(new_ps[0] if new_ps else None)),
+                first = new_ps[0] if new_ps else None
+                return (gr.update(choices=new_ps, value=first),
                         f"已切换到 `{d}`,找到 {len(new_ps)} 个产品目录",
-                        gr.update(root_dir=str(d)), gr.update(root_dir=str(d)))
+                        gr.update(root_dir=_test_dir(first)), gr.update(root_dir=_test_dir(first)))
             prod.change(preview_fit, prod, [g1, g2, info])
             app.load(preview_fit, prod, [g1, g2, info])
             btn_fit.click(do_fit, [prod, nn, nd], fit_out)
             btn_fit2.click(do_fit_files, [up_n, up_d, up_m], fit_out)
         with gr.Tab("② 在线检测(计时)"):
-            fe = gr.FileExplorer(root_dir=str(ROOT), glob="**/*.png", file_count="multiple",
+            fe = gr.FileExplorer(root_dir=_test_dir(ps[0] if ps else None), glob="**/*.png", file_count="multiple",
                                  label="像资源管理器一样点开目录、鼠标勾选图片(test/ 是混合测试流)",
                                  height=320)
             up = gr.File(label="或点这里走系统文件选择框(可框选/Ctrl多选,本机任意图片)",
@@ -354,9 +363,9 @@ def build():
             ex_md = gr.Markdown()
 
             def _refresh(p):
-                return gr.update(choices=files_of(p, "test"))
-            prod.change(_refresh, prod, one)
-            app.load(_refresh, prod, one)
+                return gr.update(choices=files_of(p, "test")), gr.update(root_dir=_test_dir(p))
+            prod.change(_refresh, prod, [one, fe])
+            app.load(_refresh, prod, [one, fe])
             btn_all.click(lambda p: gr.update(value=[str(ROOT / p / "test" / f)
                                                      for f in files_of(p, "test")]), prod, fe)
             btn_run.click(run_test, [fe, up], [gal, tbl, res_md])
@@ -366,7 +375,7 @@ def build():
                 "看到判错的图?选中它 → 标出真实情况 → 提交。系统会用 VLM 说出这是什么缺陷、"
                 "把样本并入训练集**重训分割头并重标阈值**(真改模型参数);救回它要付出过高"
                 "误报时会**如实告知救不回**,而不是牺牲整条产线。单轮约 4 分钟。")
-            fb_fe = gr.FileExplorer(root_dir=str(ROOT), glob="**/*.png", file_count="single",
+            fb_fe = gr.FileExplorer(root_dir=_test_dir(ps[0] if ps else None), glob="**/*.png", file_count="single",
                                     label="鼠标选中那张判错的图", height=240)
             with gr.Row():
                 fb_up = gr.File(label="或走系统文件选择框", file_count="single", file_types=["image"])
@@ -427,6 +436,8 @@ def build():
                 return render(img, o2), "\n".join(md)
 
             fb_btn.click(_do_fb, [fb_fe, fb_up, fb_truth], [fb_img, fb_md])
+            prod.change(lambda p: gr.update(root_dir=_test_dir(p)), prod, fb_fe)
+            app.load(lambda p: gr.update(root_dir=_test_dir(p)), prod, fb_fe)
             # 换根目录的接线放在这里:输出里的 fe/fb_fe 到②③页签才存在
             btn_root.click(_set_root, root_tb, [prod, info, fe, fb_fe])
 

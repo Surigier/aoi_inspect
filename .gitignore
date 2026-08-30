@@ -13,3 +13,4 @@ rddn_yolo/dataset/
 .env
 *.key
 models/hf_cache/
+models/fonts/

@@ -2,6 +2,7 @@
 """生成系统四层级联架构图(检测/定位/归因/反馈),供技术方案说明书§3.1插图。
 所有模块名称与参数取自 aoi/competition.py 实际实现与结果报告.md,不新造任何描述。
 """
+import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -9,28 +10,26 @@ import matplotlib.patches as mpatches
 from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
 from matplotlib.font_manager import FontProperties
 
-# 中文字体:优先用系统里已有的中文字体,找不到则退化为不影响布局的默认字体
+# 字体:用单一的"Noto Sans SC"(中英文+符号全覆盖),不做多字体拼接回退。
+# 踩过的坑:matplotlib的按字符回退列表(如 ["DejaVu Sans", 中文字体]) 对**旋转文本**
+# 不生效——本机唯一现成的中文字体 Droid Sans Fallback 本身只有CJK表意字符、
+# 一个拉丁字母/数字/符号都没有(用fontTools核实过),要跟DejaVu Sans拼接才能凑齐
+# 一整句"中文+英文+数字+箭头"的文字,而这个拼接机制在旋转90°的文字上失效,
+# 渲染成方块占位符。改用单一字体从根上消掉"多字体拼接"这个不稳定环节。
 import matplotlib.font_manager as fm
-CJK = None
-for name in ("Noto Sans CJK SC", "Noto Serif CJK SC", "WenQuanYi Zen Hei",
-             "WenQuanYi Micro Hei", "Source Han Sans SC", "SimHei"):
-    if any(name.lower() in f.name.lower() for f in fm.fontManager.ttflist):
-        CJK = name
-        break
-if CJK is None:
-    # 用 fc-list 找一个能显示中文的字体文件直接注册
-    import subprocess
-    try:
-        out = subprocess.run(["fc-list", ":lang=zh"], capture_output=True, text=True, timeout=10).stdout
-        path = out.splitlines()[0].split(":")[0] if out.strip() else None
-        if path:
-            fm.fontManager.addfont(path)
-            CJK = fm.FontProperties(fname=path).get_name()
-    except Exception:
-        pass
-plt.rcParams["font.sans-serif"] = ["DejaVu Sans", CJK] if CJK else ["DejaVu Sans"]
+_FONT_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "fonts", "NotoSansSC.otf")
+_FONT_URL = ("https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/"
+             "SimplifiedChinese/NotoSansCJKsc-Regular.otf")
+if not os.path.exists(_FONT_PATH):
+    os.makedirs(os.path.dirname(_FONT_PATH), exist_ok=True)
+    import urllib.request
+    print(f"本地未找到字体,尝试下载: {_FONT_URL}")
+    urllib.request.urlretrieve(_FONT_URL, _FONT_PATH)
+fm.fontManager.addfont(_FONT_PATH)
+CJK = fm.FontProperties(fname=_FONT_PATH).get_name()
+plt.rcParams["font.sans-serif"] = [CJK]
 plt.rcParams["axes.unicode_minus"] = False
-print("使用中文字体:", CJK)
+print("使用字体:", CJK, f"({_FONT_PATH})")
 
 fig, ax = plt.subplots(figsize=(11, 13))
 ax.set_xlim(0, 100)
@@ -149,10 +148,8 @@ ax.text(50, 13.3, "六轮端到端留出验证收敛；反馈单轮耗时 1193s 
 # 而非反馈层本身在推理主路径上)
 arrow(5, 23, 5, 89, color="#a02020", lw=1.1, style="-|>",
       connectionstyle="arc3,rad=0.25")
-# 旋转文本走单独的CJK字体属性(观测到:字体回退列表对旋转文本不生效,渲染成方块)
-_cjk_fp = fm.FontProperties(family=CJK) if CJK else None
 ax.text(1.5, 60, "增量更新模型参数", ha="center", va="center", fontsize=8,
-        color="#a02020", rotation=90, fontproperties=_cjk_fp)
+        color="#a02020", rotation=90)
 
 plt.tight_layout()
 out = "docs/delivery/架构图.png"

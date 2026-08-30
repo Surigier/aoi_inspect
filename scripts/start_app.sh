@@ -1,6 +1,15 @@
 #!/bin/bash
 # Web演示台启动器:pidfile管理,不做任何模式匹配杀进程(pkill/pgrep -f自匹配已累计坑8次)。
-# 本机(4060L WSL)环境损伤会在导入阶段随机炸,起不来就多试几轮。
+#
+# 【根治,不是绕过】2026-08-30 实测抓到崩溃真凶:gradio导入时默认会开一个后台
+# 线程,请求 https://api.gradio.app/gradio-messaging/en 查"有没有新公告"
+# (gradio/strings.py,与我们的代码逻辑无关),这次网络请求的SSL握手在本机
+# WSL环境下会直接把整个Python解释器崩掉("Fatal Python error: Unreachable
+# C code path reached"),不是异常、无法被try/except捕获,表现为"随机"启动
+# 失败——实为每次都会崩,只是偶尔那个线程跑得比主线程慢、赶在探测前就挂了。
+# gradio源码本身认这个环境变量(严格等于"True"才起线程),设成非True值即可
+# 彻底关闭这条网络请求,从根上消除崩溃诱因,而非"多试几次赌一次不崩"。
+export GRADIO_ANALYTICS_ENABLED=False
 cd "$(dirname "$0")/.."
 mkdir -p _logs   # _logs/被gitignore(实验日志目录),全新解压的交付包里不存在,需现建
 # 用install.sh装依赖时记下的那个python3(见install.sh末尾),而不是直接写死

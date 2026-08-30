@@ -27,11 +27,25 @@ if _HF_BUNDLE.is_dir():
     os.environ.setdefault("HF_HUB_CACHE", str(_HF_BUNDLE))
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
-import torch
-from aoi.backbone import Backbone
-from aoi.ensemble import default_adapter
-from aoi.video import VideoDetector, read_video_frames
-from eval.mvtec import _load_img, _load_img_native, peek_size
+try:
+    import torch
+    from aoi.backbone import Backbone
+    from aoi.ensemble import default_adapter
+    from aoi.video import VideoDetector, read_video_frames
+    from eval.mvtec import _load_img, _load_img_native, peek_size
+except ModuleNotFoundError as e:
+    # 实测踩过的坑:一台机器上常有不止一个python3(系统自带+某个虚拟环境),
+    # `bash install.sh` 装依赖用的是A,而另开一个终端/会话运行本脚本时
+    # "python3" 解析到了B——依赖明明装了,却报"没这个模块"。原始报错对
+    # 不熟悉Python环境管理的人来说很难看出这一层,这里给出直接可核查的线索。
+    import sys
+    print(f"!! 缺少依赖:{e.name}\n"
+          f"   当前运行本脚本用的解释器: {sys.executable}\n"
+          f"   如果 `bash install.sh` 时看到过 pip 成功安装该依赖,大概率是"
+          f"两次用的不是同一个 python3(这台机器上可能装了不止一个)。\n"
+          f"   请用装依赖时的**同一个终端/环境**重新运行本脚本,"
+          f"或执行: {sys.executable} -m pip install -r requirements.txt", file=sys.stderr)
+    raise SystemExit(1)
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".PNG", ".JPG", ".JPEG", ".BMP"}
 VID_EXT = {".mp4", ".avi", ".mov", ".mkv", ".MP4", ".AVI"}

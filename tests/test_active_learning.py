@@ -19,6 +19,8 @@ class _FakeDetector:
     def __init__(self):
         self.fit_calls = []
         self.threshold = None
+        self._fb_defects = []          # 契约的一部分:操作员反馈的硬约束样本
+        self._fb_normals = []
 
     def fit_fewshot(self, normals, defects, defect_masks=None, retrain_ead=True):
         self.fit_calls.append(dict(
@@ -71,6 +73,16 @@ def test_no_masks_passes_none():
     """不传掩膜时按契约显式传 defect_masks=None,而不是省略这个参数。"""
     loop = _loop()
     assert loop.adapter.fit_calls[-1]["m"] is None
+
+
+def test_feedback_registers_hard_constraint_samples():
+    """反馈样本必须登记进适配器的硬约束集合。只进样本集是不够的——实测(cable)
+    1张新样本在130张里投不出票,DINO门阈值小数点后五位都没动,那张图依然漏检。"""
+    loop = _loop()
+    loop.feedback(torch.ones(3, 8, 8), is_defect=True)
+    loop.feedback(torch.zeros(3, 8, 8), is_defect=False)
+    assert len(loop.adapter._fb_defects) == 1
+    assert len(loop.adapter._fb_normals) == 1
 
 
 def test_feedback_uses_fast_path():

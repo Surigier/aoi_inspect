@@ -152,11 +152,6 @@ class CompetitionLargeDetector:
         self.aux_size = aux_size
         self.use_vlm_type = use_vlm_type
         self._dino_feat = None               # dino_seg专用的独立DINO提取器(见_wrn_dino_feats)
-        self._wrn_cache_on = False; self._wrn_cache = None   # 见 _wrn_feats:作用域限定在locate内
-        # 操作员反馈样本(见 _calibrate_dino_gate 末尾的硬约束):这些图是**人亲口标的**,
-        # 不能和另外130张fit样本平权投票,否则1票在130票里等于没投。
-        self._fb_defects = []; self._fb_normals = []; self._fb_unsat = None
-        self._fb_frozen = None
         self.dino_seg = dino_seg             # 分割头吃WRN⊕DINO拼接特征(见_wrn_dino_feats),默认关
         self.seg_gate = seg_gate             # 用分割图当图级判据(见_calibrate_seg_gate),默认关
         self.per_mode_gate = per_mode_gate   # 正常图分模态标定阈值(见_calibrate_dino_gate),默认关,验证后再开
@@ -228,32 +223,18 @@ class CompetitionLargeDetector:
         """img(3,H,W)[0,1] → WRN50 浅层(1,2)特征 (C,128,128)。
         先搬 GPU 再下采样(大图 CPU interpolate 慢),再提特征(~8ms)。
 
-        **缓存有严格作用域:只在 locate() 内生效**(`_wrn_cache_on` 在 locate 入口开、
-        finally 里关)。逐段计时实测:分割头 39.7ms、类型头 87.3ms,而**类型头里那次
-        WRN前向与分割头刚算过的是同一份** —— 同一张图的骨干特征被算了两次。
-
-        历史教训(别再整个删掉):早先加过"只在locate入口清空"的缓存,结果
-        seg_head.fit() 在**fit期**逐张调用本函数,而fit期不进locate()、缓存永不清空,
-        30张缺陷图全部拿到第一张的特征却配各自不同的掩膜去训练,定位直接崩
-        (phone_battery 含漏检IoU 0.399→0.033、框命中0.550→0.013)。
-        **当时的修法是整个删掉缓存,正确的修法是给它加作用域**——fit期开关为False,
-        自然不命中;推理期同一张图内命中,省掉一次完整WRN前向。"""
-        # 缓存**必须按张量身份命中**,不能盲取。血的教训:曾写成"开关打开就返回缓存",
-        # 而 _wrn_feats_diff 会在同一次 locate 内先后传入**测试图和参考图**——参考图
-        # 命中了测试图的缓存 → f - fr = f - f = 全零 → 分割头输入全是零 →
-        # 定位归零(实测 框命中0.0000/IoU 0.0006)。
-        # 用 (data_ptr, shape) 做键:同一次调用里两张图同时存活,地址必不相同,不会误命中。
-        key = (img.data_ptr(), tuple(img.shape))
-        if getattr(self, "_wrn_cache_on", False) and self._wrn_cache is not None \
-                and self._wrn_cache[0] == key:
-            return self._wrn_cache[1]
-        x = img.unsqueeze(0) if img.dim() == 3 else img
-        x = x.to(self._bb_loc.device)
-        x = F.interpolate(x, size=(self._seg_in, self._seg_in), mode="bilinear", align_corners=False)
-        out = self._bb_loc.extract(x)[0]
-        if getattr(self, "_wrn_cache_on", False):
-            self._wrn_cache = (key, out)
-        return out
+        **不要在这里加"单次locate内缓存"。** 曾为了让seg_head和类型头共用一次前向
+        (省9ms)加过一个只在locate()入口清空的缓存,结果是灾难性的:seg_head.fit()
+        会在**fit期**逐张调用本函数,而fit期没有locate()来清缓存——于是30张缺陷图
+        全部拿到第一张的特征,配上各自不同的掩膜去训分割头,训出来的头是垃圾。
+        表现为图级acc几乎不变(不依赖掩膜)但IoU/框命中塌到接近零
+        (phone_battery IoU 0.399→0.033、框命中0.550→0.013)。
+        省的9ms在200ms预算里毫无意义,风险与收益完全不成比例。"""
+        if img.dim() == 3:
+            img = img.unsqueeze(0)
+        img = img.to(self._bb_loc.device)
+        img = F.interpolate(img, size=(self._seg_in, self._seg_in), mode="bilinear", align_corners=False)
+        return self._bb_loc.extract(img)[0]
 
     @torch.no_grad()
     def _wrn_dino_feats(self, img):
@@ -282,13 +263,9 @@ class CompetitionLargeDetector:
                 from .dino_gate import DinoGate
                 self._dino_feat = DinoGate(device=self._bb_loc.device)
             g = self._dino_feat
-        # **按图身份校验**,不能只看"有没有缓存"——否则会拿到上一张图的patch。
-        # (与WRN特征缓存同一类错误:第一版按状态盲取,导致参考图命中测试图的缓存、
-        #  f-fr=全零、定位归零。缓存必须按输入身份命中。)
-        key = (img.data_ptr(), tuple(img.shape)) if hasattr(img, "data_ptr") else None
         pg = getattr(g, "last_patch_grid", None)
-        if pg is None or getattr(g, "last_key", None) != key:
-            g._patches(img)                                   # 本图没跑过DINO(或缓存是别的图)
+        if pg is None:                                        # 本图还没跑过DINO → 跑一次
+            g._patches(img)
             pg = getattr(g, "last_patch_grid", None)
             if pg is None:
                 return f
@@ -346,17 +323,6 @@ class CompetitionLargeDetector:
         才允许**——EAD学生只在正常图上训,缺陷图只参与阈值标定,所以操作员反馈漏检
         (新增缺陷图)时重训学生纯属浪费。用于ActiveLearningLoop的增量反馈,见
         aoi/active_learning.py。"""
-        # 反馈快路径同时**冻结图级判决阈值**:两轮留出实测(scripts/verify_feedback.py,
-        # cable),往130张标定集里加1张反馈样本重投票,平衡准确率最优点会在near-tie
-        # 候选间跳变——第一轮一动不动(1.691→1.691),第二轮同机制跳了0.35
-        # (2.006→1.660),留出误报+15.5pp换召回+3.2pp,净负。单样本对重投票的影响
-        # 是随机的,而fit侧只显示4%误报、留出实际20.7%(fit/test漂移,老病)。
-        # 所以反馈期图级阈值只走 _apply_feedback_constraint 这一条确定性通道;
-        # z空间可比性恰好由retrain_ead=False保证(EAD学生未动、正常图同一批)。
-        # 离线完整重训(retrain_ead=True)不冻结,照常重标。
-        self._fb_frozen = None
-        if not retrain_ead and self.threshold is not None:
-            self._fb_frozen = (float(self.threshold), getattr(self, "_dino_thr", None))
         self.stats = []
         for i, b in enumerate(self.branches):
             if i == 0:
@@ -372,8 +338,6 @@ class CompetitionLargeDetector:
         ns = [ead.score(x) for x in normals]
         ds = [ead.score(d) for d in defects]
         self.threshold = FewShotAdapter._calibrate(ns, ds)    # 阈值标在 EAD 分上
-        if self._fb_frozen is not None:
-            self.threshold = self._fb_frozen[0]               # 反馈期冻结,见方法开头
         if defect_masks is not None:
             d_imgs, d_masks = list(defects), list(defect_masks)
             if self.roi_zoom:
@@ -431,21 +395,7 @@ class CompetitionLargeDetector:
         self._embed_ae = None
         if self.gcad_embed and self._dino is not None:
             self._calibrate_gcad_embed(normals, defects)
-        if self._fb_frozen is None:                                  # 延时预算自适应(评委真机自测自裁)
-            self._calibrate_latency(normals)
-        # fit结束释放训练期峰值缓存。WSL2实测(4060L 8GB):单次fit后缓存池驻留7.9/8.2GB,
-        # 其中训练峰值溢出到Windows共享内存的"慢页"被推理原样复用——每个卷积走PCIe,
-        # locate从~90ms劣化到~800ms(连正常图早退路径都733ms)。原生Linux不溢出(会OOM),
-        # 但释放后推理在真显存重新分配对任何机器都无害,且给6GB的2060留出余量。
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        # 反馈快路径跳过延时标定:裁剪是**破坏性且不可逆**的结构决策(ead.pairs=[:1]
-        # 永久丢弃第二学生、max_pixels只降不升),而它排在DINO门标定**之后**——refit里
-        # 一旦触发(反馈重训分割头→掩膜变大→类型头开销随面积涨→探针变慢,fb5实测像素
-        # 阈值2.89→2.57正是这个方向),EAD分数尺度整体漂移,冻结的阈值就指向错误位置。
-        # fb5双口径插桩实锤:阈值/学生权重/DINO库全部未变的前提下,**纯图级门**的留出
-        # 误报 8.6%→25.9%(旁路净贡献0%)——分数变了,而能在refit里改分数的只剩这里。
-        # 延时包络在初始fit已于同一台机器standing,反馈期重探只有风险没有收益。
+        self._calibrate_latency(normals)                             # 延时预算自适应(评委真机自测自裁)
         return self.threshold
 
     def _calibrate_latency(self, normals):
@@ -545,10 +495,10 @@ class CompetitionLargeDetector:
                 tiled.max_pixels = mp
                 self.lat_trimmed.append(f"max_pixels={mp//1000}k")
                 self.lat_probe_ms = probe()
-        # ③【SAM已移出可裁剪清单,勿再加回】逐段计时实测 SAM精化中位 **0.1ms**
-        # (逐区域OOF门控已短路),砍它**省不到任何时间**;而没有SAM收紧掩膜,
-        # 掩膜面积变大 → 类型头的参考特征池化开销随面积上涨(实测17.8ms→89.4ms)。
-        # 砍SAM不但没省时间,反而让下游更慢——纯亏。
+        if self.lat_probe_ms > budget and self.sam is not None:
+            self.sam = None                                          # ③弃SAM(5/5域实测reject_all,无证实正贡献)
+            self.lat_trimmed.append("sam")
+            self.lat_probe_ms = probe()
         # ④【DINO门已移出可裁剪清单,勿再加回】
         # 原逻辑:超真硬线时弃DINO门。但这笔交易**永远不划算**——弃它省的延时很少,
         # 精度代价却是-0.6量级(cable实锤 0.811→0.171)。而裁剪决策本身建立在一次
@@ -654,83 +604,10 @@ class CompetitionLargeDetector:
         self._dino_stats = (emu, esd, dmu, dsd)
         self._dino_fuse = fz2
         self._dino_thr = FewShotAdapter._calibrate(zn, zd)
-        if getattr(self, "_fb_frozen", None) is not None and self._fb_frozen[1] is not None:
-            self._dino_thr = self._fb_frozen[1]               # 反馈期冻结,见fit_fewshot开头
-        self._apply_feedback_constraint(ead, gate, zn)
         # 注:曾试"病态标定守卫"(阈值漏过半fit缺陷→重标)治cable翻车,实测无效——病态是
         # fit/test漂移(fit缺陷强/test弱),fit侧看不见;守卫触发时反而重标低→pcb图级acc掉0.011。
         # 已撤,守卫类思路对这种"fit侧看不见test漂移"的病理普遍无效(seg_head/component_graph
         # 门控今天也撞了同一堵墙)——真正有效的是"永远融合"这种不依赖fit侧判断的确定性设计。
-
-    #: 反馈硬约束最多允许把 fit 正常图的误报率推到这个绝对上限。
-    #: 取10%的依据:生产实测误报率12.2%,若允许反馈把fit侧推到与之同量级,等于
-    #: 把"救一张漏检"的代价放大到整条产线。10%是"还能救回大多数单点漏检、又不至于
-    #: 让误报翻倍"的位置;超过它就宁可不救,并把不可满足如实告诉操作员。
-    FB_FP_CAP = 0.10
-
-    def _apply_feedback_constraint(self, ead, gate, zn):
-        """**操作员反馈的硬约束**:人亲口标过的样本,必须判对。
-
-        为什么要有:图级判决走的是 self._dino_thr,而它由 _calibrate(zn, zd) 在
-        100张正常+30张缺陷上按平衡准确率选点。操作员反馈一张漏检,只是往那130票里
-        加了1票——实测(scripts/verify_feedback.py, cable)阈值从 1.69098 变成
-        1.69098,**小数点后五位都没动**,那张图反馈后依然漏检。分割头权重确实重训了
-        (指纹 4f1d5f3d150d → 4ffabf2aee95),但操作员看到的"这张是不是缺陷"没变。
-        赛题要求的是"操作员反馈→动态调整",不是"调了但judgement不变"。
-
-        做法:把反馈样本从"投票"升格为"约束"。
-          - 报过漏检的图 → 阈值必须 ≤ 它们的最低分(让它们全部过线)
-          - 报过误检的图 → 阈值必须 > 它们的最高分(让它们全部不过线)
-        两条约束都用 fit 正常图的误报率上限 FB_FP_CAP 兜底:**宁可救不回,也不让
-        单张反馈把整条产线的误报推上去**。约束不可满足(比如两类反馈样本的分数区间
-        交叉、或救它要付超过10%误报)时,退回平衡阈值,并把不可满足的样本记在
-        self._fb_unsat 里——界面据此如实告诉操作员"这张图与正常样本在当前特征下
-        不可分",而不是假装修好了。"""
-        import numpy as np
-        self._fb_unsat = None
-        if not self._fb_defects and not self._fb_normals:
-            return
-
-        def _z(im):
-            e = ead.score(im); d = gate.score(im)
-            k = _assign_mode(gate.last_cls.detach().cpu(), self._modes)
-            return float(_mode_z(e, d, self._modes[k]))
-
-        zd_fb = [_z(x) for x in self._fb_defects]
-        zn_fb = [_z(x) for x in self._fb_normals]
-        zn = np.asarray(zn, dtype=float)
-        base = float(self._dino_thr)
-
-        lo = float(np.quantile(zn, 1.0 - self.FB_FP_CAP))   # 阈值不得低于此,否则误报超上限
-        want_dn = min(zd_fb) - 1e-6 if zd_fb else None       # 漏检反馈要求阈值降到这
-        want_up = max(zn_fb) + 1e-6 if zn_fb else None       # 误检反馈要求阈值升到这
-
-        thr, unsat = base, []
-        if want_dn is not None:
-            if want_dn < lo:
-                # **救不回就一动不动**。第一版在这里仍把阈值压到lo("尽力而为"),
-                # 实测判负(scripts/verify_feedback.py, cable):fit口径只从7%涨到10%,
-                # 留出正常图误报却 6.9%→24.1%(+17.2pp),召回+0,那张图照样漏——
-                # fit正常图参与过标定、分布偏紧,fit口径的10%严重低估真实误报。
-                # 付出17个点误报、换回0张召回,这钱不能花。
-                unsat.append(f"{len(zd_fb)}张漏检反馈中最低分{min(zd_fb):.4g}低于误报上限"
-                             f"对应的阈值{lo:.4g},救它要付>{self.FB_FP_CAP:.0%}误报,"
-                             f"阈值维持不动")
-            else:
-                thr = min(thr, want_dn)
-        if want_up is not None:
-            if want_dn is not None and want_up >= want_dn:
-                unsat.append(f"误检反馈最高分{max(zn_fb):.4g} ≥ 漏检反馈最低分"
-                             f"{min(zd_fb):.4g},两类反馈样本在当前特征下不可分")
-            else:
-                thr = max(thr, want_up)
-        self._dino_thr = thr
-        self._fb_unsat = unsat or None
-        print(f"!! 反馈硬约束: 阈值 {base:.5g} → {thr:.5g} "
-              f"(漏检反馈{len(zd_fb)}张/误检反馈{len(zn_fb)}张, "
-              f"fit正常图误报 {float((zn > base).mean()):.1%} → "
-              f"{float((zn > thr).mean()):.1%})"
-              + (f" ⚠️{unsat[0]}" if unsat else ""), flush=True)
 
     def _seg_stat(self, img):
         """把分割图压成一个图级标量:取前0.1%像素的均值(比单点max稳,比全图均值敏感)。
@@ -906,12 +783,7 @@ class CompetitionLargeDetector:
         """模板差分特征:concat[feat(test), feat(test)-feat(ECC对齐最近邻正常参考)]。"""
         f = self._wrn_feats(img)
         ref = self._ref_bank.aligned_ref(img if img.dim() == 3 else img[0])
-        _on = getattr(self, "_wrn_cache_on", False)
-        self._wrn_cache_on = False        # 双保险:参考图是另一张图,绝不能碰测试图的缓存
-        try:
-            fr = self._wrn_feats(ref)
-        finally:
-            self._wrn_cache_on = _on
+        fr = self._wrn_feats(ref)
         return torch.cat([f, f - fr], dim=0)
 
     def _calibrate_boxes(self, defects, defect_masks):
@@ -1044,19 +916,7 @@ class CompetitionLargeDetector:
     def locate(self, img):
         """完整定位输出:图级分(EAD)+ 判决 + 类型 + 像素图 + 检测框。
         延时热路径:EAD/DINO判正常且不处于救援灰区→立即返回,不算WRN分割/SAM/crop级联
-        (它们只有判缺陷才有意义,正常图是生产大多数,省的是主要延时)。
-
-        外壳只负责给WRN特征缓存划定作用域:入口开、finally关(异常路径也保证关闭)。
-        fit期不走这里,所以缓存绝不会跨图污染训练——见 _wrn_feats 的说明。"""
-        self._wrn_cache_on = True
-        self._wrn_cache = None
-        try:
-            return self._locate_inner(img)
-        finally:
-            self._wrn_cache_on = False
-            self._wrn_cache = None
-
-    def _locate_inner(self, img):
+        (它们只有判缺陷才有意义,正常图是生产大多数,省的是主要延时)。"""
         import numpy as np
         import os as _os, time as _time
         _prof = _os.environ.get("LOCATE_PROFILE") == "1"
@@ -1123,28 +983,6 @@ class CompetitionLargeDetector:
             from .seg_head import merge_boxes
             boxes = map_to_boxes(mask.astype(np.float32), 0.5, min_area_frac=0.0002, close=0)
             res["boxes"] = merge_boxes(boxes, getattr(self, "box_merge_d", 0))
-            if not res["boxes"]:
-                # **判了缺陷就必须给出位置**。掩膜阈值化后可能一个像素都不超线(尤其
-                # 灰区救援/边界样本),此时输出 is_defect=1 却给空框——赛题明确要求
-                # 画出缺陷框,声明缺陷却答不出位置是不完整的答案。
-                # 退回:取异常图响应最高的那一小撮像素的外接框(至少给出最可疑区域)。
-                # 取最高响应处的**最大连通域**外接框,不能直接用top-k的外接框——
-                # top-k像素会被噪声散布到全图,外接框撑到接近整图,和不给框一样没用
-                # (实测:256²图上top-32的外接框是(4,56,241,241))。
-                import cv2 as _cv2
-                hi = (amap >= np.percentile(amap, 99.9)).astype(np.uint8)
-                n_, _, st_, _ = _cv2.connectedComponentsWithStats(hi, connectivity=8)
-                if n_ > 1:
-                    j = 1 + int(np.argmax(st_[1:, _cv2.CC_STAT_AREA]))
-                    x, y, w, h = st_[j, :4]
-                    res["boxes"] = [(int(x), int(y), int(x + w), int(y + h),
-                                     float(amap[y:y + h, x:x + w].max()))]
-                else:                                      # 极端兜底:最高点周围一个小窗
-                    yy, xx = np.unravel_index(int(np.argmax(amap)), amap.shape)
-                    r = max(2, min(amap.shape) // 32)
-                    res["boxes"] = [(int(max(0, xx - r)), int(max(0, yy - r)),
-                                     int(min(amap.shape[1], xx + r)), int(min(amap.shape[0], yy + r)),
-                                     float(amap.max()))]
             if _prof:
                 _t = self._pf("5_出框", _t)
             # VLM监督的类型头(fit期蒸馏,推理零API)。它要掩膜才能算位置匹配特征,

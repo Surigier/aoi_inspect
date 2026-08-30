@@ -4,15 +4,48 @@
 
 对未知产品:用 normal/(~100 正常)+ defect/(~30 缺陷)现场迁移(fit_fewshot,无梯度训练),
 再对 test/ 下每个**图片或视频**输出判决。视频走逐帧+时序平滑+事件聚合(早期拦截)。
-按图尺寸自动路由:长边≥1024 → 大图混合(全局5分支@320 + 局部ResNet18分块);否则常规 resize。"""
+少样本一律走生产检测器(原生分辨率,含定位框输出);--zeroshot 走独立CLIP路径。"""
 import argparse
 import csv
+import os
 from pathlib import Path
-import torch
-from aoi.backbone import Backbone
-from aoi.ensemble import default_adapter
-from aoi.video import VideoDetector, read_video_frames
-from eval.mvtec import _load_img, _load_img_native, peek_size
+
+# ── 离线权重(必须在 import torch/timm 之前)────────────────────────────────
+# WRN50 定位骨干与 DINOv2 图级门的权重是 timm 在**运行时**从 HuggingFace 拉的,
+# models/ 里只带了 EAD 教师和 MobileSAM。评委机器若无外网,会直接抛
+# LocalEntryNotFoundError 起不来——不是精度掉一点,是一行跑不了。
+# (这不是推测:把仓库迁到一台内网机器时真实触发过。)
+#
+# 实测**只设缓存目录不够**:无网时 SSL 错误会直接上抛,缓存里明明有权重也不回落,
+# 还白等 56 秒重试。所以必须同时强制 HF_HUB_OFFLINE。
+# 用 setdefault 而不是直接赋值:有外网、又想跑 --zeroshot(CLIP 权重不在包里)的人
+# 可以用 HF_HUB_OFFLINE=0 覆盖。
+# 权重包由 scripts/pack_offline_weights.py 生成,不进 git(单 blob 264MB,超 GitHub
+# 单文件 100MB 上限),随交付包分发。
+_HF_BUNDLE = Path(__file__).resolve().parent / "models" / "hf_cache"
+if _HF_BUNDLE.is_dir():
+    os.environ.setdefault("HF_HUB_CACHE", str(_HF_BUNDLE))
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+try:
+    import torch
+    from aoi.backbone import Backbone
+    from aoi.ensemble import default_adapter
+    from aoi.video import VideoDetector, read_video_frames
+    from eval.mvtec import _load_img, _load_img_native, peek_size
+except ModuleNotFoundError as e:
+    # 实测踩过的坑:一台机器上常有不止一个python3(系统自带+某个虚拟环境),
+    # `bash install.sh` 装依赖用的是A,而另开一个终端/会话运行本脚本时
+    # "python3" 解析到了B——依赖明明装了,却报"没这个模块"。原始报错对
+    # 不熟悉Python环境管理的人来说很难看出这一层,这里给出直接可核查的线索。
+    import sys
+    print(f"!! 缺少依赖:{e.name}\n"
+          f"   当前运行本脚本用的解释器: {sys.executable}\n"
+          f"   如果 `bash install.sh` 时看到过 pip 成功安装该依赖,大概率是"
+          f"两次用的不是同一个 python3(这台机器上可能装了不止一个)。\n"
+          f"   请用装依赖时的**同一个终端/环境**重新运行本脚本,"
+          f"或执行: {sys.executable} -m pip install -r requirements.txt", file=sys.stderr)
+    raise SystemExit(1)
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".PNG", ".JPG", ".JPEG", ".BMP"}
 VID_EXT = {".mp4", ".avi", ".mov", ".mkv", ".MP4", ".AVI"}
@@ -20,11 +53,39 @@ LARGE_THRESHOLD = 1024          # 长边 ≥ 此值 → 走大图分块路径(�
 
 
 def _img_files(d):
-    return [p for p in sorted(Path(d).iterdir()) if p.suffix in IMG_EXT]
+    """列目录里的图像文件。排除 *_mask.* —— 使用文档允许掩膜与缺陷图同目录同名放置,
+    掩膜是标注不是样本;不排除的话30张二值掩膜会被当缺陷图混进fit,污染阈值标定与
+    分割头(考官机模拟第三轮实锤:缺陷数 30→60)。"""
+    return [p for p in sorted(Path(d).iterdir())
+            if p.suffix in IMG_EXT and not p.stem.endswith("_mask")]
 
 
 def _load_images(d, size):
     return [_load_img(p, size) for p in _img_files(d)]
+
+
+def _scaled_boxes(o, path):
+    """把locate()给的框(掩膜坐标系,通常256²)线性还原到原图像素坐标。
+    原图尺寸从**文件本身**读(peek_size只读文件头不解码),不能用load_fast后的张量——
+    那个已经被缩放过(长边上限1152)。"""
+    bs = o.get("boxes") or []
+    mk = o.get("mask")
+    if not bs or mk is None:
+        return []
+    mh, mw = mk.shape[:2]
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            W0, H0 = im.size
+    except Exception:
+        return [f"{b[0]},{b[1]},{b[2]},{b[3]}" for b in bs]
+    sx, sy = W0 / max(mw, 1), H0 / max(mh, 1)
+    out = []
+    for b in bs:
+        x0, y0, x1, y1 = int(round(b[0] * sx)), int(round(b[1] * sy)), \
+                         int(round(b[2] * sx)), int(round(b[3] * sy))
+        out.append(f"{max(0,x0)},{max(0,y0)},{min(W0,x1)},{min(H0,y1)}")
+    return out
 
 
 def _decide_large(normal_dir):
@@ -34,10 +95,27 @@ def _decide_large(normal_dir):
 
 
 def _run_zeroshot(args, device):
-    """无样本入口(赛题"少样本或无样本"):无需 normal/defect,纯 CLIP 判异常。"""
-    from aoi.clip_encoder import CLIPEncoder
+    """无样本入口(赛题"少样本或无样本"):无需 normal/defect,纯 CLIP 判异常。
+
+    **离线可用性**:本路径依赖 CLIP 权重(约571MB),**未打进默认离线包**——赛题会提供
+    100正常+30缺陷,少样本才是评分路径,为一个可选路径让交付包翻近三倍不划算。
+    无外网且需要本路径时,在联网机器上执行:
+        python scripts/pack_offline_weights.py --with-clip
+    主路径(少样本,submit.py 不加 --zeroshot)所需权重**已全部打进离线包**,无外网可直接运行。"""
     from aoi.branches.zeroshot_clip import ZeroShotAdapter
-    adapter = ZeroShotAdapter(CLIPEncoder(device=device), class_name=args.class_name)
+    try:
+        from aoi.clip_encoder import CLIPEncoder
+        enc = CLIPEncoder(device=device)
+    except Exception as e:
+        raise SystemExit(
+            "\n[无样本路径不可用] 加载 CLIP 权重失败:%s\n"
+            "  原因:CLIP 权重(~571MB)未包含在默认离线包中,当前机器又无法访问外网。\n"
+            "  解法一(推荐):改用少样本路径——赛题提供的 100 张正常图 + 30 张缺陷图\n"
+            "               python submit.py --normal <正常目录> --defect <缺陷目录> --test <测试目录>\n"
+            "               该路径所需权重已全部离线打包,无外网可直接运行。\n"
+            "  解法二:在联网机器上执行 python scripts/pack_offline_weights.py --with-clip\n"
+            "         然后把 models/hf_cache/ 一并拷贝到本机。\n" % type(e).__name__)
+    adapter = ZeroShotAdapter(enc, class_name=args.class_name)
     adapter.fit_fewshot()
     rows = []
     for p in sorted(Path(args.test).iterdir()):
@@ -77,16 +155,20 @@ def _run_small(args, bb):
     return rows, adapter.threshold
 
 
-def _load_mask_for(defect_path, mask_dir):
-    """按文件名(或词干)在 mask_dir 找对应缺陷掩膜 → (H,W){0,1} numpy;找不到返回 None。"""
+def _load_mask_for(defect_path, mask_dirs):
+    """在候选目录列表里按文件名(或词干)找缺陷掩膜 → (H,W){0,1} numpy;找不到返回 None。
+    候选路径若与缺陷图本身是同一文件则跳过(在 defect 目录内自动探测时,
+    md/name 就是缺陷图自己——拿图当掩膜等于全图标缺陷,必须排除)。"""
     import numpy as np
     from PIL import Image
-    md = Path(mask_dir)
-    cands = [md / defect_path.name, md / (defect_path.stem + ".png"),
-             md / (defect_path.stem + "_mask.png")]
-    for c in cands:
-        if c.exists():
-            return (np.array(Image.open(c).convert("L")) > 0).astype("uint8")
+    for mask_dir in mask_dirs:
+        md = Path(mask_dir)
+        cands = [md / defect_path.name, md / (defect_path.stem + ".png"),
+                 md / (defect_path.stem + "_mask.png"),
+                 md / (defect_path.stem + "_mask" + defect_path.suffix)]
+        for c in cands:
+            if c.exists() and c.resolve() != defect_path.resolve():
+                return (np.array(Image.open(c).convert("L")) > 0).astype("uint8")
     return None
 
 
@@ -111,13 +193,20 @@ def _run_large(args, device):
     defects = [load_fast(p) for p in dfiles]
     if not normals or not defects:
         raise SystemExit("normal/ 与 defect/ 必须各含至少一张图片")
-    masks = None
-    if args.defect_mask:
-        masks = [_load_mask_for(p, args.defect_mask) for p in dfiles]
-        if all(m is None for m in masks):
-            masks = None
-        else:
-            masks = [m if m is not None else __import__("numpy").zeros((8, 8), "uint8") for m in masks]
+    # 掩膜来源(按优先级):--defect-mask 显式目录 → 缺陷同目录(<名>_mask.png)
+    # → 同级 mask/ 目录。使用文档一直承诺"同目录同名掩膜自动使用",此前代码只认
+    # 显式参数——考官照文档做会**静默**丢掉监督分割头与VLM类型头(考官机模拟实锤:
+    # 类型全部退化到启发式)。现在自动探测,找不到才退回无掩膜路径。
+    mdirs = [d for d in [args.defect_mask, args.defect,
+                         str(Path(args.defect).parent / "mask")] if d]
+    masks = [_load_mask_for(p, mdirs) for p in dfiles]
+    n_found = sum(1 for m in masks if m is not None)
+    print(f"缺陷标注掩膜:{n_found}/{len(dfiles)} 张已找到"
+          + ("(无掩膜→跳过监督分割头/VLM类型头)" if n_found == 0 else ""), flush=True)
+    if n_found == 0:
+        masks = None
+    else:
+        masks = [m if m is not None else __import__("numpy").zeros((8, 8), "uint8") for m in masks]
     det.fit_fewshot(normals, defects, defect_masks=masks)
     print(f"  监督分割头: {'已训(用掩膜)' if det.seg_head.head is not None else '未训(无掩膜→无监督定位)'}", flush=True)
     rows = []
@@ -136,7 +225,11 @@ def _run_large(args, device):
                         img_next[q] = pool.submit(load_fast, q)
                         break
                 o = det.locate(img)
-                boxes = ";".join(f"{b[0]},{b[1]},{b[2]},{b[3]}" for b in o["boxes"])
+                # 框必须还原到**原图坐标系**再交付。locate()内部的掩膜固定在
+                # seg_eval_hw(256²)上,框坐标也就在[0,256)——而评委喂进来的是2500²原图,
+                # 直接输出等于把坐标缩小了约9.77倍,和原图GT算IoU会几乎全部落空。
+                # (内部成绩单不会暴露这个问题:那边预测掩膜和GT掩膜都缩到256再比,口径自洽。)
+                boxes = ";".join(_scaled_boxes(o, p))
                 rows.append([p.name, "image", int(o["is_defect"]), round(o["score"], 4),
                              o["defect_type"], boxes])
     for p in all_files:
@@ -173,13 +266,18 @@ def main():
     else:
         if not args.normal or not args.defect:
             raise SystemExit("少样本模式需 --normal 与 --defect;或加 --zeroshot 走无样本")
-        large = args.mode == "large" or (args.mode == "auto" and _decide_large(args.normal))
-        if large:
-            print("路由:大图混合(全局5分支@320 + 局部ResNet18分块)", flush=True)
-            rows, thr = _run_large(args, device)
-        else:
-            print("路由:常规(resize 5分支ensemble)", flush=True)
+        # 少样本一律走生产检测器(CompetitionLargeDetector),不再按图尺寸路由。
+        # 依据(2026-08-29考官机模拟实锤):Real-IAD 256²小图被旧路由送进遗留的
+        # "resize 5分支"路径,输出boxes列**全空**——赛题定位分直接归零;而生产检测器
+        # 本来就是在256²原生图上跑出全部成绩单的(12类目均值acc=0.817),对小图
+        # 既是精度最优也是唯一有定位输出的路径。_run_small保留仅作历史参照,
+        # 只有显式 --mode small 才会进(不建议)。
+        if args.mode == "small":
+            print("路由:遗留small路径(仅显式指定;无定位框输出,不建议)", flush=True)
             rows, thr = _run_small(args, Backbone(pretrained=True, device=device))
+        else:
+            print("路由:生产检测器(EAD+DINO门+监督分割+SAM+类型头,原生分辨率)", flush=True)
+            rows, thr = _run_large(args, device)
 
     with open(args.out, "w", newline="") as f:
         w = csv.writer(f)

@@ -15,3 +15,4 @@ rddn_yolo/dataset/
 models/hf_cache/
 models/fonts/
 exam_data/
+demo_data/

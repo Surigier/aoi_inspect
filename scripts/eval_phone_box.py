@@ -1,127 +1,65 @@
-"""真实手机屏数据(data/phone)上的**框命中@0.5**——用户口径:"有框也行,能指出位置就行"。
+"""手机屏box-IoU对照:正常图硬约束只有20张(MSD官方good.zip量),15fit/5test维持不变;
+缺陷图按leon要求从30张fit压到10张,把省下的20张挪去测试,尽量多测。
+手机屏没有像素级GT掩膜(GT本来就是YOLO框),定位口径直接用框对框IoU,不转掩膜再算。
 
-**这个数的前提必须一起报,否则会误导**:赛题协议给100张正常图,而本数据集全库只有
-**7张**正常图(还是Roboflow增广出来的重复)。EAD学生、DINO门、像素阈值全都在正常图
-分布上标定,7张是严重饥饿状态。所以这里测的是**下界**:"正常样本被饿到极限时,
-定位还剩多少能力"。真实赛场有100张正常图,只会比这个好。
-
-同理**图级准确率在本数据集上无法测**:7张正常图全部拿去fit了,测试侧一张正常图都
-不剩,误报率无从谈起。这里只报两个能诚实测出来的:
-  ①检出率(缺陷图里有多少被判为缺陷)  ②框命中@0.5(判出来的框有没有指对位置)
-
-用法:PYTHONPATH=. python scripts/eval_phone_box.py [测试张数]
+用法:PYTHONPATH=. python scripts/eval_phone_box.py
 """
-import glob
-import os
+import random
 import sys
-import time
+from pathlib import Path
+
 import numpy as np
-import torch
-import torch.nn.functional as F
-from PIL import Image
+
+sys.path.insert(0, "scripts")
+import make_exam_data as m
 from aoi.competition import CompetitionLargeDetector
-from global_context.eval_global_branch import gt_boxes, box_hit, _box_iou as _iou
+from aoi.imageio import load_fast
+from scripts.run_scorecard import box_hit, box_iou
 
-ROOT = "data/phone"
+RNG = random.Random(1)
+msd = sorted(m.MSD_GOOD.glob("*.png")); RNG.shuffle(msd)
+pb = m.phone_best_defects(10 + 10000)   # 请求量超上限,函数会原样返回全部可用的
 
+normals = [load_fast(p) for p in msd[:15]]
+fit_items = pb[:10]
+defects = [load_fast(f) for f, _, _ in fit_items]
+masks = [mk for _, mk, _ in fit_items]
 
-def _load(path):
-    a = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
-    return torch.from_numpy(a).permute(2, 0, 1)
+print(f"fit: 正常{len(normals)} 缺陷{len(defects)}(20张官方正常图硬约束,不可再多)", flush=True)
+det = CompetitionLargeDetector(compile_infer=True)
+det.fit_fewshot(normals, defects, defect_masks=masks)
+print(f"fit完成,阈值={det.decision_threshold():.4f}", flush=True)
 
+test_items = pb[10:]
+ious, hits, recall_n = [], [], 0
+import collections
+type_table = collections.defaultdict(collections.Counter)   # 官方原始类型 -> 系统预测类别计数
+for f, mk, gt_type in test_items:
+    img = load_fast(f)
+    o = det.locate(img)
+    ys, xs = np.where(mk > 0)
+    gtb = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+    if o["is_defect"]:
+        recall_n += 1
+        mkpred = o.get("mask")
+        if mkpred is not None and o.get("boxes"):
+            mh, mw = mkpred.shape[:2]
+            H0, W0 = mk.shape
+            sx, sy = W0 / max(mw, 1), H0 / max(mh, 1)
+            pred_boxes = [(b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy) for b in o["boxes"]]
+            iou = max((box_iou(p, gtb) for p in pred_boxes), default=0.0)
+            h = box_hit(pred_boxes, [gtb])
+        else:
+            iou, h = 0.0, 0.0
+        type_table[gt_type][o["defect_type"]] += 1
+    else:
+        iou, h = 0.0, 0.0
+        type_table[gt_type]["normal(漏检)"] += 1
+    ious.append(iou); hits.append(h if h is not None else 0.0)
 
-def _boxes_mask(shape_hw, lab_path):
-    H, W = shape_hw
-    m = np.zeros((H, W), np.uint8)
-    if not os.path.exists(lab_path):
-        return m
-    for line in open(lab_path):
-        p = line.split()
-        if len(p) < 5:
-            continue
-        cx, cy, w, h = [float(x) for x in p[1:5]]
-        x0, x1 = int((cx - w / 2) * W), int((cx + w / 2) * W)
-        y0, y1 = int((cy - h / 2) * H), int((cy + h / 2) * H)
-        m[max(0, y0):min(H, y1 + 1), max(0, x0):min(W, x1 + 1)] = 1
-    return m
-
-
-def _pairs(split, want, skip=0):
-    """返回 [(img, box_mask)],跳过空标注(那是正常图)。"""
-    out = []
-    for f in sorted(glob.glob(f"{ROOT}/{split}/images/*"))[skip:]:
-        img = _load(f)
-        mk = _boxes_mask(img.shape[-2:], f.replace("/images/", "/labels/").rsplit(".", 1)[0] + ".txt")
-        if not mk.any():
-            continue
-        out.append((img, mk))
-        if len(out) >= want:
-            break
-    return out
-
-
-def _normals():
-    out = []
-    for split in ("train", "valid", "test"):
-        for f in sorted(glob.glob(f"{ROOT}/{split}/labels/*.txt")):
-            if os.path.getsize(f) == 0:
-                out.append(_load(f.replace("/labels/", "/images/").rsplit(".", 1)[0] + ".jpg"))
-    return out
-
-
-def main(n_test=100):
-    torch.manual_seed(0)
-    normals = _normals()
-    fit = _pairs("train", 30)
-    test = _pairs("valid", n_test)
-    print(f"正常图 {len(normals)} 张(赛题协议是100张——严重饥饿,本结果是下界) / "
-          f"fit缺陷 {len(fit)} / 测试缺陷 {len(test)}", flush=True)
-
-    t0 = time.time()
-    det = CompetitionLargeDetector(compile_infer=True)
-    det.fit_fewshot(normals, [i for i, _ in fit], defect_masks=[m for _, m in fit])
-    print(f"fit完成 {time.time()-t0:.0f}s  type_head={'就绪' if det.type_head else '未启用'}", flush=True)
-
-    for im, _ in test[:5]:
-        det.locate(im)                                     # 预热,不计时
-
-    hits, lat, n_det = [], [], 0
-    # 诊断:命中率为0时要能区分两种失效——"框位置对但太粗/太大"(bestIoU有值但<0.5)
-    # 还是"框根本指错地方"(bestIoU≈0)。再记预测掩膜占图比例,饿正常图会让模型把
-    # 整片区域都标成异常,那种情况下IoU分母被撑爆、必然全灭。
-    best_ious, pred_frac, n_boxes = [], [], []
-    for img, gt in test:
-        t1 = time.time()
-        o = det.locate(img)
-        lat.append((time.time() - t1) * 1000)
-        n_det += bool(o["is_defect"])
-        if o.get("mask") is None:
-            hits.append(0.0); continue
-        mk = o["mask"]
-        gt_r = (F.interpolate(torch.from_numpy(gt.astype(np.float32))[None, None],
-                              size=mk.shape, mode="nearest")[0, 0].numpy() > 0.5).astype(np.uint8)
-        gbs = gt_boxes(gt_r)
-        h = box_hit(o["boxes"], gbs)
-        hits.append(h if h is not None else 0.0)
-        pred_frac.append(float(mk.astype(bool).mean()))
-        n_boxes.append(len(o["boxes"]))
-        for g in gbs:
-            best_ious.append(max([_iou(pb[:4], g) for pb in o["boxes"]], default=0.0))
-    n = len(test)
-    print(f"\n=== 手机屏真实数据(正常图仅{len(normals)}张,下界) ===", flush=True)
-    print(f"检出率(缺陷图判为缺陷)  {n_det}/{n} = {n_det/max(n,1):.1%}", flush=True)
-    print(f"框命中@0.5              {np.mean(hits):.3f}", flush=True)
-    print(f"延时  中位={np.median(lat):.0f}ms  p90={np.percentile(lat,90):.0f}ms", flush=True)
-    if best_ious:
-        b = np.array(best_ious)
-        print(f"诊断 每个GT框的最佳IoU:  中位={np.median(b):.3f}  p90={np.percentile(b,90):.3f}  "
-              f"最大={b.max():.3f}  |  完全无重叠(IoU=0)的占 {(b==0).mean():.0%}", flush=True)
-        print(f"诊断 预测掩膜占图比例:  中位={np.median(pred_frac):.1%}  最大={max(pred_frac):.1%}  "
-              f"(GT框中位只占2.7%)  |  每图预测框数 中位={np.median(n_boxes):.0f}", flush=True)
-    print("注:图级准确率在本数据集不可测——7张正常图全部用于fit,测试侧无正常样本,误报率无从谈起。",
-          flush=True)
-    print("PHONE BOX OK", flush=True)
-
-
-if __name__ == "__main__":
-    main(int(sys.argv[1]) if len(sys.argv) > 1 else 100)
+n = len(test_items)
+print(f"\n测试{n}张(全是缺陷图,手机屏无更多正常图可测)", flush=True)
+print(f"召回={recall_n/n:.3f} 含漏检IoU(框)={np.mean(ious):.3f} 框命中@0.5={np.mean(hits):.3f}", flush=True)
+print("\n官方原始类型(oil/scratch/stain) x 系统预测类别,原始对照表不做映射评判:", flush=True)
+for gt_type, c in sorted(type_table.items()):
+    print(f"  {gt_type}(共{sum(c.values())}张): " + ", ".join(f"{k}={v}" for k, v in c.most_common()), flush=True)

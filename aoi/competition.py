@@ -133,7 +133,8 @@ class CompetitionLargeDetector:
     def __init__(self, device="cuda", aux_size=320, train_steps=10000, seg_eval_hw=(256, 256),
                  compile_infer=False, sam_refine=True, roi_zoom=False, seg_in=512, rams=False,
                  ead_students=2, crop_cascade=False, comp_graph=False, boundary_refine=False,
-                 tta=False, gcad_embed=False, joint_ensemble=True, use_vlm_type=True, per_mode_gate=False, seg_gate=False, dino_seg=False):
+                 tta=False, gcad_embed=False, joint_ensemble=True, use_vlm_type=True, per_mode_gate=False, seg_gate=False, dino_seg=False,
+                 ead_smooth_k=1):
         # ead_students=2:多种子EAD学生集成(检测分,教师共享)。实测工作类方差收窄~2×、
         # 现场一次fit下限+0.012、均值零代价;fit不计时训练免费,推理+一次学生前向(延时待验)。
         # rams 默认关:RAMS-R残差注意力修正支隔离探针+0.013~0.033(3/4类),但生产全管线实测净平
@@ -144,7 +145,7 @@ class CompetitionLargeDetector:
         bb = Backbone(device=dev)
         self.branches = [
             _EADBranch(device=dev, train_steps=train_steps, compile_infer=compile_infer,
-                       n_students=ead_students),
+                       n_students=ead_students, ead_smooth_k=ead_smooth_k),
             _AuxBranch(ColorADBranch(grid_size=16), "色彩变化", aux_size),
             _AuxBranch(DimensionADBranch(), "尺寸偏差", aux_size),
             _AuxBranch(StructuralADBranch(backbone=bb, grid_size=16), "缺件/逻辑", aux_size),

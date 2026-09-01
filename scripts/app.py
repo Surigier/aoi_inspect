@@ -203,13 +203,19 @@ def _answers(product):
 
 
 def _truth_of(path):
-    """真实标签:按文件所在产品目录的 answer.csv 查(<产品>/test/<文件> 结构)。"""
+    """(真实标签, 数据集原生缺陷类型):按文件所在产品目录的 answer.csv 查
+    (<产品>/test/<文件> 结构)。原生类型只有 make_demo_data.py 产出的三列版
+    answer.csv(file,真实标签,缺陷类型(MVTec原始))才有,没有第三列就给空字符串。"""
     p = Path(path)
     csvp = p.parent.parent / "answer.csv"
     if p.parent.name != "test" or not csvp.exists():
-        return "?"
+        return "?", ""
     with open(csvp, encoding="utf-8") as f:
-        return {r[0]: r[1] for r in list(csv.reader(f))[1:]}.get(p.name, "?")
+        rows = {r[0]: r for r in list(csv.reader(f))[1:]}
+    r = rows.get(p.name)
+    if r is None:
+        return "?", ""
+    return r[1], (r[2] if len(r) > 2 else "")
 
 
 def run_test(paths, uploads=None, progress=None):
@@ -233,7 +239,7 @@ def run_test(paths, uploads=None, progress=None):
         img = _load(path)
         t0 = time.time(); o = det.locate(img); ms = (time.time() - t0) * 1000
         lats.append(ms)
-        truth = _truth_of(path)
+        truth, native_type = _truth_of(path)
         pred = "缺陷" if o["is_defect"] else "正常"
         if truth == "缺陷" and o["is_defect"]: tp += 1; mark = "✅检出"
         elif truth == "缺陷": fn += 1; mark = "❌漏检"
@@ -241,7 +247,7 @@ def run_test(paths, uploads=None, progress=None):
         elif truth == "正常": tn += 1; mark = "✅正常"
         else: mark = "—"
         gal.append((render(img, o, ms=ms), f"{f} {mark}"))
-        rows.append([f, truth, pred, o["defect_type"], f"{o['score']:.3f}",
+        rows.append([f, truth, pred, o["defect_type"], native_type, f"{o['score']:.3f}",
                      len(o.get("boxes") or []), f"{ms:.0f}", mark])
     n = len(todo)
     n_ans = tp + fn + fp + tn          # 只有带对照答案的图才计入准确率,上传的自选图不稀释
@@ -355,7 +361,8 @@ def build():
                 btn_all = gr.Button("全选当前产品的 test/"); btn_run = gr.Button("开始检测", variant="primary")
             res_md = gr.Markdown()
             gal = gr.Gallery(label="检测结果(红=预测缺陷区域/预测框)", columns=4, height=520)
-            tbl = gr.Dataframe(headers=["文件", "真实", "判定", "缺陷类型", "异常分", "框数", "ms", "结果"],
+            tbl = gr.Dataframe(headers=["文件", "真实", "判定", "缺陷类型(赛题5类)", "数据集原生类型",
+                                        "异常分", "框数", "ms", "结果"],
                                label="逐图明细")
             with gr.Row():
                 one = gr.Dropdown([], label="回溯某张图的检测逻辑")
@@ -363,7 +370,10 @@ def build():
             ex_md = gr.Markdown()
 
             def _refresh(p):
-                return gr.update(choices=files_of(p, "test")), gr.update(root_dir=_test_dir(p))
+                # 切换产品/首次加载就默认全选test/,不用每次都手动点"全选"按钮再点一遍
+                all_files = [str(ROOT / p / "test" / f) for f in files_of(p, "test")] if p else []
+                return (gr.update(choices=files_of(p, "test")),
+                        gr.update(root_dir=_test_dir(p), value=all_files))
             prod.change(_refresh, prod, [one, fe])
             app.load(_refresh, prod, [one, fe])
             btn_all.click(lambda p: gr.update(value=[str(ROOT / p / "test" / f)

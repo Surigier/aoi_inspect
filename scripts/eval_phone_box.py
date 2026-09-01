@@ -1,6 +1,9 @@
-"""手机屏box-IoU对照:正常图硬约束只有20张(MSD官方good.zip量),15fit/5test维持不变;
-缺陷图按leon要求从30张fit压到10张,把省下的20张挪去测试,尽量多测。
-手机屏没有像素级GT掩膜(GT本来就是YOLO框),定位口径直接用框对框IoU,不转掩膜再算。
+"""手机屏box-IoU对照:公开渠道查过(MSD/SSGD/产线私有集),正常图真实来源就MSD这
+20张,没有能补充的公开数据集(leon已确认知情)。按leon的决定:复制这20张凑够
+fit配额,不是新数据,只是让fit统计量吃到更多次这20张图。20张全部用于fit(不再
+留5张当"测试正常图"——留5张本来就撑不起假设检验,不如把统计权重都给fit)。
+缺陷图仍按10张fit、其余全部测试。手机屏没有像素级GT掩膜(GT本来就是YOLO框),
+定位口径直接用框对框IoU,不转掩膜再算。
 
 用法:PYTHONPATH=. python scripts/eval_phone_box.py
 """
@@ -20,12 +23,13 @@ RNG = random.Random(1)
 msd = sorted(m.MSD_GOOD.glob("*.png")); RNG.shuffle(msd)
 pb = m.phone_best_defects(10 + 10000)   # 请求量超上限,函数会原样返回全部可用的
 
-normals = [load_fast(p) for p in msd[:15]]
+N_NORMAL_FIT = 50   # 20张真实图复制凑够,不是新增数据——如实标注,不冒充新样本
+normals = [load_fast(msd[i % len(msd)]) for i in range(N_NORMAL_FIT)]
 fit_items = pb[:10]
 defects = [load_fast(f) for f, _, _ in fit_items]
 masks = [mk for _, mk, _ in fit_items]
 
-print(f"fit: 正常{len(normals)} 缺陷{len(defects)}(20张官方正常图硬约束,不可再多)", flush=True)
+print(f"fit: 正常{len(normals)}(来自{len(msd)}张真实图循环复制) 缺陷{len(defects)}", flush=True)
 det = CompetitionLargeDetector(compile_infer=True)
 det.fit_fewshot(normals, defects, defect_masks=masks)
 print(f"fit完成,阈值={det.decision_threshold():.4f}", flush=True)

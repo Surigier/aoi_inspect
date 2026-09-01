@@ -60,6 +60,25 @@ def _img_files(d):
             if p.suffix in IMG_EXT and not p.stem.endswith("_mask")]
 
 
+def _img_files_typed(d):
+    """同 _img_files,但兼容"按缺陷类型分子文件夹"的标注格式(邮件确认训练图片均为
+    已标注数据,像MVTec那样用子目录名当类型标签是常见做法之一)。返回
+    [(图片路径, 子目录名或None)]:目录下直接就是图片 → 类型全部None,和 _img_files
+    行为逐位一致(零回退);目录下是子文件夹 → 递归进每个子文件夹,类型=子文件夹名。
+    只探测一层子目录,不做多层递归。"""
+    root = Path(d)
+    direct = [p for p in sorted(root.iterdir())
+             if p.suffix in IMG_EXT and not p.stem.endswith("_mask")]
+    subdirs = sorted(p for p in root.iterdir() if p.is_dir())
+    if not subdirs:
+        return [(p, None) for p in direct]
+    out = [(p, None) for p in direct]                        # 子目录之外散落的图片仍然收进来
+    for sd in subdirs:
+        out += [(p, sd.name) for p in sorted(sd.iterdir())
+               if p.suffix in IMG_EXT and not p.stem.endswith("_mask")]
+    return out
+
+
 def _load_images(d, size):
     return [_load_img(p, size) for p in _img_files(d)]
 
@@ -155,20 +174,25 @@ def _run_small(args, bb):
     return rows, adapter.threshold
 
 
-def _load_mask_for(defect_path, mask_dirs):
+def _load_mask_for(defect_path, mask_dirs, native_type=None):
     """在候选目录列表里按文件名(或词干)找缺陷掩膜 → (H,W){0,1} numpy;找不到返回 None。
     候选路径若与缺陷图本身是同一文件则跳过(在 defect 目录内自动探测时,
-    md/name 就是缺陷图自己——拿图当掩膜等于全图标缺陷,必须排除)。"""
+    md/name 就是缺陷图自己——拿图当掩膜等于全图标缺陷,必须排除)。
+    native_type:缺陷图所在的子目录名(见_img_files_typed);掩膜若也按同样的子目录
+    结构组织(mask/<类型>/xxx.png,MVTec就是这样),优先在该子目录下找,找不到再退回
+    mask_dir 根目录(兼容"掩膜摊平放、缺陷图分类放"这种不对称情况)。"""
     import numpy as np
     from PIL import Image
     for mask_dir in mask_dirs:
         md = Path(mask_dir)
-        cands = [md / defect_path.name, md / (defect_path.stem + ".png"),
-                 md / (defect_path.stem + "_mask.png"),
-                 md / (defect_path.stem + "_mask" + defect_path.suffix)]
-        for c in cands:
-            if c.exists() and c.resolve() != defect_path.resolve():
-                return (np.array(Image.open(c).convert("L")) > 0).astype("uint8")
+        bases = [md / native_type, md] if native_type else [md]
+        for base in bases:
+            cands = [base / defect_path.name, base / (defect_path.stem + ".png"),
+                     base / (defect_path.stem + "_mask.png"),
+                     base / (defect_path.stem + "_mask" + defect_path.suffix)]
+            for c in cands:
+                if c.exists() and c.resolve() != defect_path.resolve():
+                    return (np.array(Image.open(c).convert("L")) > 0).astype("uint8")
     return None
 
 
@@ -180,7 +204,13 @@ def _run_large(args, device):
     from aoi.imageio import load_fast
     from aoi.video import moving_average, group_events
     det = CompetitionLargeDetector(device=device, compile_infer=True)   # 竞赛入口开 torch.compile 加速
-    dfiles = _img_files(args.defect)
+    dfiles_typed = _img_files_typed(args.defect)
+    dfiles = [p for p, _ in dfiles_typed]
+    native_types = [t for _, t in dfiles_typed]
+    if any(t is not None for t in native_types):
+        from collections import Counter
+        print(f"缺陷图按子目录分类型(数据集原生标注):{dict(Counter(t for t in native_types if t))}",
+              flush=True)
     nfiles = _img_files(args.normal)
     # 延时探针传真实【测试】文件路径(原生分辨率+原生格式),禁止用load_fast缩放后的张量重建
     # (那样长边最多1152,原生2500²真实解码耗时会被系统性低估,自裁偏松、真机可能超线)。
@@ -199,7 +229,7 @@ def _run_large(args, device):
     # 类型全部退化到启发式)。现在自动探测,找不到才退回无掩膜路径。
     mdirs = [d for d in [args.defect_mask, args.defect,
                          str(Path(args.defect).parent / "mask")] if d]
-    masks = [_load_mask_for(p, mdirs) for p in dfiles]
+    masks = [_load_mask_for(p, mdirs, native_type=t) for p, t in zip(dfiles, native_types)]
     n_found = sum(1 for m in masks if m is not None)
     print(f"缺陷标注掩膜:{n_found}/{len(dfiles)} 张已找到"
           + ("(无掩膜→跳过监督分割头/VLM类型头)" if n_found == 0 else ""), flush=True)

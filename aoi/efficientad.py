@@ -211,12 +211,16 @@ class EfficientADDetector:
         return sum(scores) / len(scores), None
 
     @torch.no_grad()
-    def score_large(self, img, max_size=1280, max_pixels=None, use_half=True):
+    def score_large(self, img, max_size=1280, max_pixels=None, use_half=True, smooth_k=1):
         """整图全卷积推理(ST 主分支,不分块不降采样)。PDN 全卷积→大图一次前向出全分辨率图。
         等比缩以同时满足:长边≤max_size、面积≤max_pixels(后者保证方图也达标延时,
         因延时∝面积;只卡长边时方图面积可达扁图3倍→延时爆)。
         use_half:FP16 autocast,卷积吞吐~翻倍→全分辨率(1280)也<200ms@2060,免降分辨率砸精度。
-        AE 分支固定256不参与大图。"""
+        AE 分支固定256不参与大图。
+        smooth_k:图级分数取教师-学生差异图**全局最大值**,对孤立单像素噪声(比如CLAHE
+        拉伸对比度带来的局部伪影)极度敏感——一个噪声像素就能把整张正常图判成缺陷。
+        smooth_k>1 时先对差异图做 smooth_k×smooth_k 均值池化再取最大值,把孤立噪声摊薄,
+        真实缺陷(有空间连续性)响应基本不受影响。默认1=不平滑,行为与改动前逐位一致。"""
         if img.dim() == 3:
             img = img.unsqueeze(0)
         img = img.to(self.device)
@@ -236,7 +240,10 @@ class EfficientADDetector:
             scores = []
             for student in students:
                 st = student(x)[:, :OUT]
-                scores.append(float(((t - st) ** 2).mean(1).max()))
+                diff = ((t - st) ** 2).mean(1, keepdim=True)          # (1,1,h',w')
+                if smooth_k > 1:
+                    diff = F.avg_pool2d(diff.float(), smooth_k, stride=1, padding=smooth_k // 2)
+                scores.append(float(diff.max()))
         return sum(scores) / len(scores)
 
     @torch.no_grad()

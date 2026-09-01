@@ -62,6 +62,8 @@ def box_hit(pred_boxes, gtbs, thr=0.5):
 def evaluate(name, normals, fit_i, fit_m, test_defs, test_goods):
     import os as _os
     _kw = {"dino_seg": True} if _os.environ.get("DINO_SEG") == "1" else {}
+    if _os.environ.get("EAD_SMOOTH_K"):                    # A/B验证score_large的噪声平滑,见run_ead_smooth_ab.py
+        _kw["ead_smooth_k"] = int(_os.environ["EAD_SMOOTH_K"])
     det = CompetitionLargeDetector(**_kw)                  # 全量train_steps=10000
     det.fit_fewshot(normals, fit_i, defect_masks=fit_m)
     # 图级二值 + 定位
